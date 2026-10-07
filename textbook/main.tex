@@ -1,0 +1,55 @@
+\documentclass[11pt,twoside,openright]{book}
+\input{preamble}
+
+\title{%
+  {\Huge\bfseries Memory in Large Language Models}\\[0.8em]
+  {\Large From the Transformer to Test-Time Learning:\\
+  the 2025--2026 Memory Architectures and Their Implementations}}
+\author{The \texttt{mem-sys} project\\[0.5em]
+  {\normalsize Based on \emph{Memory for Large Language Models}
+  (Zhoubian, Zhang, Kharlamov \& Tang, 2026) and the open-source code mirrored in}\\
+  {\normalsize\url{https://github.com/utkrshkmr/mem-sys}}}
+\date{Draft built \today}
+
+\begin{document}
+
+\frontmatter
+\maketitle
+\input{frontmatter/preface}
+\setcounter{tocdepth}{1}
+\tableofcontents
+
+\mainmatter
+
+\part{Foundations}
+\input{chapters/01-llm-foundations}
+\input{chapters/02-memory-taxonomy}
+\input{chapters/03-linear-attention-ssm}
+
+\part{Implicit Memory}
+\input{chapters/04-sparse-attention}
+\input{chapters/05-delta-rule-family}
+\input{chapters/06-expressive-transitions}
+\input{chapters/07-structured-recurrent-memory}
+\input{chapters/08-probabilistic-recurrent-memory}
+
+\part{Explicit Memory}
+\input{chapters/09-test-time-training}
+\input{chapters/10-slots-and-lookup}
+\input{chapters/11-multi-timescale}
+
+\part{Hybrids and Memory Systems}
+\input{chapters/12-hybrid-architectures}
+\input{chapters/13-adaptive-routing-and-management}
+
+\part{Synthesis}
+\input{chapters/14-synthesis}
+
+\appendix
+\input{chapters/A-code-guide}
+
+\backmatter
+\bibliographystyle{plainnat}
+\bibliography{bib/core,bib/c01,bib/c02,bib/c03,bib/c04,bib/c05,bib/c06,bib/c07,bib/c08,bib/c09,bib/c10,bib/c11,bib/c12,bib/c13,bib/c14}
+
+\end{document}

@@ -1,0 +1,582 @@
+% Core bibliography shared by all chapters. Keys follow <firstauthor><year><word>.
+% Entries follow the reference list of Zhoubian et al. (2026), arXiv 2607.25380,
+% plus the code-release information collected in README.md.
+
+% ----------------------------------------------------------------- the survey
+@article{zhoubian2026memory,
+  title   = {Memory for Large Language Models},
+  author  = {Zhoubian, Sining and Zhang, Dan and Kharlamov, Evgeny and Tang, Jie},
+  journal = {arXiv preprint arXiv:2607.25380},
+  year    = {2026}
+}
+
+% ------------------------------------------------------- foundations / classics
+@inproceedings{vaswani2017attention,
+  title     = {Attention is All You Need},
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2017}
+}
+@article{elman1990finding,
+  title   = {Finding Structure in Time},
+  author  = {Elman, Jeffrey L.},
+  journal = {Cognitive Science},
+  volume  = {14},
+  number  = {2},
+  pages   = {179--211},
+  year    = {1990}
+}
+@article{hochreiter1997lstm,
+  title   = {Long Short-Term Memory},
+  author  = {Hochreiter, Sepp and Schmidhuber, J{\"u}rgen},
+  journal = {Neural Computation},
+  volume  = {9},
+  number  = {8},
+  pages   = {1735--1780},
+  year    = {1997}
+}
+@article{schmidhuber1992fastweights,
+  title   = {Learning to Control Fast-Weight Memories: An Alternative to Dynamic Recurrent Networks},
+  author  = {Schmidhuber, J{\"u}rgen},
+  journal = {Neural Computation},
+  volume  = {4},
+  number  = {1},
+  pages   = {131--139},
+  year    = {1992}
+}
+@article{ba2016fastweights,
+  title   = {Using Fast Weights to Attend to the Recent Past},
+  author  = {Ba, Jimmy and Hinton, Geoffrey and Mnih, Volodymyr and Leibo, Joel Z. and Ionescu, Catalin},
+  journal = {arXiv preprint arXiv:1610.06258},
+  year    = {2016}
+}
+@inproceedings{santoro2016mann,
+  title     = {Meta-Learning with Memory-Augmented Neural Networks},
+  author    = {Santoro, Adam and Bartunov, Sergey and Botvinick, Matthew and Wierstra, Daan and Lillicrap, Timothy},
+  booktitle = {Proceedings of the 33rd International Conference on Machine Learning},
+  series    = {PMLR},
+  volume    = {48},
+  pages     = {1842--1850},
+  year      = {2016}
+}
+@article{graves2016dnc,
+  title   = {Hybrid Computing Using a Neural Network with Dynamic External Memory},
+  author  = {Graves, Alex and others},
+  journal = {Nature},
+  volume  = {538},
+  pages   = {471--476},
+  year    = {2016}
+}
+@inproceedings{katharopoulos2020transformers,
+  title     = {Transformers are {RNNs}: Fast Autoregressive Transformers with Linear Attention},
+  author    = {Katharopoulos, Angelos and Vyas, Apoorv and Pappas, Nikolaos and Fleuret, Fran{\c{c}}ois},
+  booktitle = {Proceedings of the 37th International Conference on Machine Learning},
+  series    = {PMLR},
+  volume    = {119},
+  pages     = {5156--5165},
+  year      = {2020}
+}
+@inproceedings{yang2024gla,
+  title     = {Gated Linear Attention Transformers with Hardware-Efficient Training},
+  author    = {Yang, Songlin and Wang, Bailin and Shen, Yikang and Panda, Rameswar and Kim, Yoon},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  series    = {PMLR},
+  volume    = {235},
+  pages     = {56501--56523},
+  year      = {2024}
+}
+@article{gu2023mamba,
+  title   = {Mamba: Linear-Time Sequence Modeling with Selective State Spaces},
+  author  = {Gu, Albert and Dao, Tri},
+  journal = {arXiv preprint arXiv:2312.00752},
+  year    = {2023}
+}
+@inproceedings{dao2024ssd,
+  title     = {Transformers are {SSMs}: Generalized Models and Efficient Algorithms Through Structured State Space Duality},
+  author    = {Dao, Tri and Gu, Albert},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  year      = {2024}
+}
+@article{sun2023retnet,
+  title   = {Retentive Network: A Successor to Transformer for Large Language Models},
+  author  = {Sun, Yutao and Dong, Li and Huang, Shaohan and Ma, Shuming and Xia, Yuqing and Xue, Jilong and Wang, Jianyong and Wei, Furu},
+  journal = {arXiv preprint arXiv:2307.08621},
+  year    = {2023}
+}
+@article{peng2024eagle,
+  title   = {Eagle and Finch: {RWKV} with Matrix-Valued States and Dynamic Recurrence},
+  author  = {Peng, Bo and Goldstein, Daniel and Anthony, Quentin and Albalak, Alon and others},
+  journal = {arXiv preprint arXiv:2404.05892},
+  year    = {2024}
+}
+@article{child2019sparse,
+  title   = {Generating Long Sequences with Sparse Transformers},
+  author  = {Child, Rewon and Gray, Scott and Radford, Alec and Sutskever, Ilya},
+  journal = {arXiv preprint arXiv:1904.10509},
+  year    = {2019}
+}
+@inproceedings{zaheer2020bigbird,
+  title     = {Big Bird: Transformers for Longer Sequences},
+  author    = {Zaheer, Manzil and Guruganesh, Guru and Dubey, Avinava and Ainslie, Joshua and Alberti, Chris and Ontanon, Santiago and Pham, Philip and Ravula, Anirudh and Wang, Qifan and Yang, Li and Ahmed, Amr},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2020}
+}
+@article{beltagy2020longformer,
+  title   = {Longformer: The Long-Document Transformer},
+  author  = {Beltagy, Iz and Peters, Matthew E. and Cohan, Arman},
+  journal = {arXiv preprint arXiv:2004.05150},
+  year    = {2020}
+}
+@article{xiao2023streamingllm,
+  title   = {Efficient Streaming Language Models with Attention Sinks},
+  author  = {Xiao, Guangxuan and Tian, Yuandong and Chen, Beidi and Han, Song and Lewis, Mike},
+  journal = {arXiv preprint arXiv:2309.17453},
+  year    = {2023}
+}
+@article{lieber2024jamba,
+  title   = {Jamba: A Hybrid Transformer-Mamba Language Model},
+  author  = {Lieber, Opher and Lenz, Barak and Bata, Hofit and Cohen, Gal and others},
+  journal = {arXiv preprint arXiv:2403.19887},
+  year    = {2024}
+}
+@article{jamba2024jamba15,
+  title   = {Jamba-1.5: Hybrid Transformer-Mamba Models at Scale},
+  author  = {{Jamba Team} and Lenz, Barak and others},
+  journal = {arXiv preprint arXiv:2408.12570},
+  year    = {2024}
+}
+@article{ren2024samba,
+  title   = {Samba: Simple Hybrid State Space Models for Efficient Unlimited Context Language Modeling},
+  author  = {Ren, Liliang and Liu, Yang and Lu, Yadong and Shen, Yelong and others},
+  journal = {arXiv preprint arXiv:2406.07522},
+  year    = {2024}
+}
+@article{leviathan2024selective,
+  title   = {Selective Attention Improves Transformer},
+  author  = {Leviathan, Yaniv and Kalman, Matan and Matias, Yossi},
+  journal = {arXiv preprint arXiv:2410.02703},
+  year    = {2024}
+}
+@article{zhang2024lighttransfer,
+  title   = {{LightTransfer}: Your Long-Context {LLM} is Secretly a Hybrid Model with Effortless Adaptation},
+  author  = {Zhang, X. and Zhang, F. and Du, C. and Du, C. and Pang, T. and others},
+  journal = {arXiv preprint arXiv:2410.13846},
+  year    = {2024}
+}
+@article{deepseek2024v2,
+  title   = {{DeepSeek-V2}: A Strong, Economical, and Efficient Mixture-of-Experts Language Model},
+  author  = {{DeepSeek-AI}},
+  journal = {arXiv preprint arXiv:2405.04434},
+  year    = {2024}
+}
+@article{kwon2023paged,
+  title   = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
+  author  = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez, Joseph E. and Zhang, Hao and Stoica, Ion},
+  journal = {arXiv preprint arXiv:2309.06180},
+  year    = {2023}
+}
+@inproceedings{wu2022memorizing,
+  title     = {Memorizing Transformers},
+  author    = {Wu, Yuhuai and Rabe, Markus N. and Hutchins, DeLesley and Szegedy, Christian},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2022}
+}
+@article{wang2023longmem,
+  title   = {Augmenting Language Models with Long-Term Memory},
+  author  = {Wang, Weizhi and Dong, Li and Cheng, Hao and Liu, Xiaodong and Yan, Xifeng and Gao, Jianfeng and Wei, Furu},
+  journal = {arXiv preprint arXiv:2306.07174},
+  year    = {2023}
+}
+@inproceedings{khandelwal2020knnlm,
+  title     = {Generalization through Memorization: Nearest Neighbor Language Models},
+  author    = {Khandelwal, Urvashi and Levy, Omer and Jurafsky, Dan and Zettlemoyer, Luke and Lewis, Mike},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2020}
+}
+@article{fedus2022switch,
+  title   = {Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity},
+  author  = {Fedus, William and Zoph, Barret and Shazeer, Noam},
+  journal = {arXiv preprint arXiv:2101.03961},
+  year    = {2022}
+}
+@article{du2022glam,
+  title   = {{GLaM}: Efficient Scaling of Language Models with Mixture-of-Experts},
+  author  = {Du, Nan and Huang, Yanping and Dai, Andrew M. and others},
+  journal = {arXiv preprint arXiv:2112.06905},
+  year    = {2022}
+}
+@inproceedings{cheng2023pluglm,
+  title     = {Decouple Knowledge from Parameters for Plug-and-Play Language Modeling},
+  author    = {Cheng, Xin and Lin, Yankai and Chen, Xiuying and Zhao, Dongyan and Yan, Rui},
+  booktitle = {Findings of the Association for Computational Linguistics: ACL 2023},
+  pages     = {14288--14308},
+  year      = {2023}
+}
+@article{jiang2024mixtral,
+  title   = {Mixtral of Experts},
+  author  = {Jiang, Albert Q. and Sablayrolles, Alexandre and Roux, Antoine and others},
+  journal = {arXiv preprint arXiv:2401.04088},
+  year    = {2024}
+}
+@article{dai2024deepseekmoe,
+  title   = {{DeepSeekMoE}: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models},
+  author  = {Dai, Damai and others},
+  journal = {arXiv preprint arXiv:2401.06066},
+  year    = {2024}
+}
+@article{wang2024memoryllm,
+  title   = {{MEMORYLLM}: Towards Self-Updatable Large Language Models},
+  author  = {Wang, Yu and Gao, Yifan and Chen, Xiusi and Jiang, Haoming and Li, Shiyang and Yang, Jingfeng and Yin, Qingyu and Li, Zheng and Li, Xian and Yin, Bing and Shang, Jingbo and McAuley, Julian},
+  journal = {arXiv preprint arXiv:2402.04624},
+  year    = {2024}
+}
+
+% ------------------------------------------------------------- evaluation
+@article{hsieh2024ruler,
+  title   = {{RULER}: What's the Real Context Size of Your Long-Context Language Models?},
+  author  = {Hsieh, Cheng-Ping and Sun, Simeng and Kriman, Samuel and Acharya, Shantanu and Rekesh, Dima and Jia, Fei and Zhang, Yang and Ginsburg, Boris},
+  journal = {arXiv preprint arXiv:2404.06654},
+  year    = {2024}
+}
+@article{zhang2024infbench,
+  title   = {$\infty${Bench}: Extending Long Context Evaluation Beyond 100{K} Tokens},
+  author  = {Zhang, X. and Chen, Y. and Hu, S. and Xu, Z. and Chen, J. and Hao, M. K. and Han, X. and Thai, Z. L. and Wang, S. and Liu, Z. and Sun, M.},
+  journal = {arXiv preprint arXiv:2402.13718},
+  year    = {2024}
+}
+@inproceedings{bai2024longbench,
+  title     = {{LongBench}: A Bilingual, Multitask Benchmark for Long Context Understanding},
+  author    = {Bai, Yushi and Lv, Xin and Zhang, Jiajie and Lyu, Hongchang and Tang, Jiankai and Huang, Zhidian and Du, Zhengxiao and Liu, Xiao and Zeng, Aohan and Hou, Lei and Dong, Yuxiao and Tang, Jie and Li, Juanzi},
+  booktitle = {Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics},
+  pages     = {3119--3137},
+  year      = {2024}
+}
+@article{an2023leval,
+  title   = {{L-Eval}: Instituting Standardized Evaluation for Long Context Language Models},
+  author  = {An, Chenxin and others},
+  journal = {arXiv preprint arXiv:2307.11088},
+  year    = {2023}
+}
+@article{shaham2022scrolls,
+  title   = {{SCROLLS}: Standardized {CompaRison} Over Long Language Sequences},
+  author  = {Shaham, Uri and Segal, Elad and Ivgi, Maor and Efrat, Avia and Yoran, Ori and Haviv, Adi and Gupta, Ankit and Xiong, Wenhan and Geva, Mor and Berant, Jonathan and Levy, Omer},
+  journal = {arXiv preprint arXiv:2201.03533},
+  year    = {2022}
+}
+
+% ------------------------------------------------- 2025-2026: sparse / attention
+@inproceedings{lu2025moba,
+  title     = {{MoBA}: Mixture of Block Attention for Long-Context {LLMs}},
+  author    = {Lu, E. and Jiang, Z. and Liu, J. and Du, Y. and Jiang, T. and Hong, C. and Liu, S. and He, W. and Yuan, E. and Wang, Y. and others},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2502.13189},
+  year      = {2025}
+}
+@inproceedings{yuan2025nsa,
+  title     = {Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention},
+  author    = {Yuan, J. and Gao, H. and Dai, D. and Luo, J. and Zhao, L. and Zhang, Z. and Xie, Z. and Wei, Y. and Wang, L. and Xiao, Z. and Wang, Y. and Ruan, C. and Zhang, M. and Liang, W. and Zeng, W.},
+  booktitle = {Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics},
+  note      = {arXiv:2502.11089},
+  year      = {2025}
+}
+@article{wang2025rattention,
+  title   = {{RATTENTION}: Towards the Minimal Sliding Window Size in Local-Global Attention Models},
+  author  = {Wang, B. and Lan, C. and Wang, C. and Pang, R.},
+  journal = {arXiv preprint arXiv:2506.15545},
+  year    = {2025}
+}
+@inproceedings{lu2026hypermlp,
+  title     = {{HyperMLP}: An Integrated Perspective for Sequence Modeling},
+  author    = {Lu, J. and Yang, S.},
+  booktitle = {International Conference on Machine Learning},
+  note      = {arXiv:2602.12601},
+  year      = {2026}
+}
+
+% ------------------------------------------------- 2025-2026: recurrent memory
+@inproceedings{yang2025gdn,
+  title     = {Gated Delta Networks: Improving {Mamba2} with Delta Rule},
+  author    = {Yang, Songlin and Kautz, Jan and Hatamizadeh, Ali},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2412.06464},
+  year      = {2025}
+}
+@article{peng2025rwkv7,
+  title   = {{RWKV-7} ``Goose'' with Expressive Dynamic State Evolution},
+  author  = {Peng, B. and Zhang, R. and Goldstein, D. and Alcaide, E. and Du, X. and Hou, H. and Lin, J. and Liu, J. and Lu, J. and Merrill, W. and Song, G. and Tan, K. and Utpala, S. and Wilce, N. and Wind, J. S. and Wu, T. and Wuttke, D. and Zhou-Zheng, C.},
+  journal = {arXiv preprint arXiv:2503.14456},
+  year    = {2025}
+}
+@inproceedings{guo2025loglinear,
+  title     = {Log-Linear Attention},
+  author    = {Guo, H. and Yang, S. and Goel, T. and Xing, E. P. and Dao, T. and Kim, Y.},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2506.04761},
+  year      = {2026}
+}
+@article{kimi2025linear,
+  title   = {Kimi Linear: An Expressive, Efficient Attention Architecture},
+  author  = {{Kimi Team} and Zhang, Y. and Lin, Z. and Yao, X. and Hu, J. and Meng, F. and others},
+  journal = {arXiv preprint arXiv:2510.26692},
+  year    = {2025}
+}
+@article{du2025mom,
+  title   = {{MoM}: Linear Sequence Modeling with Mixture-of-Memories},
+  author  = {Du, J. and Sun, W. and Lan, D. and Hu, J. and Cheng, Y.},
+  journal = {arXiv preprint arXiv:2502.13685},
+  year    = {2025}
+}
+@inproceedings{siems2025deltaproduct,
+  title     = {{DeltaProduct}: Improving State-Tracking in Linear {RNNs} via {Householder} Products},
+  author    = {Siems, J. and Carstensen, T. and Zela, A. and Hutter, F. and Pontil, M. and Grazzi, R.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2502.10297},
+  year      = {2025}
+}
+@inproceedings{hu2025comba,
+  title     = {Comba: Improving Bilinear {RNNs} with Closed-loop Control},
+  author    = {Hu, J. and Pan, Y. and Du, J. and Lan, D. and Tang, X. and Wen, Q. and Liang, Y. and Sun, W.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2506.02475},
+  year      = {2025}
+}
+@inproceedings{lahoti2026mamba3,
+  title     = {{Mamba-3}: Improved Sequence Modeling using State Space Principles},
+  author    = {Lahoti, A. and Li, K. Y. and Chen, B. and Wang, C. and Bick, A. and Kolter, J. Z. and Dao, T. and Gu, A.},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2603.15569},
+  year      = {2026}
+}
+@article{hatamizadeh2026gdn2,
+  title   = {Gated {DeltaNet-2}: Decoupling Erase and Write in Linear Attention},
+  author  = {Hatamizadeh, A. and Choi, Y. and Kautz, J.},
+  journal = {arXiv preprint arXiv:2605.22791},
+  year    = {2026}
+}
+@article{zou2026kaczmarz,
+  title   = {Kaczmarz Linear Attention},
+  author  = {Zou, J. and Ren, R. and Liu, Y.},
+  journal = {arXiv preprint arXiv:2605.08587},
+  year    = {2026}
+}
+@inproceedings{shaj2026kalman,
+  title     = {Kalman Linear Attention: Parallel {Bayesian} Filtering for Efficient Language Modelling and State Tracking},
+  author    = {Shaj, V. and Barker, C. and Scannell, A. and Szecsenyi, A. and Crowley, E. J. and Storkey, A.},
+  booktitle = {International Conference on Machine Learning},
+  note      = {arXiv:2602.10743},
+  year      = {2026}
+}
+@inproceedings{peng2026gka,
+  title     = {Gated {KalmaNet}: A Fading Memory Layer through Test-Time Ridge Regression},
+  author    = {Peng, L. and Chattopadhyay, A. and Zancato, L. and Nunez, E. and Xia, W. and Soatto, S.},
+  booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  note      = {arXiv:2511.21016},
+  year      = {2026}
+}
+@article{teoh2026nextlat,
+  title   = {Next-Latent Prediction Transformers Learn Compact World Models},
+  author  = {Teoh, J. and Tomar, M. and Ahn, K. and Hu, E. S. and Sharma, P. and Islam, R. and Lamb, A. and Langford, J.},
+  journal = {arXiv preprint arXiv:2511.05963},
+  year    = {2026}
+}
+
+% --------------------------------------------- 2025-2026: explicit memory
+@inproceedings{behrouz2025titans,
+  title     = {Titans: Learning to Memorize at Test Time},
+  author    = {Behrouz, Ali and Zhong, Peilin and Mirrokni, Vahab},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2501.00663},
+  year      = {2025}
+}
+@article{tandon2025ttte2e,
+  title   = {End-to-End Test-Time Training for Long Context},
+  author  = {Tandon, A. and Dalal, K. and Li, X. and Koceja, D. and R{\o}d, M. and Buchanan, S. and Wang, X. and Leskovec, J. and Koyejo, S. and Hashimoto, T. and Guestrin, C. and McCaleb, J. and Choi, Y. and Sun, Y.},
+  journal = {arXiv preprint arXiv:2512.23675},
+  year    = {2025}
+}
+@inproceedings{behrouz2025nested,
+  title     = {Nested Learning: The Illusion of Deep Learning Architectures},
+  author    = {Behrouz, A. and Razaviyayn, M. and Zhong, P. and Mirrokni, V.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2512.24695},
+  year      = {2025}
+}
+@article{kang2025lm2,
+  title   = {{LM2}: Large Memory Models},
+  author  = {Kang, J. and Wu, W. and Christianos, F. and Chan, A. J. and Greenlee, F. and Thomas, G. and Purtorab, M. and Toulis, A.},
+  journal = {arXiv preprint arXiv:2502.06049},
+  year    = {2025}
+}
+@article{yu2025explicitlm,
+  title   = {{ExplicitLM}: Decoupling Knowledge from Parameters via Explicit Memory Banks},
+  author  = {Yu, C. and Lu, Z. and Zheng, C. and Wang, C. and Zhang, Y. and Jin, Z.},
+  journal = {arXiv preprint arXiv:2511.01581},
+  year    = {2025}
+}
+@article{chaudhary2025hydra,
+  title   = {Hydra: A Modular Architecture for Efficient Long-Context Reasoning},
+  author  = {Chaudhary, S. and Patel, D. and Chaudhary, M. and Browning, B.},
+  journal = {arXiv preprint arXiv:2508.15099},
+  year    = {2025}
+}
+@article{cheng2026engram,
+  title   = {Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models},
+  author  = {Cheng, X. and Zeng, W. and Dai, D. and Chen, Q. and Wang, B. and Xie, Z. and Huang, K. and Yu, X. and Hao, Z. and Li, Y. and Zhang, H. and Zhang, H. and Zhao, D. and Liang, W.},
+  journal = {arXiv preprint arXiv:2601.07372},
+  year    = {2026}
+}
+@inproceedings{feng2026inplacettt,
+  title     = {In-Place Test-Time Training},
+  author    = {Feng, G. and Luo, S. and Hua, K. and Zhang, G. and He, D. and Huang, W. and Cai, T.},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2604.06169},
+  year      = {2026}
+}
+@inproceedings{mei2026gdwm,
+  title     = {Gated Differentiable Working Memory for Long-Context Language Modeling},
+  author    = {Mei, L. and Liu, S. and Wang, Y. and Ge, Y. and Bi, B. and Wan, J. and Yin, Z. and Guo, J. and Cheng, X.},
+  booktitle = {Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics},
+  note      = {arXiv:2601.12906},
+  year      = {2026}
+}
+@inproceedings{jaiswal2026memoryllm,
+  title     = {{MemoryLLM}: Plug-n-Play Interpretable Feed-Forward Memory for Transformers},
+  author    = {Jaiswal, A. and Hannah, L. and Kim, H.-B. and Hoang, D. and Kundu, A. and Farajtabar, M. and Cho, M.},
+  booktitle = {International Conference on Machine Learning},
+  note      = {arXiv:2602.00398},
+  year      = {2026}
+}
+@inproceedings{liu2026tttla,
+  title     = {Test-Time Training with {KV} Binding Is Secretly Linear Attention},
+  author    = {Liu, J. and Elflein, S. and Litany, O. and Gojcic, Z. and Li, R.},
+  booktitle = {International Conference on Machine Learning},
+  note      = {arXiv:2602.21204},
+  year      = {2026}
+}
+@article{cao2025olora,
+  title   = {Orthogonal Low-Rank Adaptation in {Lie} Groups for Continual Learning of Large Language Models},
+  author  = {Cao, K. and Wu, S.},
+  journal = {arXiv preprint arXiv:2509.06100},
+  year    = {2025}
+}
+@article{lu2026muonogd,
+  title   = {{Muon-OGD}: Muon-based Spectral Orthogonal Gradient Projection for {LLM} Continual Learning},
+  author  = {Lu, B. and Deng, Z. and Zhang, R. and Hu, B. and Zhao, Y. and Tian, Y. and Mou, C. and Lin, G. and Li, X.},
+  journal = {arXiv preprint arXiv:2605.08949},
+  year    = {2026}
+}
+
+% ----------------------------------------------- 2025-2026: hybrids / systems
+@article{nunez2025expansion,
+  title   = {Expansion Span: Combining Fading Memory and Retrieval in Hybrid State Space Models},
+  author  = {Nunez, E. and Zancato, L. and Bowman, B. and Golatkar, A. and Xia, W. and Soatto, S.},
+  journal = {Proceedings of the International Conference on Neuro-symbolic Systems, PMLR},
+  volume  = {288},
+  pages   = {570--596},
+  note    = {arXiv:2412.13328},
+  year    = {2025}
+}
+@inproceedings{irie2025blending,
+  title     = {Blending Complementary Memory Systems in Hybrid Quadratic-Linear Transformers},
+  author    = {Irie, K. and Yau, M. and Gershman, S. J.},
+  booktitle = {Advances in Neural Information Processing Systems},
+  note      = {arXiv:2506.00744},
+  year      = {2025}
+}
+@inproceedings{dong2025hymba,
+  title     = {Hymba: A Hybrid-head Architecture for Small Language Models},
+  author    = {Dong, X. and Fu, Y. and Diao, S. and Byeon, W. and Chen, Z. and Mahabaleshwarkar, A. S. and Liu, S.-Y. and Van Keirsbilck, M. and Chen, M.-H. and Suhara, Y. and Lin, Y. and Kautz, J. and Molchanov, P.},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2411.13676},
+  year      = {2025}
+}
+@article{zuo2025falconh1,
+  title   = {{Falcon-H1}: A Family of Hybrid-Head Language Models Redefining Efficiency and Performance},
+  author  = {Zuo, J. and Velikanov, M. and Chahed, I. and Belkada, Y. and Rhayem, D. E. and Kunsch, G. and Hacid, H. and others},
+  journal = {arXiv preprint arXiv:2507.22448},
+  year    = {2025}
+}
+@article{wang2025hybridanalysis,
+  title   = {A Systematic Analysis of Hybrid Linear Attention},
+  author  = {Wang, D. and Zhu, R.-J. and Abreu, S. and Shan, Y. and Kergan, T. and Pan, Y. and Chou, Y. and Li, Z. and Wu, J. and Zhang, G. and Huang, W. and Eshraghian, J.},
+  journal = {arXiv preprint arXiv:2507.06457},
+  year    = {2025}
+}
+@article{merrill2026olmohybrid,
+  title   = {Olmo Hybrid: From Theory to Practice and Back},
+  author  = {Merrill, W. and Li, Y. and Romero, T. and Svete, A. and Costello, C. and Dasigi, P. and Groeneveld, D. and others},
+  journal = {arXiv preprint arXiv:2604.03444},
+  year    = {2026}
+}
+@article{zheng2026amor,
+  title   = {When to Think Fast and Slow? {AMOR}: Adaptive Entropy Gate for Hybrid Models},
+  author  = {Zheng, H. and Shani, C.},
+  journal = {arXiv preprint arXiv:2602.13215},
+  year    = {2026}
+}
+@article{lufkin2026ham,
+  title   = {Hybrid Associative Memories},
+  author  = {Lufkin, L. and Figliolia, T. and Millidge, B. and Krishnamurthy, K.},
+  journal = {arXiv preprint arXiv:2603.22325},
+  year    = {2026}
+}
+@article{chattopadhyay2026priming,
+  title   = {Priming: Hybrid State Space Models from Pre-trained Transformers},
+  author  = {Chattopadhyay, A. and Nunez, E. and Kaul, P. and Bowman, B. and Zancato, L. and Becker, E. and Dao, T. and Xia, W. and Soatto, S.},
+  journal = {arXiv preprint arXiv:2605.08301},
+  year    = {2026}
+}
+@inproceedings{li2025commvq,
+  title     = {{CommVQ}: Commutative Vector Quantization for {KV} Cache Compression},
+  author    = {Li, J. and Zhang, Y. and Hassan, M. Y. and others},
+  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
+  note      = {arXiv:2506.18879},
+  year      = {2025}
+}
+@inproceedings{behrouz2026memorycaching,
+  title     = {Memory Caching: {RNNs} with Growing Memory},
+  author    = {Behrouz, A. and Li, Z. and Deng, Y. and Zhong, P. and Razaviyayn, M. and Mirrokni, V.},
+  booktitle = {International Conference on Machine Learning},
+  note      = {arXiv:2602.24281},
+  year      = {2026}
+}
+@inproceedings{oomerjee2026bottlenecked,
+  title     = {Bottlenecked Transformers: Periodic {KV} Cache Consolidation for Generalised Reasoning},
+  author    = {Oomerjee, A. and Fountas, Z. and Bou-Ammar, H. and Wang, J.},
+  booktitle = {International Conference on Learning Representations},
+  note      = {arXiv:2505.16950},
+  year      = {2026}
+}
+
+% ----------------------------------------------------------- related surveys
+@article{zhang2024agentmemory,
+  title   = {A Survey on the Memory Mechanism of Large Language Model Based Agents},
+  author  = {Zhang, Z. and Bo, X. and Ma, C. and Li, R. and Chen, X. and Dai, Q. and Zhu, J. and Dong, Z. and Wen, J.-R.},
+  journal = {arXiv preprint arXiv:2404.13501},
+  year    = {2024}
+}
+@article{wu2025humanmemory,
+  title   = {From Human Memory to {AI} Memory: A Survey on Memory Mechanisms in the Era of {LLMs}},
+  author  = {Wu, Y. and Liang, S. and Zhang, C. and Wang, Y. and Zhang, Y. and Guo, H. and Tang, R. and Liu, Y.},
+  journal = {arXiv preprint arXiv:2504.15965},
+  year    = {2025}
+}
+@article{du2025rethinking,
+  title   = {Rethinking Memory in {LLM} Based Agents: Representations, Operations, and Emerging Topics},
+  author  = {Du, Y. and Huang, W. and Zheng, D. and Wang, Z. and Montella, S. and Lapata, M. and Wong, K.-F. and Pan, J. Z.},
+  journal = {arXiv preprint arXiv:2505.00675},
+  year    = {2025}
+}
+@article{zhang2025llmmemory,
+  title   = {Memory in Large Language Models: Mechanisms, Evaluation and Evolution},
+  author  = {Zhang, D. and Li, W. and Song, K. and Lu, J. and Li, G. and Yang, L. and Li, S.},
+  journal = {arXiv preprint arXiv:2509.18868},
+  year    = {2025}
+}
+@inproceedings{luo2026storage,
+  title     = {From Storage to Experience: A Survey on the Evolution of {LLM} Agent Memory Mechanisms},
+  author    = {Luo, J. and Tian, Y. and Cao, C. and Luo, Z. and Lin, H. and Li, K. and Kong, C. and Yang, R. and Ma, J.},
+  booktitle = {Findings of the Association for Computational Linguistics: ACL 2026},
+  pages     = {41622--41652},
+  year      = {2026}
+}
