@@ -1,3 +1,2024 @@
 \chapter{The Delta-Rule Family: Gated DeltaNet, KDA, Gated DeltaNet-2, Kaczmarz}\label{ch:delta}
 
-(Chapter in preparation.)
+A linear-attention layer replaces the growing key--value cache of a Transformer with a matrix
+$\mS_t \in \R^{d_v \times d_k}$ of fixed size. Every token writes into this matrix and every
+query reads from it, so the matrix is the layer's entire memory of the past. The plain write
+$\mS_t = \mS_{t-1} + \vv_t\vk_t\T$ only ever adds: it cannot remove an outdated association and
+cannot overwrite the value stored under a key. After a few thousand tokens the matrix holds a
+superposition of everything, and reading any one association returns that association plus
+interference from all the others. The question this chapter studies is therefore not
+\emph{how large} the memory is, but \emph{how it is edited}: what to forget, what to erase, and
+what to write.
+
+The delta rule answers part of this question. It treats the memory as the weights of a linear
+regression from keys to values and updates it by one step of error correction, so a new write
+replaces the old value at its key instead of piling on top of it. The four systems in this
+chapter are refinements of that rule, all from 2025--2026; the first three have released code
+and the fourth an unconfirmed candidate:
+\begin{itemize}
+  \item \textbf{Gated DeltaNet} \citep{yang2025gdn} adds a Mamba-2-style forget gate, giving the
+  memory both fast global forgetting and targeted overwriting (\cref{sec:c05-gdn}).
+  \item \textbf{Kimi Delta Attention (KDA)} \citep{kimi2025linear} makes the forget gate a vector,
+  one decay rate per key channel, and is the recurrent core of the 48B-parameter Kimi Linear
+  hybrid (\cref{sec:c05-kda}).
+  \item \textbf{Gated DeltaNet-2} \citep{hatamizadeh2026gdn2} splits the single write strength of
+  the delta rule into a key-side erase gate and a value-side write gate (\cref{sec:c05-gdn2}).
+  \item \textbf{Kaczmarz Linear Attention} \citep{zou2026kaczmarz} reads the delta rule as the
+  Kaczmarz projection method for linear systems and normalizes the step size by the key norm
+  (\cref{sec:c05-kla}).
+\end{itemize}
+\Cref{sec:c05-background} recaps the background from \cref{ch:linear} (matrix memory, gating, the
+delta rule, the chunkwise form) so that this chapter can be read on its own, and introduces one
+update template that covers all four systems. \Cref{sec:c05-comparison} compares them. Throughout,
+the state has shape $d_v \times d_k$ and is read as $\vo_t = \mS_t\vq_t$; the papers and kernels
+often store the transpose, and we point this out where it matters.
+
+% ===========================================================================
+\section{Background: matrix memories that edit themselves}\label{sec:c05-background}
+
+\subsection{Matrix memory: write by outer product, read by product}\label{sec:c05-bg-matrix}
+
+Causal linear attention \citep{katharopoulos2020transformers} keeps, per head, the running sum
+\begin{equation}\label{eq:c05-la}
+  \mS_t = \mS_{t-1} + \vv_t\vk_t\T, \qquad \vo_t = \mS_t\vq_t = \sum_{j\le t} \vv_j\,(\vk_j\T\vq_t).
+\end{equation}
+The right-hand form shows that the read is attention without the softmax: value $\vv_j$ is weighted
+by the raw score $\vk_j\T\vq_t$. The left-hand form shows that the memory is a fast-weight matrix
+\citep{schmidhuber1992fastweights,c02-schlag2021linear}: writing is an outer product, reading is a
+matrix--vector product, and the cost per token is $\bigO(d_k d_v)$ regardless of $t$.
+
+Reading with a stored key returns that key's value only if the keys are orthonormal, since then
+$\mS\vk_i = \sum_j \vv_j (\vk_j\T\vk_i) = \vv_i$. A $d_k$-dimensional key space holds at most $d_k$
+mutually orthogonal keys, so once a sequence has more than $d_k$ distinct keys, reads interfere.
+
+\begin{example}[Interference with $d_k = 2$]\label{ex:c05-interference}
+Write $\vk_1 = (1,0)\T \mapsto v_1 = 3$ and then $\vk_2 = (1,1)\T/\sqrt2 \mapsto v_2 = -1$
+(take $d_v = 1$). Linear attention stores $\mS = 3\vk_1\T - \vk_2\T = (3 - 1/\sqrt2,\ -1/\sqrt2)$.
+Reading with $\vk_1$ gives $3 - 1/\sqrt2 \approx 2.29$, not $3$, and reading with $\vk_2$ gives
+$3/\sqrt2 - 1 \approx 1.12$, not $-1$. Neither association is recovered because the keys overlap
+($\vk_1\T\vk_2 = 1/\sqrt2$), and nothing in \cref{eq:c05-la} ever removes the error.
+\end{example}
+
+\subsection{Forgetting with gates}\label{sec:c05-bg-gates}
+
+The simplest fix is to fade old content. A scalar data-dependent gate $\alpha_t \in (0,1)$, as in
+Mamba-2 \citep{dao2024ssd} and RetNet \citep{sun2023retnet} (where it is a constant), gives
+\begin{equation}\label{eq:c05-scalar-gate}
+  \mS_t = \alpha_t \mS_{t-1} + \vv_t\vk_t\T
+  \quad\Longrightarrow\quad
+  \mS_t = \sum_{j\le t} \Big(\prod_{s=j+1}^{t}\alpha_s\Big)\vv_j\vk_j\T .
+\end{equation}
+A per-channel gate $\valpha_t \in (0,1)^{d_k}$, as in Gated Linear Attention
+\citep{yang2024gla}, multiplies the state from the right by $\diag(\valpha_t)$, so each key
+channel (column of $\mS$) fades at its own rate:
+$\mS_t = \mS_{t-1}\diag(\valpha_t) + \vv_t\vk_t\T$. Gates bound the memory and let the model
+clear it (set $\alpha_t \approx 0$ at a document boundary), but the forgetting is blind: it fades
+every association in the affected channels, whether it is stale or still needed, and it still
+cannot replace the value at one particular key.
+
+\subsection{The delta rule: writing by error correction}\label{sec:c05-bg-delta}
+
+The delta rule \citep{c02-widrow1960adaptive}, introduced into linear Transformers as DeltaNet
+\citep{c02-schlag2021linear} and made fast by \citet{c02-yang2024deltanet}, asks the memory to
+\emph{fit} the newest pair. Define the per-token regression loss
+\begin{equation}\label{eq:c05-delta-loss}
+  \ell_t(\mS) = \tfrac12\,\norm{\mS\vk_t - \vv_t}^2,
+  \qquad
+  \nabla_{\mS}\ell_t(\mS) = (\mS\vk_t - \vv_t)\,\vk_t\T .
+\end{equation}
+(The gradient follows from $\partial(\vu\T\vu/2)/\partial\mS = \vu\,\vk_t\T$ with
+$\vu = \mS\vk_t - \vv_t$.) One gradient step with learning rate $\beta_t$ from $\mS_{t-1}$ gives
+\begin{equation}\label{eq:c05-delta}
+  \mS_t = \mS_{t-1} - \beta_t(\mS_{t-1}\vk_t - \vv_t)\vk_t\T
+        = \mS_{t-1}\big(\mI - \beta_t\vk_t\vk_t\T\big) + \beta_t\vv_t\vk_t\T .
+\end{equation}
+The first form reads ``look up what the memory currently stores at $\vk_t$, namely
+$\mS_{t-1}\vk_t$, and move it toward $\vv_t$''. For a unit-norm key, reading the new state at the
+same key gives
+\begin{equation}\label{eq:c05-delta-read}
+  \mS_t\vk_t = (1-\beta_t)\,\mS_{t-1}\vk_t + \beta_t\vv_t ,
+\end{equation}
+so $\beta_t = 1$ replaces the old value exactly and $\beta_t = 0$ keeps it. For any key
+$\vk' \perp \vk_t$ the read is unchanged, $\mS_t\vk' = \mS_{t-1}\vk'$: the edit is local to the
+direction $\vk_t$.
+
+\begin{example}[The delta rule on \cref{ex:c05-interference}]
+With $\beta = 1$, the first write gives $\mS = (3, 0)$. The second write reads
+$\mS\vk_2 = 3/\sqrt2$, forms the error $-1 - 3/\sqrt2 \approx -3.12$ and adds
+$-3.12\,\vk_2\T$, so $\mS \approx (0.79,\ -2.21)$. Now $\mS\vk_2 = -1$ exactly: the newest
+association is stored without error. The older one reads $0.79$ instead of $3$, because the keys
+are not orthogonal and the second write had to move the memory along $\vk_2$, which overlaps
+$\vk_1$. (Our NumPy check reproduces these numbers.)
+\end{example}
+
+The transition $\mI - \beta_t\vk_t\vk_t\T$ has eigenvalue $1$ on the $(d_k-1)$-dimensional
+subspace orthogonal to $\vk_t$ and eigenvalue $1-\beta_t\norm{\vk_t}^2$ along $\vk_t$. With
+L2-normalized keys and $\beta_t \in (0,1)$ all eigenvalues lie in $[0,1]$, so the recurrence is
+stable; $\beta_t = 2$ would give a Householder reflection. Allowing $\beta_t \in (0,2)$ makes the
+eigenvalue along $\vk_t$ negative, which helps state tracking \citep{c03-grazzi2025unlocking}; the
+kernels below expose this as an \code{allow_neg_eigval} flag.
+
+\subsection{Chunkwise training and the UT transform (recap)}\label{sec:c05-bg-chunk}
+
+Running \cref{eq:c05-delta} token by token is sequential and uses matrix--vector products, which
+leaves GPU tensor cores idle. The chunkwise algorithm of \cref{ch:linear}
+\citep{c02-yang2024deltanet} splits the sequence into chunks of $C$ tokens, keeps the recurrence
+only across chunks, and turns the work inside a chunk into dense matrix products. For the ungated
+delta rule, with $\mK, \mV, \mQ$ the chunk's keys, values and queries stacked as rows and
+$\mS_{[i]}$ the state entering chunk $[i]$, the result is
+\begin{align}
+  \mT &= \big(\mI + \operatorname{tril}(\diag(\vbeta)\mK\mK\T,\,-1)\big)^{-1}, &
+  \mW &= \mT\diag(\vbeta)\mK, \quad \mU = \mT\diag(\vbeta)\mV, \label{eq:c05-ut}\\
+  \mS_{[i+1]} &= \mS_{[i]} + (\mU - \mW\mS_{[i]}\T)\T\mK, &
+  \mO_{[i]} &= \mQ\mS_{[i]}\T + \operatorname{tril}(\mQ\mK\T)(\mU - \mW\mS_{[i]}\T). \nonumber
+\end{align}
+Here $\operatorname{tril}(\cdot,-1)$ keeps the strictly lower triangle. The matrix $\mT$ is the
+\emph{UT transform} \citep{c03-joffrain2006accumulating}: it packs the product of $C$ rank-one updates
+$\prod_s(\mI - \beta_s\vk_s\vk_s\T) = \mI - \mW\T\mK$ into a compact ``identity minus low rank''
+form, the WY representation of products of Householder-like matrices
+\citep{c03-bischof1987wy}. The matrix inverted in $\mT$ is unit lower triangular, so computing
+$\mT$ costs one forward substitution. \Cref{sec:c05-gdn-chunk} derives the gated version of \cref{eq:c05-ut} in full, so
+this recap only states it.
+
+\subsection{One template for the whole family}\label{sec:c05-bg-template}
+
+Every system in this chapter, and the simpler memories above, fits the update
+\begin{equation}\label{eq:c05-template}
+  \boxed{\;\bar\mS_t = \mS_{t-1}\mD_t, \qquad
+  \mS_t = \bar\mS_t + \big(\vz_t - \bar\mS_t\ve_t\big)\vk_t\T
+        = \mS_{t-1}\mD_t\big(\mI - \ve_t\vk_t\T\big) + \vz_t\vk_t\T ,\qquad
+  \vo_t = \mS_t\vq_t\;}
+\end{equation}
+with a decay $\mD_t$ (scalar or diagonal), an \emph{erase vector} $\ve_t \in \R^{d_k}$ that
+decides which part of the old memory is read and removed, and a \emph{write vector}
+$\vz_t \in \R^{d_v}$ that is stored along $\vk_t$. In words: decay the memory, read what it holds
+along $\ve_t$, and write the correction $\vz_t - \bar\mS_t\ve_t$ along the key.
+\Cref{tab:c05-template} lists the choices. Reading the table top to bottom is a short history of
+the chapter: first a gate is added to the delta rule, then the gate becomes a vector, then the
+erase and write strengths are separated, and finally the step size is tied to the key norm.
+
+\begin{table}[t]
+\centering\small
+\caption{The update template of \cref{eq:c05-template},
+$\mS_t = \mS_{t-1}\mD_t(\mI - \ve_t\vk_t\T) + \vz_t\vk_t\T$, for the memories in this chapter.
+$\alpha_t$ is a scalar gate, $\valpha_t \in (0,1)^{d_k}$ a channel-wise gate,
+$\beta_t, \eta_t \in (0,1)$ scalars, $\vb_t \in [0,1]^{d_k}$ and $\vw_t \in [0,1]^{d_v}$ gate vectors.}
+\label{tab:c05-template}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Memory & decay $\mD_t$ & erase vector $\ve_t$ & write vector $\vz_t$ \\
+\midrule
+Linear attention & $\mI$ & $\mathbf{0}$ & $\vv_t$ \\
+Scalar-gated (Mamba-2 style) & $\alpha_t\mI$ & $\mathbf{0}$ & $\vv_t$ \\
+Channel-gated (GLA style) & $\diag(\valpha_t)$ & $\mathbf{0}$ & $\vv_t$ \\
+DeltaNet & $\mI$ & $\beta_t\vk_t$ & $\beta_t\vv_t$ \\
+\midrule
+Gated DeltaNet & $\alpha_t\mI$ & $\beta_t\vk_t$ & $\beta_t\vv_t$ \\
+KDA & $\diag(\valpha_t)$ & $\beta_t\vk_t$ & $\beta_t\vv_t$ \\
+Gated DeltaNet-2 & $\diag(\valpha_t)$ & $\vb_t\had\vk_t$ & $\vw_t\had\vv_t$ \\
+Kaczmarz LA (our formalization) & $\alpha_t\mI$ & $\eta_t\vk_t/\norm{\vk_t}^2$ & $\eta_t\vv_t/\norm{\vk_t}^2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{Gated DeltaNet}\label{sec:c05-gdn}
+
+\subsection{Motivation: forgetting and overwriting are complementary}
+
+Mamba-2 and DeltaNet each solve half of the editing problem. Mamba-2's gate
+(\cref{eq:c05-scalar-gate}) can empty the memory in one step but can only add new content, so
+changing the value at one key requires fading everything. DeltaNet's rule (\cref{eq:c05-delta})
+replaces the value at one key precisely, but its transition has eigenvalue exactly $1$ on every
+direction orthogonal to the current key: whatever is not overwritten stays forever, and after a
+topic change the memory is full of stale associations that can only be removed one key at a
+time. Gated DeltaNet (GDN) \citep{yang2025gdn} multiplies the delta-rule transition by a
+data-dependent scalar gate, so the model can clear the memory quickly when the context changes
+and edit it precisely otherwise. The survey summarizes the result as recurrent models that ``use
+input-conditioned delta-rule updates for content-aware retention'' \citep{zhoubian2026memory}.
+
+\begin{taxonomy}
+\textbf{Representation:} implicit (the state is a by-product of the forward pass).
+\textbf{Update dynamics:} online, one write per token at inference.
+\textbf{Persistence:} long-term within a sequence (Table~I of \citet{zhoubian2026memory}:
+``Gated Recurrence with Delta-Rule'').
+\textbf{Update rule:} state-transition update (Table~II), with main risks ``compression loss and
+state interference''. GDN is listed there as a representative example. See \cref{ch:taxonomy}.
+\end{taxonomy}
+
+\subsection{The gated delta rule}\label{sec:c05-gdn-rule}
+
+Per head, GDN updates its memory by
+\begin{equation}\label{eq:c05-gdn}
+  \mS_t = \alpha_t\,\mS_{t-1}\big(\mI - \beta_t\vk_t\vk_t\T\big) + \beta_t\vv_t\vk_t\T,
+  \qquad \vo_t = \mS_t\vq_t,
+\end{equation}
+with $\alpha_t \in (0,1)$ and $\beta_t \in (0,1)$ computed from the current token and
+$\norm{\vk_t} = 1$. In the template of \cref{eq:c05-template} this is $\mD_t = \alpha_t\mI$,
+$\ve_t = \beta_t\vk_t$, $\vz_t = \beta_t\vv_t$. Writing $\bar\mS_t = \alpha_t\mS_{t-1}$,
+\begin{equation}\label{eq:c05-gdn-sgd}
+  \mS_t = \bar\mS_t - \beta_t\big(\bar\mS_t\vk_t - \vv_t\big)\vk_t\T
+        = \bar\mS_t - \beta_t\nabla\ell_t(\bar\mS_t),
+\end{equation}
+so GDN first decays the memory and then takes one SGD step of \cref{eq:c05-delta-loss} from the
+decayed state. The Kimi Linear report describes the gate as ``a form of weight decay on the fast
+weights'' (\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}, Sec.~2.2).
+
+\paragraph{Special cases.} $\alpha_t = 1$ gives DeltaNet; $\beta_t = 0$ gives a pure decay with no
+write; $\alpha_t\to0$ resets the memory; $\alpha_t = \beta_t = 1$ overwrites the value at $\vk_t$
+exactly and leaves the orthogonal complement untouched.
+
+\paragraph{Spectrum and boundedness.} The transition
+$\mM_t = \alpha_t(\mI - \beta_t\vk_t\vk_t\T)$ is symmetric with eigenvalues $\alpha_t$ (on
+$\vk_t^\perp$, multiplicity $d_k-1$) and $\alpha_t(1-\beta_t)$ (along $\vk_t$). Hence
+$\norm{\mM_t}_2 \le \alpha_t \le 1$ and
+$\norm{\mS_t}_F \le \alpha_t\norm{\mS_{t-1}}_F + \beta_t\norm{\vv_t}$. If the gates stay below some
+$\alpha_{\max} < 1$ and the values are bounded by $v_{\max}$, unrolling gives
+$\norm{\mS_t}_F \le v_{\max}/(1-\alpha_{\max})$ for a zero initial state: the memory cannot blow up.
+
+\paragraph{Unrolled form.} Expanding \cref{eq:c05-gdn} with $\mM_t$ as above,
+\begin{equation}\label{eq:c05-gdn-unrolled}
+  \vo_t = \sum_{j\le t}\beta_j\,\vv_j\,\Big(\vk_j\T\,\mM_{j+1}\mM_{j+2}\cdots\mM_t\,\vq_t\Big).
+\end{equation}
+The score of key $j$ for query $t$ passes through the product of all later transitions, a
+data-dependent relative position encoding. The Kimi report makes the analogy with RoPE explicit:
+RoPE scores have the same form with fixed rotation matrices in place of the $\mM_s$
+(\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}, Sec.~6.1).
+
+\subsection{Chunkwise parallel form with gates}\label{sec:c05-gdn-chunk}
+
+We now derive the chunkwise algorithm with the gate included; it reduces to \cref{eq:c05-ut} when
+all $\alpha_t = 1$. Fix a chunk $[i]$ of length $C$ and drop the chunk index. Positions in the
+chunk are $r = 1,\dots,C$; $\mS_0$ is the state entering the chunk and $\mS_r$ the state after
+position $r$. Define the cumulative decay and its ratios
+\begin{equation}\label{eq:c05-gamma}
+  \gamma_r = \prod_{s=1}^{r}\alpha_s,\qquad \gamma_0 = 1,\qquad
+  \bm{\Gamma}_{rs} = \begin{cases}\gamma_r/\gamma_s & r \ge s\\ 0 & r < s,\end{cases}
+\end{equation}
+and stack $\mQ, \mK \in \R^{C\times d_k}$ and $\mV \in \R^{C\times d_v}$ with one token per row.
+
+\begin{proposition}[Chunkwise gated delta rule]\label{prop:c05-gdn-chunk}
+Let $\mA = \operatorname{tril}\big(\diag(\vbeta)(\mK\mK\T\had\bm{\Gamma}),\,-1\big)$ and
+$\mT = (\mI + \mA)^{-1}$. Define the \emph{pseudo-keys} and \emph{pseudo-values}
+\begin{equation}\label{eq:c05-gdn-wu}
+  \mW = \mT\diag(\vbeta)\diag(\bm\gamma)\mK \in \R^{C\times d_k},\qquad
+  \mU = \mT\diag(\vbeta)\mV \in \R^{C\times d_v},
+\end{equation}
+and the \emph{new values} $\bm{R} = \mU - \mW\mS_0\T \in \R^{C\times d_v}$. Then the outputs of
+the chunk and the state leaving it are
+\begin{align}
+  \mO &= \diag(\bm\gamma)\,\mQ\mS_0\T + \big(\mQ\mK\T\had\bm\Gamma\big)\,\bm{R},
+  \label{eq:c05-gdn-out}\\
+  \mS_C &= \gamma_C\,\mS_0 + \bm{R}\T\diag(\gamma_C/\bm\gamma)\,\mK .
+  \label{eq:c05-gdn-state}
+\end{align}
+\end{proposition}
+
+\begin{proof}
+Divide out the cumulative decay: let $\hat\mS_r = \mS_r/\gamma_r$. Dividing \cref{eq:c05-gdn} by
+$\gamma_r = \alpha_r\gamma_{r-1}$ gives
+$\hat\mS_r = \hat\mS_{r-1}(\mI - \beta_r\vk_r\vk_r\T) + (\beta_r/\gamma_r)\vv_r\vk_r\T$, which we
+rewrite as
+\[
+  \hat\mS_r = \hat\mS_{r-1} + \frac{1}{\gamma_r}\,\bm\rho_r\vk_r\T,\qquad
+  \bm\rho_r := \beta_r\big(\vv_r - \gamma_r\hat\mS_{r-1}\vk_r\big)
+             = \beta_r\big(\vv_r - \alpha_r\mS_{r-1}\vk_r\big).
+\]
+The vector $\bm\rho_r$ is the delta-rule correction at position $r$ (the ``new value''). Summing,
+$\hat\mS_r = \mS_0 + \sum_{s\le r}\gamma_s^{-1}\bm\rho_s\vk_s\T$, that is,
+\begin{equation}\label{eq:c05-gdn-prefix}
+  \mS_r = \gamma_r\mS_0 + \sum_{s\le r}\frac{\gamma_r}{\gamma_s}\,\bm\rho_s\vk_s\T .
+\end{equation}
+Substituting \cref{eq:c05-gdn-prefix} for $\mS_{r-1}$ into the definition of $\bm\rho_r$ and using
+$\alpha_r\gamma_{r-1} = \gamma_r$,
+\[
+  \bm\rho_r = \beta_r\vv_r - \beta_r\gamma_r\mS_0\vk_r
+              - \sum_{s<r}\beta_r\frac{\gamma_r}{\gamma_s}(\vk_s\T\vk_r)\,\bm\rho_s .
+\]
+Stacking the rows $\bm\rho_r\T$ into $\bm{R}$, the last sum is row $r$ of $\mA\bm{R}$, so
+$(\mI + \mA)\bm{R} = \diag(\vbeta)\mV - \diag(\vbeta)\diag(\bm\gamma)\mK\mS_0\T$. Multiplying by
+$\mT$ gives $\bm{R} = \mU - \mW\mS_0\T$. For the output, $\vo_r = \mS_r\vq_r$ with
+\cref{eq:c05-gdn-prefix} gives
+$\vo_r = \gamma_r\mS_0\vq_r + \sum_{s\le r}(\gamma_r/\gamma_s)(\vk_s\T\vq_r)\bm\rho_s$, which is row
+$r$ of \cref{eq:c05-gdn-out}. Setting $r = C$ in \cref{eq:c05-gdn-prefix} gives
+\cref{eq:c05-gdn-state}.
+\end{proof}
+
+Three remarks make the formulas concrete.
+\begin{itemize}
+  \item \emph{The inverse is a forward substitution.} $\mI + \mA$ is unit lower triangular, so
+  row $r$ of $\mT$ is row $r$ of $\mI$ minus $\sum_{s<r}\mA_{rs}\mT_{s,:}$; the cost is $\bigO(C^3)$ per chunk
+  and every step is a small dot product. The kernels block this into $16\times16$ pieces
+  (\cref{sec:c05-gdn-impl}).
+  \item \emph{Gates never overflow.} Every factor $\gamma_r/\gamma_s$ with $r\ge s$ is a product of
+  gates and lies in $(0,1]$. In log space it is $\exp(G_r - G_s)$ with $G_r = \sum_{s\le r}\log\alpha_s$
+  and $G_r - G_s \le 0$. With a scalar gate the factor multiplies the $C\times C$ score matrix
+  \emph{after} the matrix product $\mK\mK\T$, so it can be applied elementwise without ever forming
+  $1/\gamma_s$ on its own.
+  \item \emph{A scalar gate commutes through the inverse.} Because the gate is the same for every
+  channel, $\mK\mK\T\had\bm\Gamma = \diag(\bm\gamma)\,\mK\mK\T\diag(\bm\gamma)^{-1}$ on and below
+  the diagonal, hence $\mT = \diag(\bm\gamma)\mT^{(0)}\diag(\bm\gamma)^{-1}$ where $\mT^{(0)}$ is
+  the inverse built without decay, and $\mW = \diag(\bm\gamma)\mT^{(0)}\diag(\vbeta)\mK$. The
+  official NVlabs kernels use exactly this: they build one triangular inverse without the gate for
+  $\mW$ and one with the gate for $\mU$ (\code{fwd_prepare_wy_repr_kernel_w} and
+  \code{fwd_prepare_wy_repr_kernel_u} in \repofile{repos/NVlabs__GatedDeltaNet/lit_gpt/gated_delta_rule_ops/wy_fast.py}).
+  We checked the identity numerically. It fails as soon as the gate differs across channels, which
+  is the central difficulty of KDA (\cref{sec:c05-kda-range}).
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small,
+  chunk/.style={draw, rounded corners=2pt, minimum width=3.1cm, minimum height=1.0cm, fill=blue!5, align=center},
+  st/.style={draw, circle, fill=orange!15, inner sep=1pt, minimum size=0.95cm}]
+  \node[st] (s1) at (0,0) {$\mS_{[1]}$};
+  \node[chunk] (c1) at (2.5,0) {chunk $[1]$\\[-1pt]{\footnotesize $\mA,\mT,\mW,\mU$}};
+  \node[st] (s2) at (5.0,0) {$\mS_{[2]}$};
+  \node[chunk] (c2) at (7.5,0) {chunk $[2]$\\[-1pt]{\footnotesize $\mA,\mT,\mW,\mU$}};
+  \node[st] (s3) at (10.0,0) {$\mS_{[3]}$};
+  \node (dots) at (11.3,0) {$\cdots$};
+  \draw[-{Stealth}] (s1) -- (c1); \draw[-{Stealth}] (c1) -- (s2);
+  \draw[-{Stealth}] (s2) -- (c2); \draw[-{Stealth}] (c2) -- (s3); \draw[-{Stealth}] (s3) -- (dots);
+  \node[above=0.35cm of c1] (o1) {$\mO_{[1]}$}; \draw[-{Stealth}] (c1) -- (o1);
+  \node[above=0.35cm of c2] (o2) {$\mO_{[2]}$}; \draw[-{Stealth}] (c2) -- (o2);
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}] (1.0,-0.75) -- (9.0,-0.75)
+    node[midway, below=6pt, align=center, font=\footnotesize]
+    {intra-chunk work ($\mA$, $\mT$, $\mW$, $\mU$, scores): all chunks in parallel, dense matmuls;\\
+     state pass ($\bm R$, $\mO_{[i]}$, $\mS_{[i+1]}$): sequential over chunks};
+\end{tikzpicture}
+\caption{The chunkwise schedule. Each chunk computes its WY quantities independently; only the
+$d_v\times d_k$ state is passed from chunk to chunk.}
+\label{fig:c05-chunk}
+\end{figure}
+
+\subsection{Algorithms and complexity}\label{sec:c05-gdn-alg}
+
+\Cref{alg:c05-gdn-chunk} is the training and prefill path (\cref{fig:c05-chunk}) and
+\cref{alg:c05-decode} the decoding path. The decoding step is the template
+\cref{eq:c05-template}, so it serves all four systems in this chapter with the appropriate
+$\mD_t$, $\ve_t$, $\vz_t$.
+
+\begin{algorithm}[t]
+\caption{Chunkwise gated delta rule, one head (training and prefill)}
+\label{alg:c05-gdn-chunk}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK \in \R^{T\times d_k}$ (rows L2-normalized), $\mV \in \R^{T\times d_v}$,
+  gates $\valpha, \vbeta \in (0,1)^T$, chunk size $C$, initial state $\mS$
+\Ensure outputs $\mO \in \R^{T\times d_v}$, final state $\mS$
+\For{each chunk $[i]$ \textbf{in parallel}} \Comment{intra-chunk, no dependence on $\mS$}
+  \State $\vg \gets \mathrm{cumsum}(\log\valpha_{[i]})$; \ $\bm\gamma \gets \exp(\vg)$;
+         \ $\bm\Gamma_{rs} \gets \exp(g_r - g_s)\,[r\ge s]$
+  \State $\mA \gets \operatorname{tril}(\diag(\vbeta_{[i]})(\mK_{[i]}\mK_{[i]}\T\had\bm\Gamma), -1)$
+  \State $\mT \gets (\mI+\mA)^{-1}$ by forward substitution
+  \State $\mW_{[i]} \gets \mT\diag(\vbeta_{[i]}\had\bm\gamma)\mK_{[i]}$; \
+         $\mU_{[i]} \gets \mT\diag(\vbeta_{[i]})\mV_{[i]}$;
+         \ $\mP_{[i]} \gets \mQ_{[i]}\mK_{[i]}\T\had\bm\Gamma$
+\EndFor
+\For{$i = 1,2,\dots,T/C$ \textbf{sequentially}} \Comment{inter-chunk state pass}
+  \State $\bm R \gets \mU_{[i]} - \mW_{[i]}\mS\T$ \Comment{new values}
+  \State $\mO_{[i]} \gets \diag(\bm\gamma)\mQ_{[i]}\mS\T + \mP_{[i]}\bm R$
+  \State $\mS \gets \gamma_C\,\mS + \bm R\T\diag(\gamma_C/\bm\gamma)\mK_{[i]}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{One decoding step of the template \cref{eq:c05-template}, one head}
+\label{alg:c05-decode}
+\begin{algorithmic}[1]
+\Require state $\mS \in \R^{d_v\times d_k}$, current $\vq_t,\vk_t,\vv_t$, decay $\mD_t$,
+  erase vector $\ve_t$, write vector $\vz_t$
+\State $\mS \gets \mS\mD_t$ \Comment{GDN: $\alpha_t\mS$; KDA, GDN-2: scale column $c$ by $\alpha_t[c]$}
+\State $\vr \gets \mS\ve_t$ \Comment{read the old content along the erase direction}
+\State $\mS \gets \mS + (\vz_t - \vr)\vk_t\T$ \Comment{write the correction along the key}
+\State \Return $\vo_t = \mS\vq_t$, $\mS$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost of the chunkwise algorithm.} Per chunk and head: $\mK\mK\T$ and $\mQ\mK\T$ cost
+$\bigO(C^2 d_k)$; the forward substitution $\bigO(C^3)$; $\mW$, $\mU$ and $\mP\bm R$ cost
+$\bigO(C^2(d_k+d_v))$; and the three products with the state ($\mW\mS\T$, $\mQ\mS\T$,
+$\bm R\T\mK$) cost $\bigO(C d_k d_v)$. Over $T/C$ chunks the total is
+\[
+  \bigO\big(T\,(C d_k + C d_v + C^2 + d_k d_v)\big),
+\]
+linear in $T$ for a fixed chunk size (typically $C = 64$). All but the sequential state pass are
+matrix products that map onto tensor cores. Activation memory is $\bigO(T(d_k + d_v + C))$; the
+$T/C$ chunk-boundary states, $\bigO((T/C)d_k d_v)$, are either stored for the backward pass or
+recomputed (both official and \fla{} kernels recompute them to save memory).
+
+\paragraph{Cost of decoding.} \Cref{alg:c05-decode} costs $\bigO(d_k d_v)$ time per token and head,
+and the memory is the state ($d_k d_v$ numbers per head) plus the short-convolution caches
+described next. Neither grows with the context length; this is the reason to use the layer.
+
+\subsection{The Gated DeltaNet layer and its hybrids}\label{sec:c05-gdn-layer}
+
+The recurrence is wrapped in a layer whose every component has a job (\cref{fig:c05-gdn-layer}).
+For input $\vx_t \in \R^d$ and head $h$:
+\begin{align}
+  \vq_t, \vk_t &= \mathrm{L2Norm}\big(\SiLU(\mathrm{ShortConv}(\mW_{q/k}\vx_t))\big),\qquad
+  \vv_t = \SiLU(\mathrm{ShortConv}(\mW_v\vx_t)), \label{eq:c05-gdn-qkv}\\
+  \log\alpha_t &= -\exp(a)\cdot\mathrm{softplus}(\vw_\alpha\T\vx_t + \delta),\qquad
+  \beta_t = \sigmoid(\vw_\beta\T\vx_t), \label{eq:c05-gdn-gates}\\
+  \vy_t &= \mW_o\big[\RMSNorm(\vo_t^{h})\had\SiLU(\mW_g^{h}\vx_t)\big]_{h=1}^{H}. \label{eq:c05-gdn-out-gate}
+\end{align}
+\begin{itemize}
+  \item \emph{Short causal convolutions} (kernel size 4, depthwise) mix each projection with the
+  previous three tokens before it enters the memory, so keys can encode local $n$-gram context;
+  the \fla{} layer warns that turning them off hurts quality.
+  \item \emph{L2-normalized $\vq,\vk$} make $\vk\vk\T$ a projector and put the transition
+  eigenvalues in $[0,1]$ (\cref{sec:c05-gdn-rule}).
+  \item \emph{The decay} uses the Mamba-2 parameterization: a per-head rate $\exp(a)$ times a
+  softplus ``time step''. At initialization the code draws $\exp(a)$ uniformly from $[0,16]$ and the
+  time step from $[0.001, 0.1]$ (log-uniform), stored through the inverse softplus in $\delta$
+  (\code{A_log}, \code{dt_bias}). The gate is computed in fp32 and is never larger than $1$.
+  \item \emph{The output gate and per-head RMSNorm} rescale the read-out and let the token suppress
+  it; the official layer uses a SiLU (swish) gate.
+\end{itemize}
+The \fla{} docstring budgets about $6d^2$ parameters per layer, like Mamba-2: $0.75d^2$ each for
+$\mW_q$ and $\mW_k$ and $1.5d^2$ each for $\mW_v$, $\mW_g$ and $\mW_o$ (heads with
+$d_v = 2d_k$).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\footnotesize, node distance=0.35cm,
+  op/.style={draw, rounded corners=2pt, fill=gray!8, minimum height=0.55cm, align=center, inner sep=2pt},
+  core/.style={draw, rounded corners=2pt, fill=blue!8, minimum height=0.7cm, minimum width=9.0cm, align=center}]
+  \node[op] (lq) at (0,0) {Linear}; \node[op] (lk) at (2.0,0) {Linear}; \node[op] (lv) at (4.0,0) {Linear};
+  \node[op] (la) at (6.0,0) {Linear}; \node[op] (lb) at (8.0,0) {Linear}; \node[op] (lg) at (10.4,0) {Linear};
+  \node[op, above=of lq] (cq) {Conv, SiLU}; \node[op, above=of lk] (ck) {Conv, SiLU}; \node[op, above=of lv] (cv) {Conv, SiLU};
+  \node[op, above=of cq] (nq) {L2}; \node[op, above=of ck] (nk) {L2};
+  \node[op, above=of la] (ga) {$-e^{a}\,\mathrm{softplus}(\cdot)$}; \node[op, above=of lb] (gb) {$\sigmoid(\cdot)$};
+  \node[core] (rule) at (4.0,2.9) {gated delta rule, \cref{eq:c05-gdn}};
+  \node[op, above=0.45cm of rule] (norm) {RMSNorm (per head)};
+  \node[op] (mul) at (10.4, 0 |- norm) {$\had\ \SiLU(\cdot)$};
+  \node[op, above=0.35cm of mul] (out) {Linear $\mW_o$};
+  \draw[-{Stealth}] (lq) -- (cq); \draw[-{Stealth}] (cq) -- (nq); \draw[-{Stealth}] (nq) -- (nq |- rule.south) node[pos=0.5,left]{$\vq$};
+  \draw[-{Stealth}] (lk) -- (ck); \draw[-{Stealth}] (ck) -- (nk); \draw[-{Stealth}] (nk) -- (nk |- rule.south) node[pos=0.5,left]{$\vk$};
+  \draw[-{Stealth}] (lv) -- (cv); \draw[-{Stealth}] (cv) -- (cv |- rule.south) node[pos=0.6,left]{$\vv$};
+  \draw[-{Stealth}] (la) -- (ga); \draw[-{Stealth}] (ga) -- (ga |- rule.south) node[pos=0.5,right]{$\alpha_t$};
+  \draw[-{Stealth}] (lb) -- (gb); \draw[-{Stealth}] (gb) -- (gb |- rule.south) node[pos=0.5,right]{$\beta_t$};
+  \draw[-{Stealth}] (rule) -- (norm); \draw[-{Stealth}] (norm) -- (mul);
+  \draw[-{Stealth}] (lg) -- (mul) node[pos=0.5,right]{$\mW_g\vx_t$}; \draw[-{Stealth}] (mul) -- (out);
+  \node[below=0.3cm of la] (x) {input $\vx_t$ (to every Linear)};
+\end{tikzpicture}
+\caption{The Gated DeltaNet layer, per head. All six linear maps read the same input $\vx_t$.}
+\label{fig:c05-gdn-layer}
+\end{figure}
+
+\paragraph{Hybrids in the official repository.} The official README compares GDN with hybrid
+models as well, and the mirrored code documents one GDN hybrid through its configurations: in
+\code{GatedDeltaNet_H1_0.4B} and \code{GatedDeltaNet_H1_1.3B} the option
+\code{gated_delta_per_layer=2} makes every even layer a GDN layer and every odd layer causal
+attention with a sliding window of $2048$ tokens (\code{local_window = 2048}), while
+\code{GatedDeltaNet_0.4B} and \code{GatedDeltaNet_1.3B} use GDN in every layer
+(\repofile{repos/NVlabs__GatedDeltaNet/lit_gpt/config.py}). For the other hybrid variants in the
+paper, see the paper; hybrids in general are the subject of \cref{ch:hybrid}.
+
+\subsection{Implementation walkthrough}\label{sec:c05-gdn-impl}
+
+Two code bases implement GDN: the official training code \repo{NVlabs__GatedDeltaNet}, built on
+the Samba/LitGPT code base \citep{ren2024samba}, and the maintained kernels in \fla{}
+(\repo{fla-org__flash-linear-attention}), which the official README recommends because they are
+faster and support variable-length batches. One convention differs from this book everywhere:
+the code stores the state as a $d_k\times d_v$ matrix \code{h} (our $\mS\T$), reads it as
+$\mS\T\vq$, and the \fla{} layer passes \code{state_v_first=True} to switch to our
+$d_v\times d_k$ layout.
+
+\begin{implnote}[title={In the code: the official layer (\texttt{lit\_gpt/gated\_delta\_net.py})}]
+\code{GatedDeltaNet} in \repofile{repos/NVlabs__GatedDeltaNet/lit_gpt/gated_delta_net.py} uses
+\code{expand_k=0.75}, \code{expand_v=1.5} and \code{num_heads=9}; with the configs' model width
+$d = 1536$ this gives $d_k = 1152/9 = 128$ and $d_v = 2304/9 = 256$ per head, so each head holds a
+$256\times128$ state. \Cref{lst:c05-nv-gates} shows how the gates are formed: with
+\code{use_mamba_gate=True} (the default) the log-decay is
+$-\exp(\text{\code{A_log}})\cdot\mathrm{softplus}(\cdot + \text{\code{dt_bias}})$, exactly
+\cref{eq:c05-gdn-gates}, and $\beta_t$ is a sigmoid. Other options in the same file are a
+\code{longhorn} normalization, $\beta/(1+\beta\norm{\vk}^2)$, which reappears in
+\cref{sec:c05-kla}, and a softmax feature map. The kernel \code{chunk_gated_delta_rule} in
+\repofile{repos/NVlabs__GatedDeltaNet/lit_gpt/gated_delta_rule_ops/chunk.py} pads the sequence to
+a multiple of the chunk size $64$, takes the per-chunk cumulative sum of the log-gates and
+multiplies it by $1.44269504 = \log_2 e$ so that the Triton kernels can use the faster
+\code{exp2}. The same file contains \code{recurrent_gated_delta_rule_ref} and
+\code{chunk_gated_delta_rule_ref}, readable PyTorch references. In
+\repofile{repos/NVlabs__GatedDeltaNet/lit_gpt/model.py}, \code{Block} chooses GDN when
+\code{layer_idx \% gated_delta_per_layer == 0} and otherwise sliding-window attention through
+FlashAttention's \code{window_size} argument.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}NVlabs\_\_GatedDeltaNet/\allowbreak{}lit\_gpt/\allowbreak{}gated\_delta\_net.py} (gates and key normalization)},label={lst:c05-nv-gates}]
+        gk = self.gk_proj(hidden_states).float()
+        if self.use_mamba_gate:
+            gk = -self.A_log.float().exp() * F.softplus(gk + self.dt_bias)
+        else:
+            gk = F.logsigmoid(gk) / self.gate_logit_normalizer
+        gk = gk.transpose(1, 2)
+
+        beta = self.b_proj(hidden_states).float().sigmoid()
+        beta = beta.transpose(1, 2)
+        # ...
+        if self.qk_norm == 'l2':
+            q = l2_norm_fn(q).to(v)
+            k = l2_norm_fn(k).to(v)
+\end{lstlisting}
+
+The \fla{} version keeps the same mathematics but organizes the forward pass into four kernels
+(\cref{lst:c05-fla-fwd}), one per stage of \cref{alg:c05-gdn-chunk}.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}gated\_delta\_rule/\allowbreak{}chunk.py}, function \texttt{chunk\_gated\_delta\_rule\_fwd}},label={lst:c05-fla-fwd}]
+    if use_gate_in_kernel:
+        g = gdn_gate_chunk_cumsum(
+            # ...
+        )
+    else:
+        g = chunk_local_cumsum(
+            g,
+            chunk_size=chunk_size,
+            scale=RCP_LN2,
+            # ...
+        )
+    # obtain WY representation. u is actually the new v.
+    # fused kkt + solve_tril + recompute_w_u
+    w, u, A = chunk_gated_delta_rule_fwd_intra(
+        k=k,
+        v=v,
+        # ...
+    )
+    # ...
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        # ...
+    )
+    # ...
+    o = chunk_fwd_o(
+        # ...
+    )
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the \fla{} kernel pipeline (\texttt{fla/ops/gated\_delta\_rule})}]
+\begin{enumerate}[leftmargin=*]
+  \item \emph{Gate and cumulative sum.} \code{chunk_local_cumsum} computes $\vg$ of
+  \cref{alg:c05-gdn-chunk} within each chunk, scaled by \code{RCP_LN2} $=1/\ln 2$ (base-2 logs).
+  With \code{use_gate_in_kernel=True} (what the layer uses) the gate activation
+  $-\exp(\text{\code{A_log}})\,\mathrm{softplus}(g + \text{\code{dt_bias}})$ is fused into the same pass
+  (\code{gdn_gate_chunk_cumsum} in \repofile{fla/ops/gated_delta_rule/gate.py}).
+  \item \emph{Intra-chunk WY quantities.} \code{chunk_gated_delta_rule_fwd_intra} in
+  \repofile{fla/ops/gated_delta_rule/chunk_fwd.py} returns \code{w}, \code{u} and the inverse
+  \code{A} (our $\mW$, $\mU$, $\mT$). For chunk size 64 it fuses $\diag(\vbeta)(\mK\mK\T\had\bm\Gamma)$
+  and the triangular solve into one kernel that keeps ``all 10 lower-triangular $[BC, BC]$
+  blocks'' with $BC = 16$ in registers, solves the four diagonal $16\times16$ blocks by forward
+  substitution and merges them using
+  $\begin{psmallmatrix}\bm L_1&0\\\bm N&\bm L_2\end{psmallmatrix}^{-1} =
+   \begin{psmallmatrix}\bm L_1^{-1}&0\\-\bm L_2^{-1}\bm N\bm L_1^{-1}&\bm L_2^{-1}\end{psmallmatrix}$.
+  For chunk sizes 16 and 32 it calls \code{chunk_scaled_dot_kkt_fwd} and \code{solve_tril}
+  (\repofile{fla/ops/utils/solve_tril.py}). \code{recompute_w_u_fwd} in
+  \repofile{fla/ops/gated_delta_rule/wy_fast.py} then forms \code{u = A @ (beta * v)} and
+  \code{w = A @ (beta * exp2(g) * k)}, our \cref{eq:c05-gdn-wu}.
+  \item \emph{State pass.} \code{chunk_gated_delta_rule_fwd_h} in
+  \repofile{fla/ops/common/chunk_delta_h.py} runs the sequential loop: it computes
+  \code{v_new = u - w @ h} (our $\bm R$), decays the state by $\gamma_C$, and adds
+  $\bm R\T\diag(\gamma_C/\bm\gamma)\mK$. The same kernel has a \code{USE_GK} branch that scales
+  each key channel separately; KDA and GDN-2 reuse it (\cref{sec:c05-kda-impl}).
+  \item \emph{Output.} \code{chunk_fwd_o} applies \cref{eq:c05-gdn-out}.
+\end{enumerate}
+Paths above are relative to \repo{fla-org__flash-linear-attention}. The public entry point
+\code{chunk_gated_delta_rule} accepts chunk sizes 16, 32 or 64 (default 64), grouped value heads
+(more value heads than key heads, ``GVA''), packed variable-length batches through
+\code{cu_seqlens}, context parallelism, an in-kernel L2 normalization of $\vq,\vk$
+(\code{use_qk_l2norm_in_kernel}), an in-kernel sigmoid for $\beta$ and the
+\code{allow_neg_eigval} option, which doubles $\beta$ to reach the range $(0,2)$
+\citep{c03-grazzi2025unlocking}. The default query scale is $d_k^{-1/2}$.
+\end{implnote}
+
+\begin{sloppypar}
+The plain-PyTorch reference \code{naive_chunk_gated_delta_rule} in
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/gated_delta_rule/naive.py} is the clearest
+bridge from \cref{prop:c05-gdn-chunk} to code (\cref{lst:c05-fla-naive}). Its state \code{S} is
+$d_k\times d_v$ (our $\mS\T$), \code{decay} is the cumulative log-gate $\vg$, \code{L_mask} is
+$\bm\Gamma$, the loop over \code{i} is the forward substitution producing $\mT$, \code{k_cumsum}
+is $\mU$ (the values were already multiplied by $\beta$), \code{k_cumdecay} is $\mW$ and
+\code{v_new} is $\bm R$.
+\end{sloppypar}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}gated\_delta\_rule/\allowbreak{}naive.py}, function \texttt{naive\_chunk\_gated\_delta\_rule}},label={lst:c05-fla-naive}]
+    decay = decay.squeeze(-1).cumsum(-1)
+    decay_exp = decay.exp()[..., None]
+    L_mask = ((decay.unsqueeze(-1) - decay.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ k.transpose(-1, -2)) * L_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        attn[..., i, :i] = attn[..., i, :i].clone() + (attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=torch.float, device=q.device)
+    attn = attn
+    k_cumsum = attn @ v
+    k_cumdecay = attn @ (k_beta * decay_exp)
+    v = k_cumsum
+    # ...
+    for i in range(0, l // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ S
+        v_new = v_i - v_prime
+        o_inter = (q_i * decay[:, :, i, :, None].exp()) @ S
+        o[:, :, i] = o_inter + attn @ v_new
+        S = S * decay[:, :, i, -1, None, None].exp() + (k_i * (decay[:, :, i, -1, None] - decay[:, :, i]).exp()
+                                                        [..., None]).transpose(-1, -2) @ v_new
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: decoding and the layer (\texttt{fused\_recurrent.py}, \texttt{layers/gated\_deltanet.py})}]
+At inference the \fla{} layer \code{GatedDeltaNet} (\repofile{fla/layers/gated_deltanet.py})
+switches to \code{fused_recurrent_gated_delta_rule} when gradients are off and the input has at
+most 64 tokens, which is the decoding case. That Triton kernel keeps one $d_v$-block of the state in
+registers and loops over time, which is \cref{alg:c05-decode} line by line
+(\cref{lst:c05-fla-recur}): decay \code{b_h}, form
+\code{b_v = beta * (v - h k)}, add the rank-one update, read \code{b_o}. It is general enough to
+also accept a per-key-channel gate \code{gk} (used by KDA), a per-value-channel gate \code{gv} and
+a per-value-channel $\beta$. The layer caches the recurrent state and the three short-convolution
+states (\code{conv_state}) between calls. Its defaults are \code{head_dim=256},
+\code{num_heads=6}, \code{expand_v=2}; \code{A_log} is initialized as $\log U[0,16]$ and
+\code{dt_bias} as the inverse softplus of a log-uniform draw from $[0.001, 0.1]$, both excluded
+from weight decay. The output uses \code{FusedRMSNormGated}, whose default gate is swish.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}gated\_delta\_rule/\allowbreak{}fused\_recurrent.py} (time loop of the decoding kernel)},label={lst:c05-fla-recur}]
+        if USE_G:
+            b_g = tl.load(p_g).to(tl.float32)
+            if USE_GATE_IN_KERNEL:
+                b_A = tl.load(A_log + i_hv).to(tl.float32)
+                if HAS_DT_BIAS:
+                    b_g = b_g + tl.load(dt_bias + i_hv).to(tl.float32)
+                b_g = -exp(b_A) * softplus(b_g)
+            b_h *= exp(b_g)
+        # ...
+        if STATE_V_FIRST:
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[None, :], 1))
+            b_h += b_v[:, None] * b_k[None, :]
+            b_o = tl.sum(b_h * b_q[None, :], 1)
+\end{lstlisting}
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c05-ours-gdn} implements \cref{eq:c05-gdn} token by token and
+\cref{prop:c05-gdn-chunk} chunk by chunk, in our $d_v\times d_k$ layout. It omits the batch and
+head dimensions, the layer around the recurrence, and every kernel optimization; its only purpose
+is to make the equations executable. The \code{torch.tril} inside the exponent sets the
+entries above the diagonal to $\exp(0) = 1$ before they are masked, so no intermediate overflows.
+We ran it, through a thin NumPy stand-in for the few \code{torch} calls it uses, on random inputs
+with $T = 70$ (not a multiple of $C = 16$), $d_k = 8$, $d_v = 5$ and a nonzero initial state:
+the chunkwise and recurrent outputs and final states agree to $4\times10^{-16}$.
+
+\begin{lstlisting}[caption={Reference implementation (ours): Gated DeltaNet, recurrent and chunkwise},label={lst:c05-ours-gdn}]
+import torch
+
+def gdn_recurrent(q, k, v, alpha, beta, S=None):
+    # q, k: (T, dk), L2-normalized; v: (T, dv); alpha, beta: (T,)
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S   # S: (dv, dk)
+    o = []
+    for t in range(T):
+        S = alpha[t] * S                                      # forget
+        S = S + beta[t] * torch.outer(v[t] - S @ k[t], k[t])  # delta write
+        o.append(S @ q[t])                                    # read
+    return torch.stack(o), S
+
+def tri_inverse(A):
+    # (I + A)^{-1} for strictly lower-triangular A, by forward substitution
+    T = torch.eye(A.shape[0])
+    for r in range(1, A.shape[0]):
+        T[r, :r] = -A[r, :r] @ T[:r, :r]
+    return T
+
+def gdn_chunk(q, k, v, alpha, beta, C=64, S=None):
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    o = []
+    for c in range(0, T, C):
+        Q, K, V, b = q[c:c+C], k[c:c+C], v[c:c+C], beta[c:c+C]
+        G = torch.cumsum(torch.log(alpha[c:c+C]), 0)          # log gamma_r
+        Gam = torch.exp(torch.tril(G[:, None] - G[None, :]))  # gamma_r/gamma_s
+        A = torch.tril(b[:, None] * (K @ K.T) * Gam, -1)
+        Tm = tri_inverse(A)                                   # UT transform
+        U = Tm @ (b[:, None] * V)                             # pseudo-values
+        W = Tm @ ((b * torch.exp(G))[:, None] * K)            # pseudo-keys
+        R = U - W @ S.T                                       # new values
+        P = torch.tril((Q @ K.T) * Gam)                       # causal scores
+        o.append(torch.exp(G)[:, None] * (Q @ S.T) + P @ R)
+        S = torch.exp(G[-1]) * S + R.T @ (torch.exp(G[-1] - G)[:, None] * K)
+    return torch.cat(o), S
+\end{lstlisting}
+
+\begin{results}
+\textbf{Official README} (\repofile{repos/NVlabs__GatedDeltaNet/README.md}). The results are shown
+only as figures, so we state the claims qualitatively: GDN shows higher training throughput than
+Mamba-2 and Samba; it ``outperforms competitors of various types (e.g. Transformer, RNN, hybrid)
+in terms of perplexity and zero-shot accuracy on reasoning benchmarks''; and it ``achieves
+favorable perplexity scores on long-context benchmarks''. See the paper for the numbers. The README
+also states that training the H1 hybrid with 0.4B parameters on 15B tokens ``requires 4 nodes and
+can be finished in approximately 4 hours'', that no pretrained weights are released, and that GDN
+has been adopted in Qwen3-Next, Qwen3.5 and OLMo Hybrid \citep{merrill2026olmohybrid}.
+
+\textbf{GDN as a baseline in other mirrored files.} The GDN-2 README
+(\repofile{repos/NVlabs__GatedDeltaNet-2/README.md}; 1.3B parameters, 100B FineWeb-Edu tokens)
+reports for GDN a WikiText perplexity of 16.40 and an average accuracy of 52.07 as a recurrent
+model, and 16.00 and 52.25 in the hybrid with sliding-window attention. The Kimi Linear technical
+report (\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}, Fig.~1; 1.4T training tokens,
+48B-A3B MoE) reports 47.9 on MMLU-Pro (4k context) and 80.5 on RULER (128k context) for its
+GDN-H hybrid baseline.
+\end{results}
+
+\subsection{Discussion}
+
+GDN is the simplest member of the family that has both of the editing operations a fixed-size
+memory needs: a global ``clear'' ($\alpha_t$) and a local ``replace'' ($\beta_t$). It keeps the
+hardware-friendly WY structure of DeltaNet, so training is as fast as for gated linear attention,
+and its decoding state is a constant $d_k\times d_v$ per head. These properties explain its
+adoption in large hybrids.
+
+Its limitations set the agenda for the rest of the chapter. The gate is one number per head, so
+clearing stale content in some channels clears all of them (KDA, \cref{sec:c05-kda}). One scalar
+$\beta_t$ decides both how much of the old value is erased and how much of the new one is written
+(GDN-2, \cref{sec:c05-gdn2}). The step size ignores the scale of the key, which the code removes by
+normalizing the key itself (Kaczmarz LA, \cref{sec:c05-kla}). Because the transitions are
+symmetric with eigenvalues in $[0,1]$, GDN cannot represent rotations or sign flips; DeltaProduct
+and RWKV-7 enrich the transition (\cref{ch:expressive}), log-linear attention gives GDN a growing
+hierarchy of states (\cref{ch:structured}), and the fixed state size limits exact recall, which is
+why GDN is usually combined with some attention layers (\cref{ch:hybrid}). The view of
+\cref{eq:c05-gdn-sgd} as one SGD step on a regression loss is the bridge to test-time training
+(\cref{ch:ttt}).
+
+% ===========================================================================
+\section{Kimi Delta Attention and Kimi Linear}\label{sec:c05-kda}
+
+\subsection{Motivation: one forgetting rate per channel}
+
+In GDN the forget gate $\alpha_t$ is a single number per head and token. A finite memory would be
+used better if different parts of it could live on different time scales: some key channels
+holding associations that must survive thousands of tokens, others refreshed every few tokens.
+Gated linear attention \citep{yang2024gla} already had such channel-wise gates but no delta rule;
+GDN has the delta rule but only a scalar gate. Kimi Delta Attention (KDA), the token mixer of Kimi
+Linear \citep{kimi2025linear}, combines the two. The survey describes it as introducing
+``channel-wise diagonal decay within a structured diagonal-plus-low-rank transition''
+\citep{zhoubian2026memory}. The technical report adds a second motivation: if GDN acts as a
+learned, multiplicative position encoding (\cref{eq:c05-gdn-unrolled}), then a per-channel decay
+gives each channel its own ``frequency'', the way RoPE gives each pair of dimensions its own
+rotation speed (\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}, Sec.~6.1). This is why
+Kimi Linear can drop position encodings from its attention layers.
+
+\begin{taxonomy}
+\textbf{Representation:} implicit. \textbf{Update dynamics:} online. \textbf{Persistence:}
+long-term within a sequence (Table~I of \citet{zhoubian2026memory}: ``KDA / Kimi Linear,
+Channel-Wise Gated Delta Memory''). \textbf{Update rule:} a state-transition update in the sense of
+Table~II; the survey's text groups KDA with RWKV-7, DeltaProduct and Comba as ``expressive delta
+and bilinear updates''. In the full Kimi Linear model the KDA memory is paired with a global
+attention memory (\cref{ch:hybrid}).
+\end{taxonomy}
+
+\subsection{Channel-wise decay in the delta rule}\label{sec:c05-kda-rule}
+
+KDA replaces $\alpha_t$ by $\diag(\valpha_t)$ with $\valpha_t \in (0,1)^{d_k}$:
+\begin{equation}\label{eq:c05-kda}
+  \mS_t = \mS_{t-1}\diag(\valpha_t)\big(\mI - \beta_t\vk_t\vk_t\T\big) + \beta_t\vv_t\vk_t\T,
+  \qquad \vo_t = \mS_t\vq_t .
+\end{equation}
+In the template, $\mD_t = \diag(\valpha_t)$, $\ve_t = \beta_t\vk_t$, $\vz_t = \beta_t\vv_t$. The
+report writes the transpose, $\mS_t = (\mI - \beta_t\vk_t\vk_t\T)\diag(\valpha_t)\mS_{t-1} +
+\beta_t\vk_t\vv_t\T$ with $\mS_t \in \R^{d_k\times d_v}$. Multiplying from the right by
+$\diag(\valpha_t)$ scales column $c$ of $\mS$, that is, everything stored along key channel $c$, by
+$\alpha_t[c]$.
+
+The order of the two factors matters because $\diag(\valpha_t)$ and $\vk_t\vk_t\T$ do not commute.
+KDA decays first and erases second: with $\bar\mS_t = \mS_{t-1}\diag(\valpha_t)$,
+\begin{equation}\label{eq:c05-kda-sgd}
+  \mS_t = \bar\mS_t + \beta_t\big(\vv_t - \bar\mS_t\vk_t\big)\vk_t\T ,
+\end{equation}
+so the value that is corrected is the one the \emph{decayed} memory would return. As for GDN, this
+is one SGD step of \cref{eq:c05-delta-loss} taken at the decayed state (report, Table~7).
+
+\paragraph{The spectrum stays in $[0,1]$.} The transition
+$\mM_t = \diag(\valpha_t)(\mI - \beta_t\vk_t\vk_t\T)$ is no longer symmetric, but it is similar to a
+symmetric matrix. With $\mD = \diag(\valpha_t)$ and $\mP = \mI - \beta_t\vk_t\vk_t\T$,
+$\mD^{-1/2}\mM_t\mD^{1/2} = \mD^{1/2}\mP\mD^{1/2}$, which is symmetric. Since $\mP$ has eigenvalues
+in $[0,1]$, for every $\vx$ we have
+$0 \le \vx\T\mD^{1/2}\mP\mD^{1/2}\vx \le \norm{\mD^{1/2}\vx}^2 \le \max_c\alpha_t[c]\,\norm{\vx}^2$.
+Hence the eigenvalues of $\mM_t$ are real and lie in $[0, \max_c\alpha_t[c]]$; a numerical check
+over 5{,}000 random draws agrees.
+
+\subsection{A constrained diagonal-plus-low-rank transition}\label{sec:c05-kda-dplr}
+
+Expanding the product,
+\begin{equation}\label{eq:c05-kda-dplr}
+  \mM_t = \diag(\valpha_t) - (\valpha_t\had\vk_t)(\beta_t\vk_t)\T ,
+\end{equation}
+a diagonal matrix minus a rank-one matrix. General diagonal-plus-low-rank (DPLR) transitions
+$\mD_t - \va_t\bm c_t\T$ with free vectors $\va_t,\bm c_t$ appear in S4-style state-space models and in
+RWKV-7 (\cref{ch:expressive}). KDA ties both low-rank factors to the key. The report argues that
+this is the right trade-off: it keeps the classical delta-rule semantics (``erase what is stored at
+$\vk_t$, write $\vv_t$ there'') and it makes the chunkwise kernel much cheaper, because the
+intra-chunk matrices that a general DPLR kernel needs for $\va$ and $\bm c$ separately collapse into
+the two that involve only $\vq$ and $\vk$ (report, Sec.~6.2).
+
+\subsection{Chunkwise form with per-channel gates}\label{sec:c05-kda-chunk}
+
+The derivation of \cref{prop:c05-gdn-chunk} goes through with vectors in place of scalars. Inside a
+chunk let $\vg_r = \sum_{s\le r}\log\valpha_s \in \R^{d_k}$ (componentwise) and
+$\bm\gamma_r = \exp(\vg_r)$, and stack the $\vg_r\T$ as rows of $\mG \in \R^{C\times d_k}$.
+
+\begin{proposition}[Chunkwise KDA]\label{prop:c05-kda-chunk}
+Define, for $s < r$ and $s \le r$ respectively,
+\begin{equation}\label{eq:c05-kda-scores}
+  \mA_{rs} = \beta_r\sum_{c=1}^{d_k} k_r[c]\,k_s[c]\,e^{\,G_{rc} - G_{sc}},\qquad
+  \mP_{rs} = \sum_{c=1}^{d_k} q_r[c]\,k_s[c]\,e^{\,G_{rc} - G_{sc}},
+\end{equation}
+and zero elsewhere. With $\mT = (\mI + \mA)^{-1}$,
+$\mW = \mT\diag(\vbeta)(e^{\mG}\had\mK)$, $\mU = \mT\diag(\vbeta)\mV$ and
+$\bm R = \mU - \mW\mS_0\T$:
+\begin{align}
+  \mO &= (e^{\mG}\had\mQ)\,\mS_0\T + \mP\bm R, \label{eq:c05-kda-out}\\
+  \mS_C &= \mS_0\diag(\bm\gamma_C) + \bm R\T\big(e^{\vg_C\T - \mG}\had\mK\big), \label{eq:c05-kda-state}
+\end{align}
+where $e^{\mG}$ is applied elementwise and row $r$ of $e^{\vg_C\T - \mG}$ is
+$\exp(\vg_C - \vg_r)\T$.
+\end{proposition}
+
+\begin{proof}
+Normalize each column by its own cumulative decay: $\hat\mS_r = \mS_r\diag(\bm\gamma_r)^{-1}$.
+Substituting \cref{eq:c05-kda} and using $\diag(\bm\gamma_r) = \diag(\bm\gamma_{r-1})\diag(\valpha_r)$
+gives
+\[
+  \hat\mS_r = \hat\mS_{r-1} + \bm\rho_r\,(\vk_r\oslash\bm\gamma_r)\T,\qquad
+  \bm\rho_r = \beta_r\big(\vv_r - \hat\mS_{r-1}(\bm\gamma_r\had\vk_r)\big),
+\]
+where $\oslash$ is elementwise division. This is the scalar proof with the \emph{read} key
+$\bm\gamma_r\had\vk_r$ and the \emph{write} key $\vk_r\oslash\bm\gamma_r$ now different vectors.
+Summing, $\hat\mS_{r-1} = \mS_0 + \sum_{s<r}\bm\rho_s(\vk_s\oslash\bm\gamma_s)\T$, and
+\[
+  \bm\rho_r = \beta_r\vv_r - \beta_r\mS_0(\bm\gamma_r\had\vk_r)
+     - \sum_{s<r}\beta_r\big[(\vk_s\oslash\bm\gamma_s)\T(\bm\gamma_r\had\vk_r)\big]\bm\rho_s .
+\]
+The bracket is $\sum_c k_s[c]k_r[c]\gamma_r[c]/\gamma_s[c]$, so the last term is row $r$ of
+$\mA\bm R$ and the rest follows exactly as in \cref{prop:c05-gdn-chunk}:
+$(\mI+\mA)\bm R = \diag(\vbeta)\mV - \diag(\vbeta)(e^{\mG}\had\mK)\mS_0\T$. The output
+$\vo_r = \mS_r\vq_r = \hat\mS_r(\bm\gamma_r\had\vq_r)$ gives \cref{eq:c05-kda-out}, and
+$\mS_C = \hat\mS_C\diag(\bm\gamma_C)$ gives \cref{eq:c05-kda-state}.
+\end{proof}
+
+These are equations (6)--(9) of the report in our orientation. With $\valpha_t = \alpha_t\mathbf 1$
+they reduce to \cref{prop:c05-gdn-chunk}; our NumPy check confirms both the proposition and this
+reduction to round-off.
+
+\subsection{Numerical range: why per-channel gates are hard}\label{sec:c05-kda-range}
+
+Everything in \cref{prop:c05-kda-chunk} is a product of gates and therefore at most $1$; the
+difficulty is computing it fast. Tensor cores multiply matrices, so the kernel wants $\mA$ and $\mP$
+as matrix products. With a scalar gate this was free: compute $\mK\mK\T$, then multiply entry
+$(r,s)$ by $\gamma_r/\gamma_s$. With per-channel gates the factor $e^{G_{rc}-G_{sc}}$ depends on the
+channel $c$ inside the sum, so it cannot be applied after the product. The obvious factorization
+\begin{equation}\label{eq:c05-kda-naive}
+  \mP = \operatorname{tril}\big((e^{\mG}\had\mQ)(e^{-\mG}\had\mK)\T\big)
+\end{equation}
+is exact in real arithmetic but needs $e^{-\mG}$, which grows exponentially along the chunk. With a
+log-decay of $-5$ per token (the lower bound used below) and $C = 64$, $e^{-G}$ reaches
+$e^{320} \approx 10^{139}$, far beyond the float32 maximum of about $3.4\times10^{38}$; our float32
+check of \cref{eq:c05-kda-naive} indeed produces infinities. The code uses three remedies.
+
+\begin{enumerate}
+  \item \emph{Secondary chunking with a reference point.} Split the chunk into sub-chunks of
+  $B_C = 16$ tokens. For a block of rows in sub-chunk $I$ and columns in an earlier sub-chunk
+  $J < I$, pick the reference position $n$ = first row of $I$ and write
+  $e^{G_{rc} - G_{sc}} = e^{G_{rc} - G_{nc}}\cdot e^{G_{nc} - G_{sc}}$. Because $s < n \le r$ and
+  $\vg$ only decreases, both exponents are $\le 0$, both factors are in $(0,1]$, and the block is
+  one well-scaled matrix product. This is the secondary chunking that GLA introduced
+  \citep{yang2024gla}; \cref{lst:c05-kda-intra} shows it in the \fla{} kernel.
+  \item \emph{Diagonal blocks.} Within a sub-chunk the reference trick does not bound both factors.
+  The default path computes these $16\times16$ blocks exactly, one row per program, as
+  $\sum_c q_r[c]k_s[c]\,2^{G_{rc}-G_{sc}}$ for $s\le r$ (exponent $\le 0$). With
+  \code{safe_gate=True} the gate is clamped to $[\,\text{\code{lower_bound}}, 0)$ with
+  \code{lower_bound} $\ge -5$, the reference is moved to the middle of the sub-chunk ($8$ tokens
+  from either end), and the exponents are bounded by $8\times5\times\log_2 e \approx 58$ in base 2,
+  inside the limit noted in the code (``less than 85 to avoid overflow in exp2''); then the
+  diagonal block is also a tensor-core product.
+  \item \emph{Short chunks.} FlashKDA uses $C = 16$ and the same lower bound $-5$. Then the whole
+  chunk fits the naive factorization: $|G| \le 16\times5 = 80$ nats, about $115.4$ bits, below the
+  $2^{128}$ range of float32 and bf16, which share an 8-bit exponent. We checked:
+  $e^{80} \approx 5.5\times10^{34}$.
+\end{enumerate}
+
+The KDA report quantifies the benefit of tying the DPLR factors to $\vk$: the general DPLR kernel
+needs four intra-chunk score matrices, one for each of the pairs $(\vq,\vk)$, $(\vq,\bm c)$,
+$(\va,\bm c)$ and $(\va,\vk)$ (with $\bm c$ standing for the report's second DPLR factor), while KDA
+needs two, $(\vq,\vk)$ and $(\vk,\vk)$; it also saves about three matrix
+multiplications in the inter-chunk and output stages (report, Sec.~6.2 and Listing~8).
+
+\subsection{Algorithms and complexity}\label{sec:c05-kda-alg}
+
+\Cref{alg:c05-kda-intra} gives the intra-chunk stage with secondary chunking; the inter-chunk state
+pass is \cref{alg:c05-gdn-chunk}, lines 6--9, with $\gamma_C\mS$ replaced by
+$\mS\diag(\bm\gamma_C)$ and $\diag(\gamma_C/\bm\gamma)\mK$ by $e^{\vg_C\T-\mG}\had\mK$. Decoding is
+\cref{alg:c05-decode} with $\mD_t = \diag(\valpha_t)$.
+
+\begin{algorithm}[t]
+\caption{KDA intra-chunk stage with secondary chunking (one chunk, one head)}
+\label{alg:c05-kda-intra}
+\begin{algorithmic}[1]
+\Require chunk $\mQ,\mK \in \R^{C\times d_k}$, $\mV$, cumulative log-gates $\mG \in \R^{C\times d_k}$,
+  $\vbeta$, sub-chunk size $B_C$
+\Ensure $\mP$, $\mT$, $\mW$, $\mU$ of \cref{prop:c05-kda-chunk}
+\For{each pair of sub-chunks $J < I$} \Comment{off-diagonal blocks, matmuls}
+  \State $n \gets$ first row of sub-chunk $I$
+  \State $\tilde\mQ_I \gets \mQ_I\had e^{\mG_I - \vg_n\T}$, \
+         $\tilde\mK_I \gets \mK_I\had e^{\mG_I - \vg_n\T}$, \
+         $\hat\mK_J \gets \mK_J\had e^{\vg_n\T - \mG_J}$ \Comment{all factors $\le 1$}
+  \State $\mP_{IJ} \gets \tilde\mQ_I\hat\mK_J\T$; \ $\mA_{IJ} \gets \diag(\vbeta_I)\tilde\mK_I\hat\mK_J\T$
+\EndFor
+\For{each sub-chunk $I$} \Comment{diagonal blocks}
+  \State $\mP_{II}, \mA_{II} \gets$ exact pairwise sums of \cref{eq:c05-kda-scores}
+         (or a midpoint-reference matmul under a gate lower bound)
+  \State invert the unit lower-triangular $\mI + \mA_{II}$ by forward substitution
+\EndFor
+\State $\mT \gets (\mI + \mA)^{-1}$ by merging the diagonal inverses block by block
+\State $\mW \gets \mT\diag(\vbeta)(e^{\mG}\had\mK)$, \ $\mU \gets \mT\diag(\vbeta)\mV$
+\end{algorithmic}
+\end{algorithm}
+
+The asymptotic cost is that of \cref{alg:c05-gdn-chunk}; the per-channel gates add
+$\bigO(C^2 d_k)$ exponentials per chunk in the diagonal blocks. The report counts, for one head of
+dimension $d_h = d_k = d_v$ and $C = 64$,
+$\mathrm{FLOPs}_{\mathrm{KDA}}(T) = 6Td_h^2 + 3TCd_h + TC^2$ against $2T^2d_h$ for attention
+(report, Eqs.~13--14). For $d_h = 128$ that is $126{,}976$ FLOPs per token for KDA versus $256\,T$
+per token for attention at context length $T$: the two are equal at $T \approx 500$ and attention
+is $8\times$ more expensive per token at $T = 4096$ (our arithmetic). Decoding keeps a
+$128\times128$ state per head.
+
+\subsection{The KDA layer and the Kimi Linear model}\label{sec:c05-kda-model}
+
+The report gives the layer, per head $h$, as
+\begin{align}
+  \vq_t, \vk_t &= \mathrm{L2Norm}(\SiLU(\mathrm{ShortConv}(\mW_{q/k}\vx_t))),\qquad
+  \vv_t = \SiLU(\mathrm{ShortConv}(\mW_v\vx_t)), \nonumber\\
+  \valpha_t &= f\big(\mW_\alpha^{\uparrow}\mW_\alpha^{\downarrow}\vx_t\big) \in (0,1)^{d_k},\qquad
+  \beta_t = \sigmoid(\vw_\beta\T\vx_t), \label{eq:c05-kda-layer}\\
+  \vy_t &= \mW_o\big(\sigmoid(\mW_g^{\uparrow}\mW_g^{\downarrow}\vx_t)\had
+          \RMSNorm(\mathrm{KDA}(\vq_t,\vk_t,\vv_t,\valpha_t,\beta_t))\big), \nonumber
+\end{align}
+with $d_k = d_v = 128$ in all experiments. The decay function $f$ is the Mamba/GDN form applied
+per channel (in \fla{}: $\log\valpha_t = -\exp(a_h)\,\mathrm{softplus}(\cdot + \bm\delta)$ with
+one rate $a_h$ per head and one bias per channel). Two choices differ from GDN:
+\begin{itemize}
+  \item \emph{Low-rank gate projections.} A full projection to $H d_k$ gate logits would cost
+  $d\cdot Hd_k$ parameters; the down/up pair through rank $d_v = 128$ costs $d\cdot128 + 128\cdot Hd_k$.
+  For $d = Hd_k = 2048$ this is $0.52$M instead of $4.2$M parameters per layer (our arithmetic).
+  The output gate uses the same low-rank form.
+  \item \emph{A sigmoid output gate}, which the report's ablation found clearly better than the
+  swish gate of GDN (\cref{tab:c05-kimi-ablation}).
+\end{itemize}
+
+\paragraph{The hybrid model.} Kimi Linear interleaves KDA with Multi-Head Latent Attention (MLA)
+\citep{deepseek2024v2} layer by layer in a uniform 3:1 ratio: three KDA layers, then one global MLA
+layer, repeated (\repofile{repos/MoonshotAI__Kimi-Linear/README.md}; report, Fig.~3). The report
+gives the rest of the configuration: the MLA layers use no position encoding at all (NoPE),
+delegating position to the KDA layers, which also lets MLA run as multi-query attention at
+inference; the channel mixers are mixture-of-experts layers with 8 of 256 experts active,
+including one shared expert, and a dense first layer; the result has 48B total and 3B active
+parameters. The released checkpoints were trained on 5.7T tokens and support a 1M-token context
+(README). Since only one layer in four keeps a key--value cache that grows with the context, the
+README's KV-cache reduction of ``up to 75\%'' is exactly the fraction of layers that use KDA. Hybrid design choices, including how the ratio was chosen, are discussed in
+\cref{ch:hybrid}.
+
+\subsection{Implementation walkthrough}\label{sec:c05-kda-impl}
+
+\begin{implnote}[title={In the code: where KDA lives}]
+The official repository \repo{MoonshotAI__Kimi-Linear} contains only a README, figures, a license
+and the technical report (\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}); the model code
+ships with the Hugging Face checkpoints (loaded with \code{trust_remote_code=True}, not mirrored
+here), serving goes through vLLM, and the README points to the KDA kernel in \fla{}
+(\code{fla/ops/kda}). Moonshot's CUDA kernels are in \repo{MoonshotAI__FlashKDA}. In \fla{}, the
+layer is \code{KimiDeltaAttention} in \repofile{repos/fla-org__flash-linear-attention/fla/layers/kda.py}
+and the model configuration \code{KDAConfig} (default 24 layers, 16 heads of dimension 128) can
+place standard attention at chosen layer indices through its \code{attn} argument, which is how a
+3:1 hybrid is expressed.
+\end{implnote}
+
+\Cref{lst:c05-kda-layer} shows the gate-related parameters of the \fla{} layer. The decay
+projection \code{f_proj} is the low-rank pair of \cref{eq:c05-kda-layer}, with output size
+\code{gate_dim} $= H_v d_k$ (one logit per value head and key channel); \code{A_log} has one entry
+per head and \code{dt_bias} one per channel. The output gate \code{g_proj} is also low-rank and is
+applied by \code{FusedRMSNormGated(..., activation="sigmoid")}.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}layers/\allowbreak{}kda.py} (gate parameters of \texttt{KimiDeltaAttention})},label={lst:c05-kda-layer}]
+        # Gate dim = HV * K: per value-head, per key-dim gating.
+        self.gate_dim = int(self.num_v_heads * self.head_k_dim)
+        self.f_proj = nn.Sequential(
+            nn.Linear(hidden_size, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.gate_dim, bias=False),
+        )
+        self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
+
+        # A_log and dt_bias are per value-head for native GVA support.
+        if safe_gate:
+            self.A_log = nn.Parameter(torch.zeros(self.num_v_heads, dtype=torch.float32))
+        else:
+            self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(1, 16)))
+        # ...
+        self.g_proj = nn.Sequential(
+            nn.Linear(hidden_size, self.head_v_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.value_dim, bias=True),
+        )
+        self.o_norm = FusedRMSNormGated(self.head_v_dim, activation="sigmoid", eps=norm_eps)
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the \fla{} KDA forward pass (\texttt{fla/ops/kda})}]
+\code{chunk_kda_fwd} in \repofile{fla/ops/kda/chunk_fwd.py} chains five steps.
+\begin{enumerate}[leftmargin=*]
+  \item \code{kda_gate_chunk_cumsum} (\repofile{fla/ops/kda/gate.py}) applies the gate,
+  $-\exp(\text{\code{A_log}})\,\mathrm{softplus}(g + \text{\code{dt_bias}})$, or with a
+  \code{lower_bound} the bounded form
+  $\text{\code{lower_bound}}\cdot\sigmoid(\exp(\text{\code{A_log}})(g + \text{\code{dt_bias}}))
+  \in [\text{\code{lower_bound}}, 0)$, and takes the per-chunk cumulative sum in base 2.
+  \item \code{chunk_kda_fwd_intra} (\repofile{fla/ops/kda/chunk_intra.py}) builds the diagonal
+  $16\times16$ blocks of $\mP$ and $\mA$ (exact token-parallel kernel, or the midpoint-reference
+  kernel under \code{safe_gate}), then \code{chunk_kda_fwd_kernel_inter_solve_fused} computes the
+  off-diagonal blocks with the reference trick (\cref{lst:c05-kda-intra}), solves the diagonal
+  blocks by forward substitution and merges them into $\mT$, all in one kernel.
+  \item \code{recompute_w_u_fwd} (\repofile{fla/ops/kda/wy_fast.py}) forms
+  \code{w = A @ (beta * exp2(g) * k)}, \code{u = A @ (beta * v)} and the ``tail'' keys
+  \code{kg = k * exp2(g_last - g)} of \cref{eq:c05-kda-state}.
+  \item \code{chunk_gated_delta_rule_fwd_h}, the same state-pass kernel as for GDN
+  (\repofile{fla/ops/common/chunk_delta_h.py}), is called with \code{k=kg} and \code{gk=g}; its
+  \code{USE_GK} branch multiplies each key channel of the state by $2^{G_{Cc}}$.
+  \item \code{chunk_gla_fwd_o_gk}, the output kernel of gated linear attention, applies
+  \cref{eq:c05-kda-out}.
+\end{enumerate}
+Paths are relative to \repo{fla-org__flash-linear-attention}. \code{chunk_kda} accepts chunk sizes
+32 and 64 with sub-chunks of 16 and requires $-5 \le \text{\code{lower_bound}} < 0$ when
+\code{safe_gate=True}; the docstring notes that $\exp(-5) \approx 0.0067$ is the smallest per-step
+decay this allows. Decoding uses \code{fused_recurrent_kda}, the per-channel version of
+\cref{lst:c05-fla-recur}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}kda/\allowbreak{}chunk\_intra.py}: block (sub-chunk 1, sub-chunk 0) with the reference point \texttt{b\_gn1}},label={lst:c05-kda-intra}]
+            # [BK]
+            b_gn1 = tl.load(g + i_tc1 * HV*K + o_k, mask=m_k, other=0).to(tl.float32)
+            # [BC, BK]
+            b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
+            # [BK, BC]
+            b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0))
+            # [BC, BC]
+            b_Aqk10 = tl.dot(b_q1 * b_gqn, b_kgt, b_Aqk10)
+            b_Akk10 = tl.dot(b_k1 * b_gqn, b_kgt, b_Akk10)
+\end{lstlisting}
+
+Here \code{b_gn1} is the cumulative log-gate at the first token of sub-chunk 1 (our $\vg_n$),
+\code{b_gqn} is $2^{\mG_1 - \vg_n\T}$ (exponents $\le0$), and \code{b_kgt} is
+$(\mK_0\had 2^{\vg_n\T - \mG_0})\T$ (exponents $\le0$), so both operands of \code{tl.dot} are
+bounded by the inputs.
+
+\begin{implnote}[title={In the code: FlashKDA (\texttt{MoonshotAI\_\_FlashKDA})}]
+FlashKDA is a CUTLASS implementation of the KDA \emph{forward} pass for inference on SM90 and newer
+GPUs; it currently requires $d_k = d_v = 128$ and is dispatched automatically from \fla{}'s
+\code{chunk_kda} under \code{torch.inference_mode()} when installed
+(\repofile{repos/MoonshotAI__FlashKDA/README.md}). Its design note
+(\repofile{repos/MoonshotAI__FlashKDA/docs/20260420-flashkda-v1-deep-dive.md}) explains the choices
+we derived above: chunk size 16, so that with \code{lower_bound} $=-5$ the range of
+$\exp(\mathrm{cumsum}(g))$ fits bf16 and no rescaling is needed; a $16\times16$ inverse computed
+exactly by two $8\times8$ forward substitutions in fp32 plus a block merge; two kernels, one
+token-parallel (gate activation, L2 normalization, decay, score matrices, inversion) and one
+head-parallel (the chunk-to-chunk recurrence, output and state); a bf16 on-chip state updated with
+fp32 multiply--add; base-2 exponentials and a sigmoid computed through a fast \code{tanh}
+instruction. The test oracle \repofile{repos/MoonshotAI__FlashKDA/tests/torch_ref.py} spells the
+chunk out in PyTorch (\cref{lst:c05-flashkda}): \code{k_decayed} is $e^{\mG}\had\mK$,
+\code{k_inv} is $e^{-\mG}\had\mK$ (the naive factorization, safe at $C=16$), \code{L} is $\mA$,
+\code{Mqk} is $\mP$, and the corrected values are formed in one step,
+$\bm R = \mT\diag(\vbeta)(\mV - (e^{\mG}\had\mK)\mS_0\T)$, which equals $\mU - \mW\mS_0\T$. The
+gates in this file are already in base-2 units.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}MoonshotAI\_\_FlashKDA/\allowbreak{}tests/\allowbreak{}torch\_ref.py} (one chunk of 16 tokens, one head)},label={lst:c05-flashkda}]
+                k_decayed = k_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
+                q_decayed = q_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16) * scale_bf16
+                neg_g_cumsum_bf16 = fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
+                k_inv = k_chunk * neg_g_cumsum_bf16
+                # ...
+                L = torch.mm(k_decayed, k_inv.t(), out_dtype=torch.float32)
+                Mqk = torch.matmul(q_decayed, k_inv.t())
+                # ...
+                L = torch.tril(L, diagonal=-1) * beta_activated.unsqueeze(-1)
+                Mqk = torch.tril(Mqk)
+
+                INV = inv_fwd_subst_16(L)
+                # ...
+                v_chunk = v_chunk - torch.matmul(k_decayed, state_slice.t())
+                v_chunk = v_chunk * beta_val_bf16
+
+                U = torch.matmul(INV, v_chunk)
+                _out = torch.matmul(q_decayed, state_slice.t())
+                _out = _out + torch.matmul(Mqk, U)
+\end{lstlisting}
+
+\begin{pitfall}
+\Cref{eq:c05-kda-naive} is tempting because it is one matrix product, and it passes tests with
+mild gates and short chunks. It fails silently in float32 as soon as a chunk accumulates more than
+about 88 nats of decay (for example $C = 64$ tokens at a log-decay of $-1.4$ each): $e^{-G}$ becomes
+infinite and the products become \code{inf} or \code{NaN}. Either keep chunks short and bound the
+gate (FlashKDA), or factor around a reference point inside each sub-chunk (\fla{}).
+\end{pitfall}
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c05-ours-kda} is \cref{eq:c05-kda} and \cref{prop:c05-kda-chunk} in executable form. It
+reuses \code{tri_inverse} from \cref{lst:c05-ours-gdn} and computes the decay factors exactly and
+pairwise (a $C\times C\times d_k$ tensor whose exponents are masked to be $\le 0$), which is the
+numerically safe but memory-hungry version of \cref{alg:c05-kda-intra}; the kernels exist to
+avoid materializing this tensor. On the same random test as before (now with channel-wise gates)
+the chunkwise and recurrent outputs agree to $6\times10^{-16}$, and with every channel given the
+same gate the function reproduces \code{gdn_chunk}.
+
+\begin{lstlisting}[caption={Reference implementation (ours): KDA, recurrent and chunkwise},label={lst:c05-ours-kda}]
+import torch
+from gdn import tri_inverse
+
+def kda_recurrent(q, k, v, alpha, beta, S=None):
+    # alpha: (T, dk) per-channel decay; beta: (T,)
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    o = []
+    for t in range(T):
+        S = S * alpha[t]                                      # S Diag(alpha_t)
+        S = S + beta[t] * torch.outer(v[t] - S @ k[t], k[t])
+        o.append(S @ q[t])
+    return torch.stack(o), S
+
+def decay_tensor(G):
+    # D[r, s, d] = exp(G[r, d] - G[s, d]) for s <= r, else 0. Never overflows.
+    n = G.shape[0]
+    mask = torch.tril(torch.ones(n, n))[:, :, None]
+    return torch.exp((G[:, None] - G[None, :]) * mask) * mask
+
+def kda_chunk(q, k, v, alpha, beta, C=64, S=None):
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    o = []
+    for c in range(0, T, C):
+        Q, K, V, b = q[c:c+C], k[c:c+C], v[c:c+C], beta[c:c+C]
+        G = torch.cumsum(torch.log(alpha[c:c+C]), 0)          # (C, dk)
+        D = decay_tensor(G)                                   # (C, C, dk)
+        Akk = torch.einsum('rd,sd,rsd->rs', K, K, D)
+        Tm = tri_inverse(torch.tril(b[:, None] * Akk, -1))
+        U = Tm @ (b[:, None] * V)
+        W = Tm @ (b[:, None] * torch.exp(G) * K)
+        R = U - W @ S.T
+        P = torch.einsum('rd,sd,rsd->rs', Q, K, D)            # causal
+        o.append((torch.exp(G) * Q) @ S.T + P @ R)
+        S = S * torch.exp(G[-1]) + R.T @ (torch.exp(G[-1] - G) * K)
+    return torch.cat(o), S
+\end{lstlisting}
+
+\begin{results}
+\textbf{Kimi Linear README} (\repofile{repos/MoonshotAI__Kimi-Linear/README.md}). Released
+checkpoints Kimi-Linear-Base and Kimi-Linear-Instruct: 48B total and 3B activated parameters,
+1M-token context, trained on 5.7T tokens. On MMLU-Pro (4k context) Kimi Linear scores 51.0 at a
+speed similar to full attention; on RULER (128k context) it scores 84.3 with a $3.98\times$
+speedup; its time per output token is $6.3\times$ lower than MLA at 1M tokens. The README states
+a KV-cache reduction of up to 75\% and up to $6\times$ decoding throughput at 1M context.
+
+\textbf{Technical report} (\repofile{repos/MoonshotAI__Kimi-Linear/tech_report.pdf}). Under an
+identical 1.4T-token recipe (Fig.~1), MMLU-Pro is 51.0 (Kimi Linear), 47.9 (GDN-H) and 47.2
+(MLA); RULER at 128k is 84.3, 80.5 and 81.3; at 1M tokens the time per output token is 1.84\,ms
+for Kimi Linear versus 11.48\,ms for MLA. The KDA kernel runs at nearly $2\times$ the speed of a
+general DPLR kernel for sequences up to 64k (Fig.~2), and the scaling-law fit gives Kimi Linear
+about $1.16\times$ the compute efficiency of MLA (Sec.~5.3). The ablations of Table~1 are
+reproduced in \cref{tab:c05-kimi-ablation} (lower is better).
+
+\begin{center}\small
+\captionof{table}{Ablations from Table~1 of the Kimi Linear report (hybrid ratio is KDA:MLA).}
+\label{tab:c05-kimi-ablation}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Variant & Training PPL & Validation PPL \\
+\midrule
+3:1 (final choice) & 9.23 & 5.65 \\
+0:1 (full attention) & 9.45 & 5.77 \\
+1:1 & 9.29 & 5.66 \\
+7:1 & 9.23 & 5.70 \\
+15:1 & 9.34 & 5.82 \\
+without output gate & 9.25 & 5.67 \\
+swish output gate & 9.43 & 5.81 \\
+without short convolution & 9.29 & 5.70 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{FlashKDA} (\repofile{repos/MoonshotAI__FlashKDA/BENCHMARK_H20.md}, H20 GPU, $T = 8192$,
+96 heads, $d = 128$, fixed length): 2.62\,ms for FlashKDA versus 4.84\,ms for the \fla{} Triton
+\code{chunk_kda} ($1.85\times$) and 3.20\,ms for \fla{}'s scalar-gate \code{chunk_gated_delta_rule}.
+\end{results}
+
+\subsection{Discussion}
+
+KDA is the member of the family that this chapter's sources document at the largest scale (a
+48B-parameter model trained on 5.7T tokens), and the reason it works is visible in the equations:
+one extra degree of freedom per key channel buys separate
+memory lifetimes and a learned position signal, while the transition keeps the delta rule's
+meaning and a WY-friendly structure. The price is paid in the kernel. Per-channel decay breaks
+the identity that let GDN apply its gate after the matrix product, so every intra-chunk score
+needs either exact pairwise exponentials, secondary chunking around a reference point, or short
+chunks with a bounded gate. The fastest kernels (FlashKDA and \fla{}'s \code{safe_gate} path)
+therefore require the per-step log-decay to be bounded below, with $-5$ as the recommended bound:
+a modeling constraint introduced for numerical reasons. (The report does not say which gate
+parameterization the released checkpoints use; the kernels support both.) KDA also keeps GDN's scalar $\beta_t$
+for erasing and writing, which is the next restriction to go (\cref{sec:c05-gdn2}). Compared with
+fully general DPLR transitions such as RWKV-7's (\cref{ch:expressive}), KDA trades expressivity
+for speed and a clear editing semantics. Its role inside a 3:1 hybrid, where global attention
+provides exact recall and KDA provides position and compressed context, is analyzed further in
+\cref{ch:hybrid}.
+
+% ===========================================================================
+\section{Gated DeltaNet-2}\label{sec:c05-gdn2}
+
+\subsection{Motivation: erasing and writing are different decisions}
+
+Look again at the read-then-write form \cref{eq:c05-kda-sgd} of KDA:
+$\mS_t = \bar\mS_t + \beta_t(\vv_t - \bar\mS_t\vk_t)\vk_t\T$. The single scalar $\beta_t$ makes two
+decisions at once. On the \emph{key side} it decides how much of the content currently read along
+$\vk_t$ is removed; on the \emph{value side} it decides how much of the new value is committed.
+The first acts on the columns of $\mS$ (key channels), the second on its rows (value channels),
+and nothing forces them to agree or to be the same for every channel. Gated DeltaNet-2 (GDN-2)
+\citep{hatamizadeh2026gdn2} replaces $\beta_t$ by two channel-wise gates: an \emph{erase gate}
+$\vb_t \in [0,1]^{d_k}$ on the key axis and a \emph{write gate} $\vw_t \in [0,1]^{d_v}$ on the value
+axis, while keeping KDA's channel-wise decay. The survey describes the result as separating
+``key-side erasure from value-side writing'' \citep{zhoubian2026memory}.
+
+\begin{taxonomy}
+\textbf{Representation:} implicit. \textbf{Update dynamics:} online. \textbf{Persistence:}
+long-term within a sequence (Table~I of \citet{zhoubian2026memory}: ``Decoupled Delta-Rule State
+Editing''). \textbf{Update rule:} state-transition update; GDN-2 is one of the representative
+examples of that row of Table~II, with the risks ``compression loss and state interference''.
+\end{taxonomy}
+
+\subsection{The gated delta rule-2}\label{sec:c05-gdn2-rule}
+
+Define the gated erase direction and the gated value,
+\begin{equation}\label{eq:c05-gdn2-ez}
+  \ve_t = \vb_t\had\vk_t \in \R^{d_k},\qquad \vz_t = \vw_t\had\vv_t \in \R^{d_v}.
+\end{equation}
+Then, with $\bar\mS_t = \mS_{t-1}\diag(\valpha_t)$,
+\begin{equation}\label{eq:c05-gdn2}
+  \mS_t = \bar\mS_t + \big(\vz_t - \bar\mS_t\ve_t\big)\vk_t\T
+        = \mS_{t-1}\diag(\valpha_t)\big(\mI - \ve_t\vk_t\T\big) + \vz_t\vk_t\T ,
+  \qquad \vo_t = \mS_t\vq_t .
+\end{equation}
+This is the full template \cref{eq:c05-template}. The paper writes the transpose,
+$\mS_t = (\mI - \vk_t(\vb_t\had\vk_t)\T)\diag(\valpha_t)\mS_{t-1} + \vk_t(\vw_t\had\vv_t)\T$ in
+$\R^{d_k\times d_v}$, and calls it the gated delta rule-2. The write direction is still the
+ungated key $\vk_t$; only the read direction $\ve_t$ and the target $\vz_t$ are gated.
+
+\paragraph{What the update does.} Take a unit-norm key. Reading the new state along the same key,
+\begin{equation}\label{eq:c05-gdn2-read}
+  \mS_t\vk_t = \bar\mS_t\vk_t - \bar\mS_t\ve_t + \vz_t
+             = \bar\mS_t\big((\mathbf 1 - \vb_t)\had\vk_t\big) + \vw_t\had\vv_t .
+\end{equation}
+Key channels with $b_t[c] = 1$ contribute nothing of the old memory to this read (they were
+erased); channels with $b_t[c] = 0$ keep their old contribution, so on those channels the write is
+purely additive, as in linear attention. GDN-2 therefore interpolates, channel by channel, between
+the additive write of linear attention ($\vb_t = \mathbf 0$) and the replacing write of the delta
+rule ($\vb_t = \mathbf 1$). On the value side, value channel $j$ receives the target
+$w_t[j]v_t[j]$; with $w_t[j] = 0$ its row is erased along $\ve_t$ but not rewritten. Reads along
+keys orthogonal to $\vk_t$ are untouched, as for every delta rule: if $\vk_t\T\vk' = 0$ then
+$\mS_t\vk' = \bar\mS_t\vk'$.
+
+\begin{example}[Partial erasure, $d_k = 2$, $d_v = 1$]
+Let $\bar\mS = (2,\ 4)$, $\vk = (1,1)\T/\sqrt2$, $v = 0$ and $w = 1$. Reading gives
+$\bar\mS\vk = 6/\sqrt2 \approx 4.24$, of which $2/\sqrt2$ comes from channel 1 and $4/\sqrt2$ from
+channel 2. With the delta rule ($\vb = (1,1)$) the update subtracts all of it:
+$\mS = (2,4) - 3\cdot(1,1) = (-1,\ 1)$ and $\mS\vk = 0$. With $\vb = (1,0)$, $\ve = (1/\sqrt2, 0)$,
+$\bar\mS\ve = 1$ and $\mS = (2,4) - (1,1) = (1,\ 3)$, so $\mS\vk = 4/\sqrt2 \approx 2.83$: exactly
+the channel-2 part of the old read survives, as \cref{eq:c05-gdn2-read} predicts.
+\end{example}
+
+\paragraph{A local optimization view.} The paper shows that \cref{eq:c05-gdn2} solves a local
+problem. In our orientation,
+\begin{equation}\label{eq:c05-gdn2-obj}
+  \mS_t = \argmin_{\mS}\; \norm{\mS - \bar\mS_t}_F^2 - 2\,(\vz_t - \bar\mS_t\ve_t)\T\mS\vk_t .
+\end{equation}
+The objective is a convex quadratic; its gradient $2(\mS - \bar\mS_t) - 2(\vz_t - \bar\mS_t\ve_t)\vk_t\T$
+vanishes exactly at \cref{eq:c05-gdn2}. The first term keeps the memory close to its decayed
+version; the second rewards moving it so that reading along $\vk_t$ returns more of the residual
+$\vz_t - \bar\mS_t\ve_t$.
+
+\paragraph{Reductions.} Setting $\vb_t = \beta_t\mathbf 1_{d_k}$ and $\vw_t = \beta_t\mathbf 1_{d_v}$
+gives $\ve_t = \beta_t\vk_t$ and $\vz_t = \beta_t\vv_t$, which is KDA, \cref{eq:c05-kda}; setting
+also $\valpha_t = \alpha_t\mathbf 1$ gives GDN, \cref{eq:c05-gdn}. The same substitution in the
+chunkwise formulas below recovers \cref{prop:c05-kda-chunk} and \cref{prop:c05-gdn-chunk}. The
+paper adds that a wrapper that ties the gates receives the gradient
+$\partial\loss/\partial\beta_t = \inner{\partial\loss/\partial\vb_t}{\mathbf 1} +
+\inner{\partial\loss/\partial\vw_t}{\mathbf 1}$, so KDA and GDN are literally sub-models.
+
+\paragraph{Spectrum.} The rank-one matrix $\ve_t\vk_t\T$ has the single nonzero eigenvalue
+$\vk_t\T\ve_t = \sum_c b_t[c]k_t[c]^2$, which lies in $[0, \norm{\vk_t}^2] = [0,1]$. So
+$\mI - \ve_t\vk_t\T$ has eigenvalue $1$ on $\vk_t^\perp$ and $1 - \vk_t\T\ve_t \in [0,1]$ on one
+more direction; lifting $\vb_t$ to $[0,2]$ (the code's \code{allow_neg_eigval}) extends this to
+$[-1,1]$. (When every $b_t[c] > 0$, the scaling $\diag(\vb_t)^{1/2}$ makes the matrix similar to
+the symmetric $\mI - (\vb_t^{1/2}\had\vk_t)(\vb_t^{1/2}\had\vk_t)\T$, which is another way to see
+that the eigenvalues are real.) Unlike the GDN transition, however, $\mI - \ve_t\vk_t\T$ is not a
+normal matrix when the erase gate varies across channels, and eigenvalues in $[0,1]$ do not bound
+its norm. For $\vk = (1,1)\T/\sqrt2$ and $\vb = (1,0)$ the matrix is
+$\begin{psmallmatrix}1/2&-1/2\\0&1\end{psmallmatrix}$ with eigenvalues $\{1/2, 1\}$ and spectral
+norm $\approx 1.144$, so a single step can increase $\norm{\mS}_F$ for a suitable $\mS$
+(\cref{ex:c05-gdn2-norm}). This is our observation, not a claim of the paper; in practice the decay,
+the L2-normalized keys (the paper notes that normalization ``still stabilizes the scale'' of the
+intra-chunk matrices) and the learned gates keep the state in range, and the paper's 1.3B models
+train with this parameterization.
+
+\subsection{Chunkwise form: an asymmetric WY representation}\label{sec:c05-gdn2-chunk}
+
+\begin{proposition}[Chunkwise GDN-2]\label{prop:c05-gdn2-chunk}
+Inside a chunk, with $\mG$, $\bm\gamma_r$ and $\mP$ as in \cref{prop:c05-kda-chunk}, stack
+$\bm E = \mB\had\mK$ (rows $\ve_r\T$) and $\mZ = \mW_{\!g}\had\mV$ (rows $\vz_r\T$, with $\mW_{\!g}$
+the stacked write gates). Let
+\begin{equation}\label{eq:c05-gdn2-A}
+  \mA_{rs} = \sum_{c=1}^{d_k} e_r[c]\,k_s[c]\,e^{\,G_{rc}-G_{sc}}\quad (s < r),\qquad
+  \mT = (\mI + \mA)^{-1},
+\end{equation}
+\begin{equation}\label{eq:c05-gdn2-UY}
+  \mU = \mT\mZ,\qquad \mY = \mT\big(e^{\mG}\had\bm E\big),\qquad \bm R = \mU - \mY\mS_0\T .
+\end{equation}
+Then $\mO$ and $\mS_C$ are given by \cref{eq:c05-kda-out,eq:c05-kda-state} with this $\bm R$.
+\end{proposition}
+
+\begin{proof}
+Repeat the proof of \cref{prop:c05-kda-chunk} with $\beta_r\vk_r$ replaced by $\ve_r$ in the read
+and $\beta_r\vv_r$ by $\vz_r$ in the target. The normalized state satisfies
+$\hat\mS_r = \hat\mS_{r-1} + \bm\rho_r(\vk_r\oslash\bm\gamma_r)\T$ with
+$\bm\rho_r = \vz_r - \hat\mS_{r-1}(\bm\gamma_r\had\ve_r)$; expanding $\hat\mS_{r-1}$ gives
+$(\mI + \mA)\bm R = \mZ - (e^{\mG}\had\bm E)\mS_0\T$, and the output and state formulas do not
+involve the gates at all.
+\end{proof}
+
+In KDA both factors of the score matrix $\mA$ were the same key, up to the row scaling $\beta_r$. In
+GDN-2 its left factor is the gated erase key and its right factor the plain key, and the two auxiliaries are
+built from different right-hand sides: the erase gate enters $\mA$ and $\mY$, the write gate only
+$\mU$. The paper calls this a WY form ``with channel-wise decay absorbed into asymmetric erase
+factors''. Everything downstream of $\bm R$, the inter-chunk state pass and the output, is
+unchanged, so GDN-2 reuses KDA's state and output kernels.
+
+\paragraph{Gate-aware backward.} The backward pass is where GDN-2 differs from KDA in the code. In
+KDA the gradient with respect to the inverse accumulates terms such as
+$\mathrm{d}\vu_r(\beta_s\vv_s)\T = \beta_s\,\mathrm{d}\vu_r\vv_s\T$, so $\beta_s$ can be applied
+after the dot product. In GDN-2 the corresponding term is $\mathrm{d}\vu_r(\vw_s\had\vv_s)\T$; no
+scalar can be pulled out, so the gates must be multiplied into the operands before the dot
+products: the gradient with respect to the inverse is
+$\mathrm{d}\mT = \mathrm{d}\mU\mZ\T + \mathrm{d}\mY(e^{\mG}\had\bm E)\T$, followed by the standard
+rule for a triangular inverse,
+$\mathrm{d}\mA = -\operatorname{tril}(\mT\T\,\mathrm{d}\mT\,\mT\T, -1)$. The paper's appendix
+derives the full backward pass.
+
+\subsection{Algorithms, layer and hybrid}\label{sec:c05-gdn2-alg}
+
+\Cref{alg:c05-gdn2} lists the forward pass. Decoding is \cref{alg:c05-decode} with
+$\ve_t = \vb_t\had\vk_t$ and $\vz_t = \vw_t\had\vv_t$; its cost per token is $\bigO(d_kd_v)$ plus
+$\bigO(d_k + d_v)$ for the gates. Training costs the same order as KDA.
+
+\begin{algorithm}[t]
+\caption{GDN-2 chunkwise forward, one head (changes relative to KDA marked $\star$)}
+\label{alg:c05-gdn2}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK,\mV$, log-decays, erase gates $\mB \in [0,1]^{T\times d_k}$, write gates
+  $\mW_{\!g} \in [0,1]^{T\times d_v}$, chunk size $C$, state $\mS$
+\For{each chunk $[i]$ \textbf{in parallel}}
+  \State $\mG \gets$ per-chunk cumulative sum of the log-decays
+  \State $\bm E \gets \mB_{[i]}\had\mK_{[i]}$; \ $\mZ \gets \mW_{\!g,[i]}\had\mV_{[i]}$ \Comment{$\star$}
+  \State $\mP, \mA \gets$ \cref{alg:c05-kda-intra} with $\diag(\vbeta)\mK$ replaced by $\bm E$ in the
+         rows of $\mA$ \Comment{$\star$}
+  \State $\mT \gets (\mI+\mA)^{-1}$; \ $\mU \gets \mT\mZ$; \ $\mY \gets \mT(e^{\mG}\had\bm E)$
+         \Comment{$\star$}
+\EndFor
+\For{$i = 1,\dots,T/C$ \textbf{sequentially}} \Comment{identical to KDA}
+  \State $\bm R \gets \mU - \mY\mS\T$; \ $\mO_{[i]} \gets (e^{\mG}\had\mQ_{[i]})\mS\T + \mP\bm R$
+  \State $\mS \gets \mS\diag(\bm\gamma_C) + \bm R\T(e^{\vg_C\T - \mG}\had\mK_{[i]})$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{The layer.} The official layer \code{GatedDeltaNet2}
+(\repofile{repos/NVlabs__GatedDeltaNet-2/lit_gpt/gdn2.py}) follows KDA's structure: projections,
+short convolutions with SiLU, L2-normalized $\vq,\vk$, a low-rank decay projection, and a gated
+RMSNorm before the output projection. The new parts are two full-rank projections,
+\begin{equation}\label{eq:c05-gdn2-gates}
+  \vb_t = \sigmoid(\mW_b\vx_t) \in [0,1]^{Hd_k},\qquad \vw_t = \sigmoid(\mW_w\vx_t) \in [0,1]^{H_vd_v},
+\end{equation}
+and the decay $\log\valpha_t = -\exp(a_h)\,\mathrm{softplus}(\mW_f^{\uparrow}\mW_f^{\downarrow}\vx_t +
+\bm\delta)$ computed in fp32 outside the kernel, because a low-precision cumulative sum would
+perturb long products of decays (paper, App.~D.1). The two gate projections cost
+$d(Hd_k + H_vd_v)$ parameters where GDN and KDA spend $dH$ on $\beta$; with $d = 2304$ and
+$H = H_v = 16$ heads of size $128$ this is about $9.4$M extra parameters per layer (our
+arithmetic), which the configurations compensate elsewhere: \code{gdn2_1.3B} and
+\code{swa_gdn2_1.3B} carry parameter totals of $1{,}302{,}638{,}112$ and $1{,}300{,}314{,}384$ in
+their comments (\repofile{repos/NVlabs__GatedDeltaNet-2/lit_gpt/config.py}). The paper matches the
+recurrent state size across baselines: $H d_k d_v = 16\cdot128\cdot128 = 262{,}144$ numbers per
+layer and sequence.
+
+\paragraph{The hybrid.} The configuration \code{swa_gdn2_1.3B} sets \code{gdn2_per_layer=2} and
+\code{local_window=2048}, so its 18 layers alternate a GDN-2 mixer and sliding-window attention,
+each followed by an MLP; the paper's Figure~1 draws the same repeated cell (GDN-2, MLP, SWA, MLP).
+The recurrent-only model \code{gdn2_1.3B} uses GDN-2 in every layer.
+
+\subsection{Implementation walkthrough}\label{sec:c05-gdn2-impl}
+
+\Cref{lst:c05-gdn2-layer} is the heart of the official layer: the fp32 log-decay, the two sigmoid
+gates, the head split, the replication of key-side tensors for grouped value heads, and the
+negative-eigenvalue option, which doubles only the erase gate because ``the spectral effect
+concerns the state transition, not the value magnitude'' (paper, Sec.~3.1).
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}NVlabs\_\_GatedDeltaNet-2/\allowbreak{}lit\_gpt/\allowbreak{}gdn2.py} (gates of \texttt{GatedDeltaNet2.forward})},label={lst:c05-gdn2-layer}]
+        g = (
+            -self.A_log.float().exp().repeat_interleave(self.head_k_dim)
+            * F.softplus(self.f_proj(hidden_states).float() + self.dt_bias)
+        )
+
+        # GDN-2 gates, both squashed to [0, 1] by a sigmoid. b is the
+        # channel-wise erase gate (key axis); w is the channel-wise write
+        # gate (value axis).
+        b = self.b_proj(hidden_states).sigmoid()
+        w = self.w_proj(hidden_states).sigmoid()
+        # ...
+        if self.num_v_heads > self.num_heads:
+            q, k, g, b = (
+                repeat(x, "... h d -> ... (h g) d", g=self.num_v_heads // self.num_heads)
+                for x in (q, k, g, b)
+            )
+        # ...
+        if self.allow_neg_eigval:
+            b = b * 2.0
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the GDN-2 kernels (\texttt{lit\_gpt/gdn2\_ops})}]
+\repofile{repos/NVlabs__GatedDeltaNet-2/lit_gpt/gdn2_ops/chunk_gdn2.py} documents its pipeline in
+the module docstring. The forward pass reuses KDA's structure with chunk size 64 and sub-chunks
+of 16: a token-parallel kernel for the diagonal score blocks, a sub-chunk kernel, a fused kernel
+for the off-diagonal blocks and the triangular solve, and \code{recompute_w_u_fwd_gdn2_kernel},
+which forms \code{u = A @ (v * wg)} (our $\mU = \mT\mZ$) and \code{w = A @ (k * b * exp2(gk))}
+(our $\mY$). The inter-chunk state pass and the output kernel are imported unchanged from the
+KDA path, exactly as \cref{prop:c05-gdn2-chunk} predicts. The paper warns that the kernel stores
+$\mY$ ``using the historical buffer name \code{w} because KDA used the same buffer'': in this
+code \code{w} means the WY auxiliary inside the kernels and the write gate is passed as \code{wg}.
+The only change in the off-diagonal score kernel is one elementwise product,
+\code{b_bk1 = b_b1 * b_k1}, applied to the row side of $\mA$ but not to $\mP$
+(\cref{lst:c05-gdn2-intra}; compare \cref{lst:c05-kda-intra}). The backward kernel
+\code{chunk_gdn2_bwd_kernel_wy_dqkg_fused} bakes the gates into the accumulation of the inverse's
+gradient, and \repofile{repos/NVlabs__GatedDeltaNet-2/lit_gpt/gdn2_ops/fused_recurrent_gdn2.py}
+is the token-by-token kernel the layer uses at inference for inputs of at most 64 tokens. \fla{}
+carries a port (\repofile{repos/fla-org__flash-linear-attention/fla/ops/gdn2/} and
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/gdn2.py}, ``Adapted from NVIDIA's
+reference implementation''); one visible difference is that the \fla{} layer uses a sigmoid output
+gate where the official one uses SiLU. Its \code{naive_recurrent_gdn2} in \code{fla/ops/gdn2/naive.py}
+is a ten-line statement of \cref{eq:c05-gdn2}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}NVlabs\_\_GatedDeltaNet-2/\allowbreak{}lit\_gpt/\allowbreak{}gdn2\_ops/\allowbreak{}chunk\_gdn2.py} (off-diagonal block of the score matrices)},label={lst:c05-gdn2-intra}]
+            b_b1 = tl.load(p_b1, boundary_check=(0, 1)).to(tl.float32)
+            # [BK]
+            b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
+            # [BC, BK]
+            b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
+            # [BK, BC]
+            b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0))
+            # row side; for Aqk we use q (no absorption).
+            b_bk1 = b_b1 * b_k1
+            b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt)
+            b_Akk10 += tl.dot(b_bk1 * b_gqn, b_kgt)
+\end{lstlisting}
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c05-ours-gdn2} reuses \code{tri_inverse} and \code{decay_tensor}. We checked three
+things on random inputs: the chunkwise and recurrent forms agree ($4\times10^{-16}$); with
+$\vb_t = \beta_t\mathbf1$ and $\vw_t = \beta_t\mathbf1$ the outputs equal \code{kda_recurrent}
+($3\times10^{-16}$); and with a scalar decay as well, \code{gdn2_chunk} equals
+\code{gdn_recurrent} ($3\times10^{-16}$). We also confirmed numerically that
+\cref{eq:c05-gdn2} minimizes \cref{eq:c05-gdn2-obj}.
+
+\begin{lstlisting}[caption={Reference implementation (ours): Gated DeltaNet-2, recurrent and chunkwise},label={lst:c05-ours-gdn2}]
+import torch
+from gdn import tri_inverse
+from kda import decay_tensor
+
+def gdn2_recurrent(q, k, v, alpha, b, w, S=None):
+    # alpha, b: (T, dk) decay and erase gate; w: (T, dv) write gate
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    o = []
+    for t in range(T):
+        S = S * alpha[t]                         # S-bar = S Diag(alpha_t)
+        e, z = b[t] * k[t], w[t] * v[t]          # gated erase key, gated value
+        S = S + torch.outer(z - S @ e, k[t])     # read along e, write along k
+        o.append(S @ q[t])
+    return torch.stack(o), S
+
+def gdn2_chunk(q, k, v, alpha, b, w, C=64, S=None):
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    o = []
+    for c in range(0, T, C):
+        Q, K = q[c:c+C], k[c:c+C]
+        E, Z = b[c:c+C] * K, w[c:c+C] * v[c:c+C]             # gates enter here
+        G = torch.cumsum(torch.log(alpha[c:c+C]), 0)
+        D = decay_tensor(G)
+        Tm = tri_inverse(torch.tril(torch.einsum('rd,sd,rsd->rs', E, K, D), -1))
+        U, Y = Tm @ Z, Tm @ (torch.exp(G) * E)               # asymmetric WY
+        R = U - Y @ S.T
+        P = torch.einsum('rd,sd,rsd->rs', Q, K, D)
+        o.append((torch.exp(G) * Q) @ S.T + P @ R)
+        S = S * torch.exp(G[-1]) + R.T @ (torch.exp(G[-1] - G) * K)
+    return torch.cat(o), S
+\end{lstlisting}
+
+\begin{results}
+\textbf{GDN-2 README} (\repofile{repos/NVlabs__GatedDeltaNet-2/README.md}). All models have 1.3B
+parameters, are trained on 100B FineWeb-Edu tokens and are matched in recurrent state size;
+hybrids add 2K sliding-window attention.
+\begin{center}\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccc@{\hspace{1em}}cccc@{}}
+\toprule
+ & \multicolumn{4}{c}{Recurrent} & \multicolumn{4}{c}{Hybrid (+ SWA)}\\
+\cmidrule(lr){2-5}\cmidrule(l){6-9}
+Model & Wiki ppl & LMB ppl & LMB acc & Avg acc & Wiki ppl & LMB ppl & LMB acc & Avg acc\\
+\midrule
+Gated DeltaNet & 16.40 & 11.89 & 49.62 & 52.07 & 16.00 & 10.82 & 48.71 & 52.25\\
+KDA & 16.81 & 11.68 & 48.13 & 52.28 & 16.01 & 10.66 & 49.21 & 52.68\\
+Mamba-3 (MIMO) & 16.45 & 11.66 & 47.82 & 52.39 & 15.81 & 10.92 & 49.82 & 52.72\\
+Gated DeltaNet-2 & 15.90 & 11.41 & 48.09 & 53.11 & 15.62 & 10.43 & 50.90 & 53.97\\
+\bottomrule
+\end{tabular}
+\end{center}
+On RULER needle-in-a-haystack (recurrent models), GDN, KDA and GDN-2 score 87.2, 89.0 and 93.0 on
+S-NIAH-2 at 4K; 54.2, 63.2 and 89.8 on S-NIAH-3 at 2K; and 27.8, 28.0 and 37.8 on MK-NIAH-1 at 4K.
+The average over six real-world recall tasks (SWDE, SQuAD, FDA, TriviaQA, NQ, DROP) is 28.09 (GDN),
+28.67 (KDA) and 29.88 (GDN-2) for recurrent models and 39.11, 40.14 and 42.28 for hybrids. The
+README states that the erase gate accounts for most of the gain.
+
+\textbf{GDN-2 paper} (\repofile{repos/NVlabs__GatedDeltaNet-2/paper/GDN2_paper.pdf}, Table~5,
+recurrent models). Keeping channel structure only in the write gate gives Wiki ppl 16.55, common-sense
+average 52.45 and recall average 28.92; only in the erase gate, 16.12, 52.79 and 29.51; the full
+model, 15.90, 53.11 and 29.88. Extending the erase gate to $[0,2]$ gives 15.95, 53.04 and 29.81,
+``no consistent gain at this scale''. Training throughput of the 1.3B hybrid on one H100 drops
+only from 38.0 to 36.1 thousand tokens per second as the sequence grows from 2K to 16K tokens
+(Fig.~2).
+\end{results}
+
+\subsection{Discussion}
+
+GDN-2 completes the template: decay, erase direction and write target are all channel-wise and
+independent. Its strengths are an exact superset relation (GDN $\subset$ KDA $\subset$ GDN-2 by
+tying gates) and an unchanged chunkwise skeleton, so the extra flexibility costs two elementwise
+products in the forward kernels and a more careful backward kernel. The reported gains are
+largest on interference-heavy retrieval, which fits the mechanism: with a channel-selective erase
+the memory can revise part of what is stored at a key and protect the rest. The costs are more
+parameters (two $d\times Hd$ projections), a non-normal transition whose norm is not bounded by
+its eigenvalues, and results so far only at the 1.3B scale. RWKV-7 (\cref{ch:expressive}) also
+separates the vectors used to remove and to add content, with a different parameterization;
+comparing the two decouplings is a natural exercise after reading that chapter. The Kalman-style
+layers of \cref{ch:probabilistic} go one step further and choose the write strength per direction
+from an estimate of uncertainty.
+
+% ===========================================================================
+\section{Kaczmarz Linear Attention}\label{sec:c05-kla}
+
+\subsection{Motivation and code status}
+
+The delta rule's step size $\beta_t$ multiplies $\vk_t\vk_t\T$, so the effective step along the
+key is $\beta_t\norm{\vk_t}^2$. GDN removes the dependence on the key's scale by L2-normalizing the
+key itself. Kaczmarz Linear Attention (KLA; not to be confused with the Kalman Linear Attention
+of \cref{ch:probabilistic}, which uses the same abbreviation) \citep{zou2026kaczmarz} takes the
+other route: it
+keeps the key and normalizes the \emph{step}. The survey states that it ``casts writes as
+key-normalized projection steps'', and its Table~I names the paradigm ``Projection-Calibrated
+Linear Attention'' \citep{zhoubian2026memory}. The public abstract (which we saw through a web
+search; arXiv itself could not be opened from this environment) describes KLA as
+revisiting the online-regression objective behind GDN and, inspired by the Kaczmarz projection
+method, deriving the key-norm-normalized dynamic step size
+$\beta_t = \eta_t/(\norm{\vk_t}_2^2 + \epsilon)$; it calls KLA ``a one-scalar modification of
+GDN'' that keeps the state shape, the gates, the linear recurrence and the chunkwise algorithm.
+
+\begin{pitfall}[title={Code status: unconfirmed}]
+The only candidate code is \repo{JiaxuanZou0714__KaczmarzLinearAttention}, on the first author's
+GitHub account. Its README is a copy of Gated DeltaNet's README and never mentions the paper, so
+we cannot confirm that it is the paper's official code. Its source, however, is not a plain copy:
+\cref{sec:c05-kla-repo} reports what it adds. Everything below that depends on this repository is
+marked as such.
+\end{pitfall}
+
+\begin{taxonomy}
+\textbf{Representation:} implicit. \textbf{Update dynamics:} online. \textbf{Persistence:}
+long-term within a sequence (Table~I of \citet{zhoubian2026memory}). \textbf{Update rule:}
+state-transition update (Table~II, where it is a representative example: ``a hidden or recurrent
+state is updated by a learned transition, delta rule, projection, or filtering equation'').
+\end{taxonomy}
+
+\subsection{The Kaczmarz method from scratch}\label{sec:c05-kla-kaczmarz}
+
+Consider a linear system $\mA\vx = \vy$ with rows $\va_i\T$, $i = 1,\dots,m$, and unknown
+$\vx \in \R^n$ (in this subsection $\mA$ is the system matrix, unrelated to the WY matrices above). Each equation $\va_i\T\vx = y_i$ defines a hyperplane
+$H_i = \{\vx : \va_i\T\vx = y_i\}$. Kaczmarz's method \citep{c05-kaczmarz1937} visits the equations
+one at a time and moves the current guess to the \emph{nearest point} of the current hyperplane.
+
+\paragraph{The projection step.} Minimize $\norm{\vx - \vx_{\mathrm{old}}}^2$ subject to
+$\va_i\T\vx = y_i$. With a Lagrange multiplier $\lambda$, the stationarity condition
+$2(\vx - \vx_{\mathrm{old}}) - 2\lambda\va_i = \mathbf 0$ gives $\vx = \vx_{\mathrm{old}} + \lambda\va_i$;
+substituting into the constraint gives $\lambda = (y_i - \va_i\T\vx_{\mathrm{old}})/\norm{\va_i}^2$.
+Hence
+\begin{equation}\label{eq:c05-kaczmarz}
+  \vx_{\mathrm{new}} = \vx_{\mathrm{old}} + \eta\,\frac{y_i - \va_i\T\vx_{\mathrm{old}}}{\norm{\va_i}^2}\,\va_i ,
+\end{equation}
+with $\eta = 1$ for the exact projection and $\eta \in (0,2)$ for the \emph{relaxed} method. The
+step moves along the row $\va_i$, by an amount proportional to the residual of that equation and
+inversely proportional to $\norm{\va_i}^2$. After a relaxed step the residual of equation $i$ is
+multiplied by $(1-\eta)$: $\va_i\T\vx_{\mathrm{new}} - y_i = (1-\eta)(\va_i\T\vx_{\mathrm{old}} - y_i)$.
+
+\paragraph{Why it converges.} Let $\vx^\star$ solve the whole (consistent) system and write
+$\bm{d} = \vx_{\mathrm{old}} - \vx^\star$ and $c = (y_i - \va_i\T\vx_{\mathrm{old}})/\norm{\va_i}^2
+= -\va_i\T\bm{d}/\norm{\va_i}^2$. Then
+\begin{equation}\label{eq:c05-kaczmarz-pyth}
+  \norm{\vx_{\mathrm{new}} - \vx^\star}^2 = \norm{\bm{d} + \eta c\,\va_i}^2
+  = \norm{\bm{d}}^2 + 2\eta c\,\va_i\T\bm{d} + \eta^2c^2\norm{\va_i}^2
+  = \norm{\bm{d}}^2 - \eta(2-\eta)\,\frac{(y_i - \va_i\T\vx_{\mathrm{old}})^2}{\norm{\va_i}^2}.
+\end{equation}
+For $\eta \in (0,2)$ the distance to \emph{every} solution never increases, and it decreases
+strictly unless equation $i$ is already satisfied. For $\eta = 1$ this is Pythagoras' theorem: the
+step is orthogonal to $H_i$, which contains $\vx^\star$. Sweeping cyclically over the equations
+converges for consistent systems \citep{c05-kaczmarz1937}. Choosing row $i$ at random with
+probability $\norm{\va_i}^2/\norm{\mA}_F^2$ gives linear convergence in expectation,
+$\E\norm{\vx_k - \vx^\star}^2 \le (1 - \kappa^{-2})^k\norm{\vx_0 - \vx^\star}^2$ with
+$\kappa = \norm{\mA}_F\norm{\mA^{+}}_2$ \citep{c05-strohmer2009randomized}. The method is also
+known as the algebraic reconstruction technique of computed tomography
+\citep{c05-gordon1970art} and, in adaptive filtering, as normalized least mean squares.
+\Cref{fig:c05-kaczmarz} shows the iteration for two equations in the plane.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[scale=1.15, font=\small]
+  \draw[->, gray] (-1.2,0) -- (4.4,0); \draw[->, gray] (0,-1.2) -- (0,2.9);
+  \draw[thick, blue!60!black] (-1.1,-0.495) -- (4.3,1.935) node[right] {$H_1$};
+  \draw[thick, red!60!black] (-0.75,0.975) -- (0.95,-1.235) node[below right] {$H_2$};
+  \fill (0,0) circle (1.6pt) node[above left] {$\vx^\star$};
+  \foreach \a/\b in {3.200/2.600, 3.634/1.635, 0.561/-0.729, 0.193/0.087, 0.030/-0.039}
+    {\fill[black!70] (\a,\b) circle (1.2pt);}
+  \draw[-{Stealth}, densely dashed] (3.200,2.600) -- (3.634,1.635);
+  \draw[-{Stealth}, densely dashed] (3.634,1.635) -- (0.561,-0.729);
+  \draw[-{Stealth}, densely dashed] (0.561,-0.729) -- (0.193,0.087);
+  \draw[-{Stealth}, densely dashed] (0.193,0.087) -- (0.030,-0.039);
+  \node[above right] at (3.200,2.600) {$\vx_0$};
+  \node[right] at (3.634,1.635) {$\vx_1$};
+  \node[below] at (0.561,-0.729) {$\vx_2$};
+\end{tikzpicture}
+\caption{Kaczmarz's method for two equations in $\R^2$: each step projects orthogonally onto one
+line, and the iterates zig-zag toward the intersection $\vx^\star$. In the delta rule the
+``equations'' are the key--value pairs $\mS\vk_t = \vv_t$, visited once each, in order.}
+\label{fig:c05-kaczmarz}
+\end{figure}
+
+\subsection{The delta rule is a Kaczmarz step}\label{sec:c05-kla-delta}
+
+An associative memory should satisfy $\mS\vk_j = \vv_j$ for the pairs it has seen. For a fixed
+$\mS \in \R^{d_v\times d_k}$ with rows $\vs_1\T,\dots,\vs_{d_v}\T$, each pair contributes $d_v$
+scalar equations $\vk_j\T\vs_i = v_j[i]$, one per row of $\mS$, and all of them have the same
+coefficient vector $\vk_j$. Applying \cref{eq:c05-kaczmarz} with $\va = \vk_t$ to every row at once,
+\[
+  \vs_i \gets \vs_i + \eta_t\frac{v_t[i] - \vk_t\T\vs_i}{\norm{\vk_t}^2}\vk_t
+  \quad(i = 1,\dots,d_v)
+  \quad\Longleftrightarrow\quad
+  \mS_t = \mS_{t-1} + \frac{\eta_t}{\norm{\vk_t}^2}\big(\vv_t - \mS_{t-1}\vk_t\big)\vk_t\T ,
+\]
+which is the delta rule \cref{eq:c05-delta} with
+\begin{equation}\label{eq:c05-kla-beta}
+  \beta_t = \frac{\eta_t}{\norm{\vk_t}^2} .
+\end{equation}
+For $\eta_t = 1$ the update is the minimum-change edit that stores the pair exactly,
+\[
+  \mS_t = \argmin_{\mS}\big\{\norm{\mS - \mS_{t-1}}_F \,:\, \mS\vk_t = \vv_t\big\},
+\]
+and for a unit-norm key it is DeltaNet with $\beta_t = 1$. Our NumPy check confirms both statements: the delta rule with
+$\beta_t = 1/\norm{\vk_t}^2$ equals the row-wise Kaczmarz step to machine precision, satisfies
+$\mS_t\vk_t = \vv_t$, and every one of 200 other states satisfying the constraint is farther from
+$\mS_{t-1}$.
+
+Two consequences follow. First, the transition becomes \emph{scale-invariant}:
+$\mI - \beta_t\vk_t\vk_t\T = \mI - \eta_t\hat\vk_t\hat\vk_t\T$ with $\hat\vk_t = \vk_t/\norm{\vk_t}$,
+so replacing $\vk_t$ by $c\vk_t$ leaves the erase unchanged and the eigenvalue along $\vk_t$ is
+$1 - \eta_t$ whatever the key's length. An unnormalized delta rule with a fixed $\beta_t$ would be
+unstable for long keys ($\beta_t\norm{\vk_t}^2 > 2$ flips and amplifies). Second, a streaming memory
+does not solve one fixed system: old pairs become wrong and must be forgotten. Adding the GDN gate
+gives a Kaczmarz iteration on a time-varying system in which older equations fade.
+
+\subsection{Kaczmarz Linear Attention as we formalize it}\label{sec:c05-kla-formal}
+
+One way to formalize the description above is
+\begin{equation}\label{eq:c05-kla}
+  \mS_t = \alpha_t\mS_{t-1}\Big(\mI - \beta_t\vk_t\vk_t\T\Big) + \beta_t\vv_t\vk_t\T,\qquad
+  \beta_t = \frac{\eta_t}{\norm{\vk_t}^2 + \epsilon},\qquad \eta_t = \sigmoid(\vw_\eta\T\vx_t),
+\end{equation}
+with $\alpha_t$ the GDN gate and, crucially, keys that are \emph{not} L2-normalized (with unit keys
+\cref{eq:c05-kla} would be GDN with $\beta_t = \eta_t$). This matches the abstract and the
+candidate code of \cref{sec:c05-kla-repo}; the paper's exact parameterization may differ.
+
+\paragraph{How it differs from GDN.} Write $n_t = \norm{\vk_t}$ and ignore $\epsilon$. Since
+$\beta_t\vk_t\vk_t\T = \eta_t\hat\vk_t\hat\vk_t\T$ and $\beta_t\vv_t\vk_t\T = \eta_t(\vv_t/n_t)\hat\vk_t\T$,
+\begin{equation}\label{eq:c05-kla-gdn}
+  \mathrm{KLA}(\vk_t, \vv_t;\ \eta_t) = \mathrm{GDN}(\hat\vk_t,\ \vv_t/n_t;\ \beta_t = \eta_t).
+\end{equation}
+In our formalization, then, KLA is GDN in which each written value is divided by the norm of its
+key. Equivalently, the memory stores each pair \emph{for the raw key}: reading with $\vk_t$ right
+after the write gives $\mS_t\vk_t = \alpha_t(1-\eta_t)\mS_{t-1}\vk_t + \eta_t\vv_t$, the relaxed
+Kaczmarz interpolation, whereas GDN guarantees this for $\hat\vk_t$. The key norm thus becomes a
+free, learned per-token channel: a long key writes a weaker trace as seen by unit-norm queries.
+Both identities hold to round-off in our check, over a whole sequence in the chunkwise form. This
+analysis is ours; see the paper for the authors' interpretation.
+
+\paragraph{Relation to Longhorn.} The \code{longhorn} option in the GDN code uses
+$\beta_t/(1 + \beta_t\norm{\vk_t}^2)$ \citep{c05-liu2024longhorn}. That is the closed-form solution
+of the regularized problem $\min_{\mS}\norm{\mS - \mS_{t-1}}_F^2 + \beta_t\norm{\mS\vk_t - \vv_t}^2$
+(\cref{ex:c05-longhorn}), an implicit (proximal) step instead of an explicit gradient step. As
+$\beta_t\to\infty$ it tends to $1/\norm{\vk_t}^2$, the exact Kaczmarz projection; our check shows
+the gap shrinking from $3\times10^{-2}$ to $3\times10^{-8}$ as $\beta_t$ grows from $1$ to $10^6$.
+The Kalman-style layers of \cref{ch:probabilistic} generalize the same idea by replacing
+$\norm{\vk_t}^2$ with a quadratic form that tracks uncertainty.
+
+\subsection{What the candidate repository contains}\label{sec:c05-kla-repo}
+
+\begin{sloppypar}
+Comparing \repo{JiaxuanZou0714__KaczmarzLinearAttention} file by file with
+\repo{NVlabs__GatedDeltaNet} shows that the Triton kernels are unchanged apart from an updated
+PyTorch autocast import, while the layer, the configurations and the experiment scripts are new.
+\end{sloppypar}
+
+\begin{implnote}[title={In the code: Kaczmarz-specific changes in the candidate repository}]
+\code{GatedDeltaNet} in
+\repofile{repos/JiaxuanZou0714__KaczmarzLinearAttention/lit_gpt/gated_delta_net.py} gains new
+values for its \code{qk_norm} option (\cref{lst:c05-kla-modes}). Under \code{kaczmarz} the step is
+$1/(\norm{\vk_t}^2 + 10^{-6})$ with no learned gate; under \code{relaxed_kaczmarz} it is
+$\sigmoid(\cdot)/(\norm{\vk_t}^2 + 10^{-6})$, i.e.\ \cref{eq:c05-kla}; \code{relaxed_kaczmarz_q_norm}
+additionally L2-normalizes the query. In none of these modes are the keys normalized. Further
+options support ablations: \code{k_norm_only} (identical code to \code{kaczmarz}),
+\code{learned_scalar} ($\sigmoid(\cdot)/(c\norm{\vk_t}^2 + \epsilon)$ with a learned $c > 0$),
+\code{seq_only} ($\beta_t = 1/t$, no key norm), a \code{seq_factor_mode} that multiplies $\beta_t$
+by $1/t$, $1/\sqrt t$ or $1/\log(1+t)$, and \code{gate_mode='single'}, which ties the decay to the write strength by setting
+$\alpha_t = 1 - \sigmoid(\cdot)$. The resulting $\beta_t$ is passed unchanged to the original
+\code{chunk_gated_delta_rule}, so training uses the GDN kernel of \cref{alg:c05-gdn-chunk}, as the
+abstract's ``one-scalar modification'' implies.
+
+\repofile{repos/JiaxuanZou0714__KaczmarzLinearAttention/lit_gpt/config.py} adds configurations
+\code{Kaczmarz_0.4B}, \code{RelaxedKaczmarz_0.4B}, \code{RelaxedKaczmarzQNorm_0.4B}, a hybrid
+\code{RelaxedKaczmarzQNorm_H1_0.4B} (alternating with 2K sliding-window attention, as GDN's H1),
+baselines (DeltaNet, Mamba-2, Longhorn, GLA) and small models for MQAR, palindrome and stack
+tasks. The analysis code maps the name \code{RelaxedKaczmarzQNorm} to the label ``KLA''
+(\repofile{repos/JiaxuanZou0714__KaczmarzLinearAttention/analysis_plot_style.py}), and the run
+scripts compare KLA, GDN and Mamba-2. The repository also holds experiment plans and generated
+reports, written in Chinese (\code{KIMI_EXPERIMENT_PLAN.md},
+\code{analysis_results/ablation_47/ablation_47_report.md}), whose ablation axes (normalization,
+sequence factor, single versus dual gate, value expansion) match the options above. We take this
+as strong circumstantial evidence that the repository is a development version of the paper's
+code, but it remains unconfirmed, and we do not quote numbers from its result files because they
+cannot be tied to the paper.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}JiaxuanZou0714\_\_KaczmarzLinearAttention/\allowbreak{}lit\_gpt/\allowbreak{}gated\_delta\_net.py} (step-size modes; repository unconfirmed)},label={lst:c05-kla-modes}]
+        elif self.qk_norm == 'longhorn':
+            beta = beta / (1 + beta * (k * k).sum(-1))
+        elif self.qk_norm == 'kaczmarz':
+            beta = 1 / ((k * k).sum(-1) + 1e-6)
+        elif self.qk_norm == 'relaxed_kaczmarz':
+            beta = beta / ((k * k).sum(-1) + 1e-6)
+        elif self.qk_norm == 'relaxed_kaczmarz_q_norm':
+            beta = beta / ((k * k).sum(-1) + 1e-6)
+            q = l2_norm_fn(q).to(v)
+        # ...
+        elif self.qk_norm == 'learned_scalar':
+            learned_scalar = F.softplus(self.learned_norm_logit)
+            beta = raw_beta / (learned_scalar * (k * k).sum(-1) + 1e-6)
+\end{lstlisting}
+
+\subsection{Algorithms and complexity}
+
+\Cref{alg:c05-kla} is the layer's forward pass in our formalization (following the
+\code{RelaxedKaczmarzQNorm} configuration). Because only $\beta_t$ changes, training and decoding
+cost exactly what GDN costs, plus $\bigO(d_k)$ per token for the key norm; the state is the same
+$d_v\times d_k$ matrix.
+
+\begin{algorithm}[t]
+\caption{Kaczmarz linear attention layer, one head (our formalization)}
+\label{alg:c05-kla}
+\begin{algorithmic}[1]
+\Require inputs $\mX \in \R^{T\times d}$, state $\mS$
+\State $\mQ, \mK, \mV \gets \SiLU(\mathrm{ShortConv}(\mX\mW_{q/k/v}))$ \Comment{no L2 norm on $\mK$}
+\State $\mQ \gets \mathrm{L2Norm}(\mQ)$ \Comment{as in the \code{q_norm} variant}
+\State $\log\alpha_t \gets -e^{a}\,\mathrm{softplus}(\vw_\alpha\T\vx_t + \delta)$; \
+       $\eta_t \gets \sigmoid(\vw_\eta\T\vx_t)$
+\State $\beta_t \gets \eta_t/(\norm{\vk_t}^2 + \epsilon)$ \Comment{key-normalized step}
+\State $\mO, \mS \gets$ \cref{alg:c05-gdn-chunk}$(\mQ, \mK, \mV, \valpha, \vbeta, \mS)$
+       \Comment{unchanged GDN kernel}
+\State \Return output gate, RMSNorm and $\mW_o$ applied to $\mO$, as in GDN
+\end{algorithmic}
+\end{algorithm}
+
+\begin{pitfall}[title={Pitfall: same mathematics, different conditioning}]
+Feeding raw keys and $\beta_t = \eta_t/\norm{\vk_t}^2$ to the GDN kernel builds the WY matrix
+$\mA_{rs} = \eta_r(\hat\vk_r\T\hat\vk_s)(n_s/n_r)\,\gamma_r/\gamma_s$, a diagonal rescaling of the one
+GDN would build for unit keys; the triangular inverse changes by the same similarity, and the
+outputs agree in exact arithmetic. With key norms that vary by orders of magnitude inside a chunk,
+the ratios $n_s/n_r$ can make the half-precision solve less accurate. By \cref{eq:c05-kla-gdn} one
+can instead normalize the keys and divide the values by $n_t$ before calling the kernel, which
+computes the same function with unit keys. This is our suggestion, not something the candidate code
+does.
+\end{pitfall}
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c05-ours-kla} contains a cyclic Kaczmarz solver for a linear system, to make the
+classical method concrete, and the KLA recurrence of \cref{eq:c05-kla}. On a random consistent
+system with 30 equations and 10 unknowns our cyclic solver reaches an error of $6\times10^{-7}$
+after 10 sweeps and machine precision after 50; the randomized variant decreases the error
+monotonically, as \cref{eq:c05-kaczmarz-pyth} promises. \code{kla_recurrent} agrees with
+\code{gdn_chunk} of \cref{lst:c05-ours-gdn} called with raw keys and the same $\beta$
+($1.4\times10^{-16}$), which confirms that the chunkwise GDN algorithm needs no change.
+
+\begin{lstlisting}[caption={Reference implementation (ours): Kaczmarz solver and Kaczmarz linear attention},label={lst:c05-ours-kla}]
+import torch
+
+def kaczmarz(A, y, sweeps=10, relax=1.0):
+    # cyclic (relaxed) Kaczmarz for the linear system A x = y
+    x = torch.zeros(A.shape[1])
+    for _ in range(sweeps):
+        for a_i, y_i in zip(A, y):
+            x = x + relax * (y_i - a_i @ x) / (a_i @ a_i) * a_i
+    return x
+
+def kla_recurrent(q, k, v, alpha, eta, eps=1e-6, S=None):
+    # k is NOT normalized; eta, alpha: (T,) in (0, 1)
+    T, dk = k.shape
+    S = torch.zeros(v.shape[1], dk) if S is None else S
+    q = q / torch.linalg.vector_norm(q, dim=-1, keepdim=True)
+    beta = eta / ((k * k).sum(-1) + eps)       # key-normalized step size
+    o = []
+    for t in range(T):
+        S = alpha[t] * S
+        S = S + beta[t] * torch.outer(v[t] - S @ k[t], k[t])  # relaxed projection
+        o.append(S @ q[t])
+    return torch.stack(o), S
+\end{lstlisting}
+
+\begin{results}
+No file in this repository reports results for the paper: the candidate repository's README is
+Gated DeltaNet's, and its generated reports cannot be tied to the paper. The public abstract
+states, qualitatively, that at the 0.4B-parameter scale KLA reaches lower validation perplexity
+than the evaluated linear-time baselines including GDN, remains stable on long inputs, is strong on
+needle-in-a-haystack retrieval, improves multi-query associative recall over GDN, and decodes
+faster than its baseline at long context. See the paper for the numbers and settings.
+\end{results}
+
+\subsection{Discussion}
+
+KLA's contribution is a reading of the delta rule rather than a new state or kernel: the write is a
+projection of the memory onto the set of matrices that store the newest pair, relaxed by $\eta_t$
+and preceded by a gated decay. This connects the family to a century of numerical linear algebra
+(convergence rates, randomized and block variants, relaxation) and makes explicit what GDN's key
+normalization does implicitly. The cost is negligible, and the change composes with the other
+systems: nothing prevents a key-normalized step in KDA or GDN-2. Its open questions are empirical
+(when the norm of a raw key is a useful signal rather than noise) and, for the code, provenance.
+The projection view also links to test-time training (\cref{ch:ttt}), where the memory is a
+network trained by explicit gradient steps, and to the Kalman layers of \cref{ch:probabilistic}.
+
+% ===========================================================================
+\section{Comparison and discussion}\label{sec:c05-comparison}
+
+\Cref{tab:c05-compare} puts the four systems side by side. All share the template
+\cref{eq:c05-template}, a $d_v\times d_k$ state per head, decoding in $\bigO(d_kd_v)$ per token,
+and a chunkwise training algorithm built on the UT transform. They differ in which parts of the
+update are allowed to vary per channel.
+
+\begin{table}[t]
+\centering\small
+\caption{The delta-rule family. ``State'' is the per-head state in the configurations of the
+mirrored code; ``kernel'' names the training kernel and its chunk size.}
+\label{tab:c05-compare}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.7cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{1.5cm}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+System & Transition $\mM_t$ (state update $\mS_{t-1}\mM_t + \vz_t\vk_t\T$) & Decay & Erase / write strength & State per head & Kernel and hybrid in the code \\
+\midrule
+Gated DeltaNet & $\alpha_t(\mI - \beta_t\vk_t\vk_t\T)$, symmetric, eigenvalues in $[0,1]$ & scalar per head & one scalar $\beta_t$ for both & $128\times256$ (0.4B, 1.3B configs) & Triton WY/UT, $C = 64$ (\fla{}: 16/32/64); H1 = alternating GDN and 2K SWA \\
+KDA & $\diag(\valpha_t)(\mI - \beta_t\vk_t\vk_t\T)$, constrained DPLR, real eigenvalues in $[0,\max\alpha]$ & per key channel & one scalar $\beta_t$ for both & $128\times128$ & Triton, $C = 64$ with 16-token sub-chunks; FlashKDA (CUDA), $C = 16$; 3 KDA : 1 MLA (Kimi Linear) \\
+Gated DeltaNet-2 & $\diag(\valpha_t)(\mI - (\vb_t\had\vk_t)\vk_t\T)$, non-normal, eigenvalues of the erase factor in $[0,1]$ & per key channel & $\vb_t \in [0,1]^{d_k}$, $\vw_t \in [0,1]^{d_v}$ & $128\times128$ & Triton, $C = 64$, gate-aware backward; GDN-2 alternating with 2K SWA \\
+Kaczmarz LA (ours) & $\alpha_t(\mI - \eta_t\hat\vk_t\hat\vk_t\T)$, raw keys, step $\eta_t/\norm{\vk_t}^2$ & scalar per head & one scalar $\eta_t/\norm{\vk_t}^2$ & as GDN (candidate code) & unchanged GDN kernel; H1 config in the unconfirmed repository \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{A ladder of editing operations.} Read top to bottom, the table adds one freedom at a
+time. GDN gives the memory a global ``clear'' and a local ``replace''. KDA lets each key channel
+keep its own memory lifetime, which the Kimi report also interprets as a learned position
+encoding. GDN-2 lets the erase act on some key channels and the write on some value channels, so a
+single token can revise part of what is stored at a key. KLA changes no freedom at all; it fixes
+how the step depends on the key's scale and explains the write as a Kaczmarz projection. All four
+contain the plain delta rule, and each of GDN, KDA and GDN-2 is the previous one with tied gates.
+
+\paragraph{Where the cost goes.} The recurrence is cheap in every case. The engineering cost lies
+in the chunkwise kernel, and it grows with the granularity of the decay: a scalar decay can be
+applied after the matrix product and even commutes through the triangular inverse; a per-channel
+decay forces secondary chunking around reference points, exact pairwise diagonal blocks or short
+chunks with a bounded gate. Decoupled erase and write gates leave the forward kernel almost
+untouched but make the backward kernel accumulate gate-weighted products. Key-normalized steps cost
+nothing in the kernel but change the conditioning of its triangular solve.
+
+\paragraph{What none of them change.} The memory is still a fixed $d_v\times d_k$ matrix per head,
+so exact recall over long contexts remains limited; this is why every repository in this chapter
+also provides a hybrid with attention (sliding-window attention for GDN, GDN-2 and the KLA
+candidate, global MLA for KDA), see \cref{ch:hybrid}. The transitions have real eigenvalues in $[0,1]$ (or $[-1,1]$
+with the negative-eigenvalue option), so none can rotate the state; products of several
+Householder-like factors (DeltaProduct) or general DPLR transitions (RWKV-7) relax this
+(\cref{ch:expressive}), and log-linear attention replaces the single state by a hierarchy
+(\cref{ch:structured}). Viewed through the survey's lens \citep{zhoubian2026memory}, all four are
+implicit, online, state-transition memories whose main risks are compression loss and
+interference, and the family is best understood as a sequence of increasingly precise answers to
+the interference problem of \cref{ex:c05-interference}.
+
+\begin{summarybox}
+\begin{itemize}
+  \item A linear-attention layer stores its past in a $d_v\times d_k$ matrix. The delta rule writes
+  by error correction, $\mS_t = \mS_{t-1}(\mI - \beta_t\vk_t\vk_t\T) + \beta_t\vv_t\vk_t\T$, one SGD
+  step on $\tfrac12\norm{\mS\vk_t - \vv_t}^2$, so new writes replace instead of accumulate.
+  \item All systems in this chapter fit
+  $\mS_t = \mS_{t-1}\mD_t(\mI - \ve_t\vk_t\T) + \vz_t\vk_t\T$: decay, read along an erase direction,
+  write the correction along the key.
+  \item \textbf{Gated DeltaNet} adds a scalar Mamba-2 gate, $\mD_t = \alpha_t\mI$, combining fast
+  forgetting with targeted overwriting. Its chunkwise form uses the UT transform
+  $\mT = (\mI + \operatorname{tril}(\diag(\vbeta)(\mK\mK\T\had\bm\Gamma),-1))^{-1}$, pseudo-keys
+  $\mW$, pseudo-values $\mU$ and new values $\bm R = \mU - \mW\mS\T$.
+  \item \textbf{KDA} makes the decay channel-wise, $\mD_t = \diag(\valpha_t)$, a DPLR transition with
+  both low-rank factors tied to the key. The kernels avoid overflow of $e^{-G}$ by secondary
+  chunking (\fla{}) or by 16-token chunks with gates bounded below by $-5$ (FlashKDA). Kimi Linear
+  interleaves 3 KDA layers with 1 NoPE MLA layer in a 48B-A3B MoE model.
+  \item \textbf{Gated DeltaNet-2} decouples the erase gate $\vb_t$ (key side) from the write gate
+  $\vw_t$ (value side), reduces to KDA and GDN by tying gates, and keeps the chunkwise skeleton
+  with an asymmetric WY form and a gate-aware backward pass.
+  \item \textbf{Kaczmarz LA} reads the delta rule as a Kaczmarz projection: with
+  $\beta_t = \eta_t/\norm{\vk_t}^2$ and raw keys the write is the minimal edit that (for $\eta_t = 1$)
+  stores the newest pair exactly. In our formalization it equals GDN on normalized keys with values
+  divided by the key norm. Its candidate code is unconfirmed but implements exactly this step.
+  \item Every reference implementation in this chapter was checked numerically: chunkwise equals
+  recurrent, and GDN-2 reduces to KDA and GDN under tied gates.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Spectra of the transitions]\label{ex:c05-spectrum}
+(a) For a unit key, show that $\alpha(\mI - \beta\vk\vk\T)$ has eigenvalues $\alpha$ and
+$\alpha(1-\beta)$ and give their multiplicities. Which range of $\beta$ makes the eigenvalue along
+$\vk$ negative but larger than $-1$? (b) Prove that the KDA transition
+$\diag(\valpha)(\mI - \beta\vk\vk\T)$ has real eigenvalues in $[0, \max_c\alpha_c]$ for
+$\beta \in [0,1]$. \emph{Hint:} conjugate by $\diag(\valpha)^{1/2}$. (c) Does (b) still hold for
+$\beta \in (1,2)$? Find the interval that contains the eigenvalues.
+\end{exercise}
+
+\begin{exercise}[The chunkwise form]\label{ex:c05-chunk}
+(a) Prove \cref{eq:c05-gdn-prefix} by induction on $r$ directly from \cref{eq:c05-gdn}, without
+the normalized state. (b) Show that for a scalar decay
+$\mK\mK\T\had\bm\Gamma$ and $\diag(\bm\gamma)\mK\mK\T\diag(\bm\gamma)^{-1}$ agree on and below the
+diagonal, and deduce $\mW = \diag(\bm\gamma)\,(\mI + \operatorname{tril}(\diag(\vbeta)\mK\mK\T,-1))^{-1}\diag(\vbeta)\mK$.
+(c) Explain why the analogous identity fails for a channel-wise decay, and verify numerically with
+\code{kda_chunk}.
+\end{exercise}
+
+\begin{exercise}[A GDN-2 step can grow the state]\label{ex:c05-gdn2-norm}
+Let $d_k = 2$, $d_v = 1$, $\vk = (1,1)\T/\sqrt2$, $\vb = (1,0)$, $\vw = 0$ and no decay.
+(a) Compute $\mM = \mI - (\vb\had\vk)\vk\T$, its eigenvalues and its spectral norm.
+(b) Find a row vector $\mS_0$ with $\norm{\mS_0\mM} > \norm{\mS_0}$. (c) Show that with
+$\vb = \beta\mathbf 1$, $\beta\in[0,1]$, no such $\mS_0$ exists. (d) Is the product of many GDN-2
+transitions with random gates in $[0,1]$ and random unit keys bounded in practice? Estimate its
+norm by simulation for $d_k = 16$ and $1000$ steps.
+\end{exercise}
+
+\begin{exercise}[Kaczmarz]\label{ex:c05-kaczmarz}
+(a) Derive \cref{eq:c05-kaczmarz-pyth} and conclude that relaxed Kaczmarz with
+$\eta\in(0,2)$ never increases the distance to any solution of a consistent system. (b) Show that
+the delta rule with $\beta_t = \eta_t/\norm{\vk_t}^2$ is invariant to rescaling the key in its
+erase term, and compute how the write term and the read $\mS_t\hat\vk_t$ change when $\vk_t$ is
+replaced by $c\vk_t$. (c) For an inconsistent system (noisy equations), what happens to cyclic
+Kaczmarz with $\eta = 1$? Why might the decay $\alpha_t$ help in the streaming setting?
+\end{exercise}
+
+\begin{exercise}[Longhorn and the Kaczmarz limit]\label{ex:c05-longhorn}
+Solve $\min_{\mS}\ \norm{\mS - \mS_{t-1}}_F^2 + \lambda\norm{\mS\vk_t - \vv_t}^2$ in closed form.
+\emph{Hint:} set the gradient to zero, multiply by $\vk_t$ to find $\mS\vk_t$, then substitute back.
+Show that the solution is a delta-rule step with $\beta_t = \lambda/(1 + \lambda\norm{\vk_t}^2)$,
+the \code{longhorn} option of the GDN code, and that it tends to the Kaczmarz step as
+$\lambda\to\infty$. Interpret $\lambda$ as a confidence in the new pair.
+\end{exercise}
+
+\begin{exercise}[Coding: secondary chunking]\label{ex:c05-code}
+Implement \cref{alg:c05-kda-intra} in NumPy in float32 with $C = 64$ and $B_C = 16$. Using
+log-decays of $-5$ per token, show that the naive factorization \cref{eq:c05-kda-naive} produces
+infinities, that your implementation does not, and that it matches a float64 evaluation of
+\cref{eq:c05-kda-scores} to about $10^{-7}$. Then add an erase-gate argument so that the same
+function computes the GDN-2 score matrix of \cref{eq:c05-gdn2-A}, and check \code{gdn2_chunk}
+against \code{gdn2_recurrent}.
+\end{exercise}

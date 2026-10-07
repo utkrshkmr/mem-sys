@@ -1,3 +1,1679 @@
 \chapter{A Taxonomy of Memory in LLMs}\label{ch:taxonomy}
 
-(Chapter in preparation.)
+The word \emph{memory} is used for a surprising number of different things in today's language
+models. The key--value (KV) cache of \cref{ch:foundations} is called memory. So is the
+fixed-size matrix that a Mamba or Gated DeltaNet layer carries from token to token, the small
+neural network that Titans trains by gradient descent while it reads a document, the hashed
+$n$-gram tables of DeepSeek's Engram, the experts of a mixture-of-experts layer, and the vector
+database behind a chatbot that ``remembers'' a user's preferences. These mechanisms look nothing
+alike, yet they answer the same questions: \emph{what is stored, when and how is it updated, how
+does it interact with the forward computation, how long is it retained, and at what granularity
+is it stored?}
+
+This chapter builds the vocabulary that the rest of the book uses to answer those questions. It
+follows the survey of \citet{zhoubian2026memory}, which classifies \emph{model-level} memory along
+three orthogonal axes---\emph{representation} (implicit or explicit), \emph{update dynamics}
+(offline or online) and \emph{persistence} (short-term or long-term)---and refines the second axis
+with five families of \emph{update rules}. We teach that framework slowly, with definitions,
+worked examples and the edge cases the survey itself discusses, and we add two things a textbook
+needs: the historical ideas that every modern design descends from, and a single mathematical
+lens---memory as online regression---that turns many of the later chapters into variations on one
+equation.
+
+\paragraph{Roadmap.} \Cref{sec:c02-what} pins down what ``memory'' means at the model level and
+how this differs from agent-level memory. \Cref{sec:c02-history} builds the background from
+scratch: recurrent states, associative matrices, fast weights, memory-augmented networks and
+retrieval-based language models. \Cref{sec:c02-axes} presents the three axes and argues that they
+are orthogonal. \Cref{sec:c02-rules} gives a mathematical template for each update rule of the
+survey's Table~II. \Cref{sec:c02-unify} shows that linear attention, the delta rule and test-time
+training are gradient steps on different regression objectives. \Cref{sec:c02-implicit-limits,%
+sec:c02-explicit-risks} discuss the limits of implicit memory and the risks of explicit memory.
+\Cref{sec:c02-eval} explains how memory is evaluated, including how to build a
+needle-in-a-haystack test and a multi-query associative recall task. \Cref{sec:c02-open} lists the
+open challenges, and \cref{sec:c02-master} places every 2025--2026 system of this book on the
+taxonomy in one master table.
+
+% ===========================================================================
+\section{What ``memory'' means for a language model}\label{sec:c02-what}
+% ===========================================================================
+
+\subsection{A working definition}\label{sec:c02-definition}
+
+Every autoregressive model reads a sequence $\vx_1, \vx_2, \dots$ and produces an output at each
+step. For the output at step $t$ to depend on $\vx_i$ with $i < t$, something computed from
+$\vx_i$ must still exist at step $t$. That something is memory. The following definition is ours,
+not the survey's; it is a convenient way to make the survey's three questions precise.
+
+\begin{definition}[Memory mechanism]\label{def:c02-memory}
+A \emph{memory mechanism} of a sequence model consists of
+\begin{enumerate}[label=(\roman*)]
+  \item a \emph{memory state} $\mathcal{M}_t$, which may be a set of vectors, a matrix, the
+        parameters of a small network or a table;
+  \item a \emph{write map} $\mathcal{M}_t = W(\mathcal{M}_{t-1}, \vx_t)$, which may be the
+        identity (the memory is not written at inference);
+  \item a \emph{read map} $\vo_t = R(\mathcal{M}_t, \vx_t)$, which produces the information
+        that flows back into the computation; and
+  \item a \emph{lifecycle policy}: how $\mathcal{M}_0$ is initialised and when the state is
+        reset, carried over or saved.
+\end{enumerate}
+\end{definition}
+
+A few instances make the definition concrete. We use the book's notation: per-head query, key and
+value $\vq_t, \vk_t \in \R^{d_k}$, $\vv_t \in \R^{d_v}$, and matrix state
+$\mS_t \in \R^{d_v \times d_k}$.
+\begin{itemize}
+  \item \textbf{Softmax attention.} $\mathcal{M}_t = \{(\vk_i, \vv_i)\}_{i \le t}$ is the KV cache;
+        $W$ appends the new pair; $R$ is
+        $\vo_t = \sum_{i \le t} \vv_i \exp(\vq_t\T\vk_i/\sqrt{d_k}) / \sum_{j\le t}\exp(\vq_t\T\vk_j/\sqrt{d_k})$.
+        The lifecycle policy discards the cache at the end of the request.
+  \item \textbf{Linear attention.} $\mathcal{M}_t = \mS_t$; $W$ is $\mS_t = \mS_{t-1} + \vv_t\vk_t\T$;
+        $R$ is $\vo_t = \mS_t\vq_t$.
+  \item \textbf{A test-time-trained memory (Titans-like).} $\mathcal{M}_t$ is the weight set of
+        a small MLP $f$; $W$ is a gradient step on a loss such as
+        $\tfrac12\norm{f(\vk_t) - \vv_t}^2$; $R$ evaluates $f(\vq_t)$.
+  \item \textbf{Mixture of experts.} $\mathcal{M}$ is the set of expert weights; $W$ is the
+        identity at inference; $R$ is the routed feed-forward computation.
+  \item \textbf{Hashed lookup (Engram-like).} $\mathcal{M}$ is a set of embedding tables; $W$ is the
+        identity at inference; $R$ hashes the last few tokens into table rows and gates the
+        fetched vectors with the hidden state.
+\end{itemize}
+Any causal model fits \cref{def:c02-memory} trivially (let $\mathcal{M}_t$ be the whole prefix).
+The definition becomes useful when we ask how $\mathcal{M}_t$ is structured, whether $W$ and $R$
+are separate operations or simply ``whatever the layer computes'', when $W$ is applied, and how
+long information written at step $i$ keeps influencing $R$ at step $t > i$. These are exactly
+the three axes of \cref{sec:c02-axes}.
+
+\subsection{Three levels at which ``memory'' is used}\label{sec:c02-levels}
+
+The survey restricts itself to \emph{model-level memory mechanisms and systems}: memory that is
+instantiated within the model architecture or its inference-time dynamics. It explicitly excludes
+agent-level and prompt-based memory systems that rely on external orchestration
+\citep[\S II]{zhoubian2026memory}. It also excludes, by a ``scope clarification'', the static
+parameters learned during pretraining, even though they encode knowledge: the focus is on
+mechanisms that \emph{evolve over time} or play an active role in storing and retrieving
+contextual or experiential information. \Cref{fig:c02-levels} summarises the three levels.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small]
+  \draw[rounded corners=4pt, fill=gray!6, draw=gray!60] (-7.4,-2.9) rectangle (7.4,3.1);
+  \node[anchor=north west, font=\small\bfseries, align=left] at (-7.25,3.0)
+    {Agent / system level (outside the survey's scope)};
+  \node[anchor=north west, font=\footnotesize, align=left, text width=14.2cm] at (-7.25,2.5)
+    {conversation logs, user profiles, reflection traces, tool outputs, vector databases,
+     retrieval-augmented generation pipelines};
+  \draw[rounded corners=4pt, fill=violet!5, draw=violet!50!black] (-7.0,-2.6) rectangle (7.0,1.75);
+  \node[anchor=north west, font=\small\bfseries] at (-6.85,1.65) {Model-level memory (this book)};
+  \node[anchor=north west, font=\footnotesize, align=left, text width=6.2cm] at (-6.85,1.1)
+    {\textbf{Implicit:} KV cache, sliding windows, sparse KV access, recurrent and
+     linear-attention states, SSM states};
+  \node[anchor=north west, font=\footnotesize, align=left, text width=6.4cm] at (0.3,1.1)
+    {\textbf{Explicit:} test-time-trained parameters, dedicated memory slots, hashed lookup
+     tables, mixture-of-experts parameters, model-integrated datastores};
+  \draw[rounded corners=3pt, dashed, fill=white, draw=gray!70] (-6.7,-2.35) rectangle (6.7,-1.05);
+  \node[font=\footnotesize, align=center, text width=12.8cm] at (0,-1.7)
+    {\textbf{Static pretrained weights} of attention and MLP layers: they encode knowledge, but
+     they do not evolve during use and are excluded by the survey's scope clarification};
+\end{tikzpicture}
+\caption{Three levels at which the word ``memory'' is used. The survey and this book study the
+middle level. Agent-level stores enter the scope only when their storage, access or update
+mechanism is instantiated within, or tightly coupled to, the model architecture.}
+\label{fig:c02-levels}
+\end{figure}
+
+The boundary between the second and third levels is easiest to see in retrieval. A
+\emph{retrieval-augmented generation} (RAG) system \citep{c02-lewis2020rag} fetches documents
+from an external corpus with a separately engineered retriever and pastes them into the prompt;
+the language model never sees anything but tokens. The kNN-LM of \citet{khandelwal2020knnlm}
+also uses an external datastore, but its keys are the model's own hidden states and its output is
+mixed into the model's next-token distribution by a fixed rule (\cref{sec:c02-retrieval}). The
+survey therefore places kNN-LM inside its taxonomy as explicit lookup memory and leaves RAG
+outside, and it draws the same line for its 2025--2026 lookup systems: ``the mechanisms discussed
+here embed persistent storage directly into the model's structural design''
+\citep[\S IV-B]{zhoubian2026memory}.
+
+\subsection{Relation to other memory surveys}\label{sec:c02-surveys}
+
+Several recent surveys use the word memory at different system levels. Their taxonomies are
+complementary rather than interchangeable \citep[\S II-D, Table III]{zhoubian2026memory}.
+\Cref{tab:c02-surveys} summarises them.
+
+\begin{table}[t]
+\centering\small
+\caption{Memory surveys and their organising lenses (after Table III of the survey).}
+\label{tab:c02-surveys}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{4.6cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+Survey & Scope and organising lens & Main emphasis \\
+\midrule
+\citet{zhang2024agentmemory} & LLM-based agents; memory sources, forms and operations &
+Design and evaluation of agent memory modules for long-horizon interaction and applications \\
+\citet{wu2025humanmemory} & LLM-driven AI systems; object (personal/system), form
+(parametric/non-parametric) and time (short/long term) & Correspondence between human-memory
+categories and AI memory \\
+\citet{du2025rethinking} & LLM-based AI and agents; representation types and six atomic
+operations & Lifecycle management: consolidation, indexing, updating, forgetting, retrieval and
+compression \\
+\citet{zhang2025llmmemory} & LLM memory across the model lifecycle: parametric, contextual,
+external and procedural/episodic memory & Operational definitions, evaluation protocols,
+editing and forgetting, governance and auditing \\
+\citet{luo2026storage} & LLM-agent memory as an evolution from storage through reflection to
+experience & Turning interaction trajectories into refined, transferable experience \\
+\citet{zhoubian2026memory} & Model-level LLM architectures; representation, update dynamics and
+persistence & How attention/KV states, recurrent states, writable parameters, addressable modules
+and hybrids store, update and retain information \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The lenses differ in their unit of analysis: human memory categories (episodic, semantic, working
+memory), lifecycle operations (consolidation, forgetting), or---in the architecture-centric
+survey---the substrate itself (a cache, a state, a parameter set, a table) and how it is written and
+read.
+
+For agent-level memory, two mirrored paper lists (reading lists, not code) are good starting points:
+\begin{itemize}[itemsep=0pt]
+  \item \repo{Elvin-Yiming-Du__Survey_Memory_in_AI}, accompanying \citet{du2025rethinking}, groups
+        papers into long-term, long-context, parametric and multi-source memory, with dataset tables
+        and lists of memory tools;
+  \item \repo{FeishuLuo__Evolving-LLM-Agent-Memory-Survey}, accompanying \citet{luo2026storage},
+        organises papers and benchmarks by storage, reflection and experience.
+\end{itemize}
+
+% ===========================================================================
+\section{Historical background: memory before 2025}\label{sec:c02-history}
+% ===========================================================================
+
+Almost every 2025--2026 design in this book recombines a handful of older ideas.
+\Cref{fig:c02-timeline} places them on a timeline. This section introduces them in order of
+increasing explicitness: a recurrent hidden state, an associative matrix written by outer
+products, fast weights, memory-augmented networks with read and write heads, and retrieval from
+a datastore.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize, xscale=0.98]
+  \draw[-{Latex[length=2mm]}, thick, gray!70!black] (0,0) -- (15.6,0);
+  \foreach \x/\yr/\pos in {0.9/1972/below, 2.15/1982--87/above, 3.4/1990--97/below,
+      4.65/1992/above, 5.9/2014--16/below, 7.15/2017/above, 8.4/2020/below, 9.65/2021--22/above,
+      10.9/2023/below, 12.15/2024/above, 13.4/2025/below, 14.65/2026/above} {
+    \fill[violet!60!black] (\x,0) circle (2pt);
+    \node[font=\scriptsize\bfseries, \pos=1pt] at (\x,0) {\yr};
+  }
+  \foreach \x/\lab in {0.9/{Correlation matrix memory},3.4/{Elman RNN; LSTM},
+      5.9/{NTM, MANN, DNC; fast weights attend to the recent past},8.4/{kNN-LM; linear attention},
+      10.9/{LongMem; StreamingLLM},13.4/{Titans, Gated DeltaNet, MoBA, NSA}} {
+    \node[anchor=south, text width=2.0cm, align=center] at (\x,0.35) {\lab};
+  }
+  \foreach \x/\lab in {2.15/{Hopfield nets; slow and fast weights},4.65/{Fast-weight programmers},
+      7.15/{Transformer: the KV cache},9.65/{Linear Transformers as fast-weight programmers; Memorizing Transformers},
+      12.15/{Mamba-2, GLA, DeltaNet, TTT layers},14.65/{Engram, In-Place TTT, Gated DeltaNet-2, Mamba-3}} {
+    \node[anchor=north, text width=2.0cm, align=center] at (\x,-0.35) {\lab};
+  }
+\end{tikzpicture}
+\caption{A timeline of memory ideas used in this book (evenly spaced, not to scale). Labels above
+and below the axis alternate only for legibility.}
+\label{fig:c02-timeline}
+\end{figure}
+
+\subsection{The recurrent hidden state}\label{sec:c02-rnn}
+
+The simplest memory is the hidden state of a recurrent neural network (RNN). The Elman network
+\citep{elman1990finding} updates a vector $\vh_t \in \R^{d}$ by
+\begin{equation}\label{eq:c02-elman}
+  \vh_t = \tanh(\mW_h \vh_{t-1} + \mW_x \vx_t + \vb).
+\end{equation}
+Everything the network knows about $\vx_1, \dots, \vx_{t-1}$ must be squeezed into the $d$
+numbers of $\vh_{t-1}$, and every step overwrites all of them. In the language of
+\cref{def:c02-memory}, the state is $\vh_t$, the write map is \eqref{eq:c02-elman} and the read map
+is the output layer. Training such a network by backpropagation through time multiplies many
+Jacobians $\partial\vh_t/\partial\vh_{t-1}$, whose product tends to vanish or explode, so
+information from far back is hard to learn to keep.
+
+The long short-term memory (LSTM) of \citet{hochreiter1997lstm} adds a separate cell state
+$\bm{c}_t$ that is changed additively. With the forget gate added later by
+\citet{c02-gers2000forget}, the update is
+\begin{align}
+  \vg^{(f)}_t &= \sigmoid(\mW_f[\vh_{t-1}; \vx_t] + \vb_f), \quad
+  \vg^{(i)}_t = \sigmoid(\mW_i[\vh_{t-1}; \vx_t] + \vb_i), \quad
+  \vg^{(o)}_t = \sigmoid(\mW_o[\vh_{t-1}; \vx_t] + \vb_o), \nonumber\\
+  \tilde{\bm{c}}_t &= \tanh(\mW_c[\vh_{t-1}; \vx_t] + \vb_c), \nonumber\\
+  \bm{c}_t &= \vg^{(f)}_t \had \bm{c}_{t-1} + \vg^{(i)}_t \had \tilde{\bm{c}}_t, \qquad
+  \vh_t = \vg^{(o)}_t \had \tanh(\bm{c}_t). \label{eq:c02-lstm}
+\end{align}
+Look at the cell update in \eqref{eq:c02-lstm}. For fixed gates it is a \emph{linear},
+\emph{diagonal} recurrence in $\bm{c}$: the old memory is scaled channel by channel by the forget
+gate, and new content is added. This is the skeleton of every gated linear recurrence in
+\cref{ch:linear,ch:delta}. Two differences separate the LSTM from its modern descendants. First,
+modern states are \emph{matrices} $\mS_t \in \R^{d_v \times d_k}$ rather than vectors, which gives
+far more storage for the same width. Second, modern gates depend only on the current input
+$\vx_t$, not on $\vh_{t-1}$. That single change makes the recurrence linear in the state, so the
+whole sequence can be processed with a parallel scan or a chunkwise algorithm instead of a
+strictly sequential loop (\cref{ch:linear}).
+
+\subsection{Associative memory and the outer product}\label{sec:c02-assoc}
+
+An \emph{associative memory} stores pairs $(\vk_i, \vv_i)$ so that presenting $\vk_i$ returns
+$\vv_i$. The correlation matrix memory of \citet{c02-kohonen1972correlation} and the Hopfield
+network \citep{c02-hopfield1982neural} store pairs by summing outer products,
+\begin{equation}\label{eq:c02-hebb}
+  \mS = \sum_{i=1}^{n} \vv_i \vk_i\T \in \R^{d_v \times d_k},
+\end{equation}
+which is a Hebbian rule: the weight between input unit $a$ and output unit $b$ grows when key
+component $a$ and value component $b$ are active together. Reading with key $\vk_j$ gives
+\begin{equation}\label{eq:c02-crosstalk}
+  \mS\vk_j = \vv_j \norm{\vk_j}^2 + \sum_{i \ne j} \vv_i (\vk_i\T\vk_j).
+\end{equation}
+The first term is the signal; the second is \emph{crosstalk}. If the keys are orthonormal, the
+crosstalk vanishes and every value is recovered exactly. How many pairs can a $d_v \times d_k$
+matrix hold?
+
+\begin{proposition}[Capacity of a linear associative memory]\label{prop:c02-capacity}
+Let $\vk_1, \dots, \vk_n \in \R^{d_k}$. There is a matrix $\mS \in \R^{d_v\times d_k}$ with
+$\mS\vk_i = \vv_i$ for all $i$ \emph{for every choice} of values $\vv_1,\dots,\vv_n \in \R^{d_v}$
+if and only if the keys are linearly independent. In particular, at most $d_k$ arbitrary
+bindings can be stored exactly.
+\end{proposition}
+
+\begin{proof}
+Collect the keys and values as columns: $\mK = [\vk_1, \dots, \vk_n] \in \R^{d_k \times n}$ and
+$\mV = [\vv_1,\dots,\vv_n] \in \R^{d_v\times n}$. The conditions read $\mS\mK = \mV$.
+If the keys are independent, $\mK\T\mK$ is invertible and $\mS = \mV(\mK\T\mK)^{-1}\mK\T$
+satisfies $\mS\mK = \mV(\mK\T\mK)^{-1}\mK\T\mK = \mV$. Conversely, if the keys are dependent,
+there are coefficients $c_1, \dots, c_n$, not all zero, with $\sum_i c_i \vk_i = \mathbf{0}$.
+Any $\mS$ then satisfies $\sum_i c_i \mS\vk_i = \mathbf{0}$, so the values must obey
+$\sum_i c_i \vv_i = \mathbf{0}$. Choosing values that violate this (for example
+$\vv_j \ne \mathbf{0}$ for one $j$ with $c_j \neq 0$ and all others zero) leaves no solution.
+Independent vectors in $\R^{d_k}$ number at most $d_k$.
+\end{proof}
+
+\begin{example}[Two keys in two dimensions]\label{ex:c02-two-keys}
+Let $d_k = 2$, $d_v = 1$, $\vk_1 = (1, 0)\T$, $\vk_2 = (0.6, 0.8)\T$ (both unit length,
+$\vk_1\T\vk_2 = 0.6$) and $v_1 = v_2 = 1$. The Hebbian sum \eqref{eq:c02-hebb} gives
+$\mS = (1.6,\ 0.8)$, so $\mS\vk_1 = 1.6$ and $\mS\vk_2 = 0.96 + 0.64 = 1.6$: both reads are wrong by
+the crosstalk $0.6$. Because the two keys are independent, \cref{prop:c02-capacity} promises an
+exact memory. Indeed $\mK = \begin{psmallmatrix}1 & 0.6\\ 0 & 0.8\end{psmallmatrix}$ has inverse
+$\begin{psmallmatrix}1 & -0.75\\ 0 & 1.25\end{psmallmatrix}$, and
+$\mS = \mV\mK^{-1} = (1,\ 0.5)$ gives $\mS\vk_1 = 1$ and $\mS\vk_2 = 0.6 + 0.4 = 1$. We will meet
+the same numbers again in \cref{sec:c02-unify}, where the delta rule lands in between.
+\end{example}
+
+\subsection{Fast weights: the common ancestor}\label{sec:c02-fastweights}
+
+The idea that a network could keep two kinds of weights---\emph{slow} weights that store
+long-term knowledge and \emph{fast} weights that change quickly and decay, holding temporary
+information---goes back to \citet{c02-hinton1987fastweights}. \citet{schmidhuber1992fastweights}
+turned it into a sequence-processing architecture: a slow network, trained by gradient descent,
+reads each input and emits patterns whose outer product is \emph{added} to the weight matrix of a
+second, fast network; the fast network then processes the input with its just-modified weights.
+In today's notation, the slow network produces a key, a value and a query from $\vx_t$
+($\vk_t = \mW_K\T\vx_t$ and so on, with slow weights $\mW_K, \mW_V, \mW_Q$), and the fast weights
+are a matrix $\mS_t$:
+\begin{equation}\label{eq:c02-fwp}
+  \mS_t = \mS_{t-1} + \vv_t\vk_t\T, \qquad \vo_t = \mS_t\vq_t.
+\end{equation}
+\citet{ba2016fastweights} revived the idea for RNNs: a fast weight matrix
+$\mA(t) = \lambda\mA(t-1) + \eta\,\vh(t)\vh(t)\T$, with decay $\lambda$ and rate $\eta$, is applied
+in a short inner loop when computing the next hidden state, so that the network ``attends to the
+recent past''. Unrolling the recursion shows why this is attention:
+$\mA(t)\vh = \eta\sum_{\tau \le t}\lambda^{t-\tau}\,\vh(\tau)\,(\vh(\tau)\T\vh)$, a weighted sum of
+past hidden states with dot-product scores and exponential recency weighting.
+
+Unroll \eqref{eq:c02-fwp} the same way, with $\mS_0 = \mathbf{0}$:
+\begin{equation}\label{eq:c02-fwp-unrolled}
+  \vo_t = \Big(\sum_{i \le t}\vv_i\vk_i\T\Big)\vq_t = \sum_{i\le t}\vv_i\,(\vk_i\T\vq_t).
+\end{equation}
+Compare softmax attention, $\vo_t = \sum_{i\le t}\vv_i\exp(\vq_t\T\vk_i/\sqrt{d_k})/Z_t$. Replace
+the exponential by a dot product of feature maps $\phi(\vq_t)\T\phi(\vk_i)$ and drop (or keep) the
+normaliser $Z_t$, and you obtain \emph{linear attention} \citep{katharopoulos2020transformers}.
+\citet{c02-schlag2021linear} made the equivalence explicit---linear Transformers \emph{are}
+fast-weight programmers---and pointed out that the purely additive write
+\eqref{eq:c02-fwp} cannot overwrite an old association. They replaced it by the delta rule of
+\citet{c02-widrow1960adaptive},
+\begin{equation}\label{eq:c02-delta-intro}
+  \mS_t = \mS_{t-1} + \beta_t\,(\vv_t - \mS_{t-1}\vk_t)\,\vk_t\T,
+\end{equation}
+which writes only the \emph{error} between the desired value and what the memory currently
+returns for $\vk_t$. Later, \citet{c02-sun2024ttt} let the fast weights be the parameters of a
+small model trained by gradient descent on a self-supervised loss at test time (TTT layers).
+
+\begin{keyidea}[title={Key idea: fast weights are the common ancestor}]
+A fast-weight memory is a matrix (or a small network) whose parameters are \emph{written during
+inference} by rules computed from the input. Additive outer-product writes give linear attention
+and, with gates, the state-space and linear-recurrent family (implicit memory,
+\cref{ch:linear,ch:delta,ch:expressive,ch:structured}). Error-correcting writes give the delta
+rule. Writes that are gradient steps on a general loss, applied to a general network, give
+test-time training (explicit memory, \cref{ch:ttt}). \Cref{sec:c02-unify} makes this precise.
+\end{keyidea}
+
+\subsection{Memory-augmented neural networks}\label{sec:c02-mann}
+
+A second line of work gave networks an explicit memory \emph{matrix} with learned read and write
+heads. The Neural Turing Machine \citep{c02-graves2014ntm}, its use for one-shot learning in
+memory-augmented neural networks (MANN) \citep{santoro2016mann}, and the Differentiable Neural
+Computer (DNC) \citep{graves2016dnc} share three operations on a memory
+$\mathcal{M}_t \in \R^{N \times d_m}$ with $N$ slots (rows $\mathcal{M}_t(i)$).
+\begin{itemize}
+  \item \textbf{Content-based addressing.} A controller emits a key $\vk_t$ and a sharpness
+        $\beta_t > 0$; the weight on slot $i$ is
+        \begin{equation}\label{eq:c02-ntm-address}
+          w_t(i) = \frac{\exp\big(\beta_t\,\cos(\vk_t, \mathcal{M}_{t-1}(i))\big)}
+                        {\sum_{j=1}^{N}\exp\big(\beta_t\,\cos(\vk_t, \mathcal{M}_{t-1}(j))\big)}.
+        \end{equation}
+  \item \textbf{Read.} $\vr_t = \sum_i w_t(i)\,\mathcal{M}_t(i)$.
+  \item \textbf{Write by erase and add.} With an erase vector $\ve_t \in (0,1)^{d_m}$ and an add
+        vector $\va_t$,
+        \begin{equation}\label{eq:c02-ntm-write}
+          \mathcal{M}_t(i) = \mathcal{M}_{t-1}(i) \had \big(\mathbf{1} - w_t(i)\,\ve_t\big)
+                             + w_t(i)\,\va_t .
+        \end{equation}
+\end{itemize}
+MANN writes preferentially to least-recently-used slots; the DNC adds a usage-based allocator
+and a temporal link matrix that records the order of writes. These models are \emph{explicit}
+memory in the survey's sense: the memory has its own addressing and update operations that are
+distinct from the controller's forward computation \citep[\S IV-A]{zhoubian2026memory}. They were
+proposed at small scale, but their ideas reappear in this book: gated slot memories (LM2,
+\cref{ch:lookup}) and the separation of an \emph{erase} decision from a \emph{write} decision in
+Gated DeltaNet-2 (\cref{ch:delta}), whose erase gate acts on key channels and whose write gate acts
+on value channels, much as $\ve_t$ and $\va_t$ do in \eqref{eq:c02-ntm-write}.
+
+\subsection{Retrieval from a datastore}\label{sec:c02-retrieval}
+
+The third ancestor stores \emph{activations} rather than weights. The kNN-LM
+\citep{khandelwal2020knnlm} builds a datastore of pairs $(f(c_i), w_i)$, where $f(c_i)$ is the
+pretrained model's hidden representation of a training context $c_i$ and $w_i$ is the token that
+followed it. At test time, with context $\vx$, it retrieves the $K$ nearest keys $\mathcal{N}$
+under a distance $d$ and mixes two distributions:
+\begin{equation}\label{eq:c02-knnlm}
+\begin{gathered}
+  p(y\mid\vx) = \lambda\,p_{\mathrm{kNN}}(y\mid\vx) + (1-\lambda)\,p_{\mathrm{LM}}(y\mid\vx),
+  \\
+  p_{\mathrm{kNN}}(y\mid\vx) \propto \sum_{(\vk_i, w_i)\in\mathcal{N}} \mathbb{I}[y = w_i]\,
+  \exp\big(-d(\vk_i, f(\vx))\big).
+\end{gathered}
+\end{equation}
+The datastore is built offline, is addressable, survives across inference calls and is queried by
+a separate nearest-neighbour mechanism, so the survey lists kNN-LM as explicit, offline,
+long-term memory and notes that it ``exemplifies explicit memory more clearly than ordinary KV
+cache'' \citep[\S IV-B]{zhoubian2026memory}.
+
+Memorizing Transformers \citep{wu2022memorizing} store the keys and values of past segments in a
+large non-differentiable memory; one attention layer retrieves the top matches by approximate
+nearest-neighbour search and combines them with ordinary local attention through a learned gate.
+LongMem \citep{wang2023longmem} caches key--value pairs from a frozen backbone in a memory bank
+and trains a residual side network to retrieve and fuse them. The survey treats both as a
+\emph{boundary class}: they add explicit indexing and retrieval machinery, but what they store is
+still the model's own intermediate state, without the semantic autonomy, editability or storage
+abstraction of a dedicated memory bank. It therefore discusses them as informative related
+mechanisms rather than as core entries of its taxonomy table.
+
+% ===========================================================================
+\section{The three axes of the taxonomy}\label{sec:c02-axes}
+% ===========================================================================
+
+The survey organises model-level memory along three axes: \emph{what} is stored as memory,
+\emph{when and how} it is updated, and \emph{how long} it persists \citep[\S II]{zhoubian2026memory}.
+It stresses that this is ``a conceptual framework'' rather than a rigid classification, and its
+Table~I classifies each model by its \emph{primary} memory mechanism. When a system has two memories
+(say, a KV cache and a lookup table), each has its own coordinates, and the table records the one
+that defines the system.
+
+\subsection{Representation: implicit versus explicit}\label{sec:c02-representation}
+
+The first axis asks how memory is represented and accessed within the model.
+
+\begin{definition}[Implicit memory {\citep[\S II-A]{zhoubian2026memory}}]\label{def:c02-implicit}
+\emph{Implicit memory} is information stored as a by-product of the model's forward computation
+and tightly coupled to its internal dynamics. It does not expose an explicit read, write or
+lookup interface; it is accessed implicitly through the computation graph.
+\end{definition}
+
+\begin{definition}[Explicit memory {\citep[\S II-A]{zhoubian2026memory}}]\label{def:c02-explicit}
+\emph{Explicit memory} is instantiated as a distinct storage component with well-defined access
+semantics. It supports explicit addressing, retrieval and update operations that are not
+reducible to standard forward computation or offline backpropagation. It may be non-parametric
+(tables, buffers, datastores) or parametric (dedicated modules trained or updated by specialised
+rules); what makes it explicit is that it is \emph{designed and operated as memory}, with clear
+read/write semantics and controllable update policies.
+\end{definition}
+
+Notice what the definitions do \emph{not} say. Implicit does not mean ``not materialised'': a KV
+cache is a very concrete tensor in GPU memory. Explicit does not mean ``external'',
+``non-parametric'' or ``writable'': Titans' memory is a set of MLP weights inside the model, and
+Engram is explicit but read-only at inference. The criterion is
+\emph{autonomy}: does the stored information exist under its own access and update semantics, or
+is it simply whatever the forward pass happened to compute? \Cref{sec:c02-what} already gave the
+\emph{scope clarification}: static pretrained weights are excluded even though they encode
+knowledge, because they neither evolve during use nor are operated as a memory.
+
+The survey's decisions can be reproduced, in nearly every case, by asking three questions (our
+summary, not a mechanical rule):
+\begin{enumerate}[label=(Q\arabic*)]
+  \item Is there a designated storage substrate whose \emph{role} is to hold information?
+  \item Is its content written by a rule of its own---a gradient step on a memory objective, a
+        gated slot write, admission into a table, an offline construction---rather than being
+        the layer's ordinary activations?
+  \item Can the store be addressed, inspected, reset or edited independently of the forward
+        computation that reads it?
+\end{enumerate}
+A KV cache fails all three in the relevant sense: its entries are the layer's own activations
+($\vk_t = \mW_K\T\vx_t$, $\vv_t = \mW_V\T\vx_t$), the ``write'' is appending them, and there is no
+operation such as ``replace the value stored for this key''. Titans' memory passes all three. Most
+interesting cases pass some and fail others; those are the edge cases below.
+
+\begin{example}[Implicit memory]\label{ex:c02-implicit}
+(a) \emph{KV cache.} Every new token appends its key and value; retrieval is the attention
+computation. Although materialised as tensors, KV caches ``lack independent addressing or
+controllable read/write semantics; their evolution is fully determined by the internal forward
+pass'' \citep[\S III-A]{zhoubian2026memory}. (b) \emph{Recurrent state of a linear-attention or
+state-space layer.} $\mS_t$ is updated by a learned transition (decay, delta rule, projection or
+filtering). Even sophisticated state-editing rules stay implicit, because ``the state and its
+update rule are coupled to forward dynamics'' \citep[\S III-C]{zhoubian2026memory}.
+\end{example}
+
+\begin{example}[Explicit memory]\label{ex:c02-explicit}
+(a) \emph{Titans} \citep{behrouz2025titans}: a dedicated memory module whose parameters are
+updated during inference by surprise-driven gradient signals; the stored information resides in
+persistent parameters that survive beyond one forward computation and is governed by update rules
+distinct from pretraining. (b) \emph{Engram} \citep{cheng2026engram}: hashed $n$-gram tables
+fetched by lookup; although integrated tightly with the forward pass, ``the stored memory
+representations remain structurally distinct from transient activations''
+\citep[\S IV-B]{zhoubian2026memory}. (c) \emph{Mixture of experts}: experts are persistent
+parameterised memory blocks and the router performs context-dependent addressing over them, so the
+survey treats MoE as explicit, offline, conditional-parameter memory \citep[\S IV-C]{zhoubian2026memory}.
+\end{example}
+
+\paragraph{Edge cases.} The survey discusses several systems that sit near the boundary. We list
+them with the survey's resolution, because they are the best way to understand the axis.
+\begin{enumerate}
+  \item \textbf{Memorizing Transformers, LongMem}: a boundary class (\cref{sec:c02-retrieval}).
+  \item \textbf{Test-time training versus linear attention.} \citet{liu2026tttla} argue that a
+        broad class of TTT inner loops that learn key--value bindings can be rewritten as learned
+        linear attention. The survey does not abandon the memory interpretation of TTT, but
+        concludes that ``only variants with a clearly designated, autonomously updated storage
+        substrate should be treated as explicit memory'' \citep[\S IV-A]{zhoubian2026memory}.
+        \Cref{sec:c02-unify} shows why the two views meet.
+  \item \textbf{In-Place TTT} \citep{feng2026inplacettt} adds no new module: it updates the
+        down-projection of an existing feed-forward layer chunk by chunk at inference. It is
+        explicit ``in the functional sense'': a designated parameter subset is operated as
+        writable memory under a specialised test-time objective. Explicit memory need not look
+        like a separate bank.
+  \item \textbf{HyperMLP} \citep{lu2026hypermlp} recasts attention as a two-layer MLP whose hidden
+        width grows with the context; history is still stored and accessed through the forward
+        computation, so it remains implicit.
+  \item \textbf{Bottlenecked Transformers} \citep{oomerjee2026bottlenecked} rewrite KV entries with
+        an auxiliary module at reasoning-step boundaries. Because what is manipulated is still the
+        model's own cache, the survey places them ``closer to short-term implicit working memory
+        than to long-term explicit storage'' \citep[\S V-B]{zhoubian2026memory}.
+  \item \textbf{Next-Latent Prediction} \citep{teoh2026nextlat} only adds a training objective on hidden
+        states; the memory it shapes is implicit.
+  \item \textbf{Hybrids.} Table~I lists HAM, AMOR, the Hybrid Quadratic-Linear Transformer,
+        Memory Caching and Expansion Span, whose memories are computation-coupled caches and
+        states, under implicit memory, but lists Hydra, which adds workspace and product-key
+        memory modules, under explicit memory.
+\end{enumerate}
+
+
+\subsection{Update dynamics: offline versus online}\label{sec:c02-update}
+
+The second axis asks \emph{when}, and how often, the memory is updated \citep[\S II-B]{zhoubian2026memory}.
+
+\begin{definition}[Offline and online memory]\label{def:c02-online}
+\emph{Offline memory} is updated only during a distinct training phase, typically by gradient-based
+optimisation; once training is complete, it stays fixed during inference. \emph{Online memory}
+supports updates during inference, so the model incorporates new information on the fly. Online
+updates may be triggered per token, per segment or per batch, and may follow rules distinct from
+standard backpropagation.
+\end{definition}
+
+In terms of \cref{def:c02-memory}: a memory is offline when its write map is the identity at
+inference, $\mathcal{M}_t = \mathcal{M}(\vtheta^\star)$ for every $t$, where $\vtheta^\star$ are
+the trained parameters; it is online when $\mathcal{M}_t$ depends on the inputs
+$\vx_1,\dots,\vx_t$ seen so far. Note that \emph{reading} an offline memory can depend on the
+input---Engram's lookup address is a hash of the current tokens---but what is \emph{stored} does
+not. Online writes happen at different frequencies: every token (KV-cache appends, recurrent
+states, Titans' surprise-driven writes), every chunk or segment (In-Place TTT, TTT-E2E, Memory
+Caching's snapshots, the consolidation steps of Bottlenecked Transformers) or every interaction or
+batch (explicit modules in multi-timescale hybrids, the slow levels of Nested Learning). MoE
+experts, Engram tables, ExplicitLM banks and the kNN-LM datastore are never written at inference.
+
+\begin{example}[Online is not the same as gradient-based]\label{ex:c02-online}
+The KV cache is online: every token writes a new entry. MEMORYLLM \citep{wang2024memoryllm}
+is online explicit memory whose latent memory pool is refreshed by \emph{forward-only}
+self-updates when new knowledge is read, with no gradient computation. Titans is online explicit
+memory updated by gradients. All three are online; they differ in their update rule, which is why
+the survey adds the finer lens of \cref{sec:c02-rules}.
+\end{example}
+
+\paragraph{Edge cases.}
+\begin{enumerate}
+  \item \textbf{TTT-E2E} \citep{tandon2025ttte2e} combines both regimes: the starting weights are
+        meta-learned offline, and the model then keeps training on next-token loss over the
+        context at test time. Table~I lists it as online, the regime that defines it.
+  \item \textbf{Next-Latent Prediction} is listed as \emph{offline}: its mechanism is a training
+        objective. At inference the model is an ordinary Transformer whose KV cache is, of course,
+        online---a reminder that the table classifies the primary mechanism.
+  \item \textbf{LM2} \citep{kang2025lm2} is listed as \emph{offline}. Its memory bank is read
+        through cross-attention and passed through input, forget and output gates inside the
+        forward pass; in the released code the bank starts from a stored initial value and the
+        updated bank flows from layer to layer (\repofile{repos/convergence-ai__lm2/src/model_memory_llama.py}).
+        One could argue that this in-pass gated rewriting is an online write. The survey's choice
+        emphasises that the bank and its gates are learned parameters fixed after training; we
+        follow Table~I in this book, and \cref{ch:lookup} returns to the question.
+\end{enumerate}
+
+\subsection{Persistence: short-term versus long-term}\label{sec:c02-persistence}
+
+The third axis asks how long stored information keeps influencing computation
+\citep[\S II-C]{zhoubian2026memory}.
+
+\begin{definition}[Persistence]\label{def:c02-persistence}
+The \emph{persistence} of a memory is the effective temporal horizon over which stored information
+can continue to influence computation. It is determined not only by whether the memory is
+physically retained, but also by its \emph{storage granularity} and \emph{compression rate}.
+\emph{Short-term} memory stores information at relatively fine granularity and is bounded by a
+local context window, a segment or an inference episode. \emph{Long-term} memory preserves
+information, or its influence, over extended contexts and in some cases across sessions; it does
+not necessarily require a large uncompressed store.
+\end{definition}
+
+The definition contains an apparent paradox. A KV cache keeps \emph{every} token at full
+precision, yet it is the canonical \emph{short-term} memory; a recurrent state keeps only a fixed
+matrix, yet the survey lists Gated DeltaNet and Mamba-3 as \emph{long-term}. The resolution is
+that persistence is about horizon under realistic budgets, not about fidelity. Token-level storage
+grows with the number of retained tokens, so in practice it is bounded by a window, a cache
+budget, an eviction policy or a session boundary. A compressed state has a fixed size, so it never
+has to stop; whatever it retains, it can retain for an unbounded number of steps.
+
+\paragraph{Measuring the horizon (our formalisation).} Define the influence of input $i$ on output
+$t$ as $I_t(i) = \norm{\partial\vo_t/\partial\vx_i}$ and the horizon as the largest lag $t - i$
+for which $I_t(i)$ exceeds a tolerance. For sliding-window attention with window $w$, $I_t(i) = 0$
+whenever $t - i \ge w$: a hard horizon. For a gated recurrence
+$\mS_t = \alpha_t\mS_{t-1} + \vv_t\vk_t\T$, unrolling gives
+\begin{equation}\label{eq:c02-decay-unroll}
+  \mS_t = \sum_{i \le t}\Big(\prod_{j=i+1}^{t}\alpha_j\Big)\vv_i\vk_i\T,
+\end{equation}
+so the write of token $i$ survives with weight $\prod_{j=i+1}^{t}\alpha_j$. With a constant gate
+$\alpha$, the weight halves after $\ln 2/(-\ln\alpha) \approx 0.69/(1-\alpha)$ steps: about $6.6$
+tokens for $\alpha = 0.9$, $69$ for $\alpha = 0.99$ and $693$ for $\alpha = 0.999$. With a
+data-dependent gate the model can set $\alpha_j \approx 1$ on tokens that carry nothing worth
+displacing old content for, and the horizon becomes as long as the model chooses. This is what
+the survey means by long-term memory being enabled by ``higher compression, selective retention,
+or persistent storage, rather than by storage size alone''.
+
+\paragraph{Granularity and compression.} \Cref{tab:c02-state-size} lists, per layer, the unit that
+is stored and the memory size as a function of the sequence length $T$.
+
+\begin{table}[t]
+\centering\small
+\caption{Storage granularity and memory size per layer as a function of sequence length $T$.
+$H_{kv}$ is the number of KV heads, $w$ a window, $s$ the number of sink tokens, $C$ a segment
+length; recurrent states are counted per head.}
+\label{tab:c02-state-size}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{2.0cm}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+Mechanism & Granularity & Size & Persistence (Table~I) \\
+\midrule
+Full KV cache & token & $2H_{kv}d_kT$ & short-term \\
+Sliding window / StreamingLLM & token & $2H_{kv}d_k(w + s)$ & short-term \\
+Sparse access (MoBA, NSA) & token, read by block & $\bigO(T)$ stored, $\bigO(kB)$ read & short-term (MoBA) \\
+Linear attention, SSM, delta rule & whole prefix & $H d_k d_v$ & long-term \\
+Log-Linear Attention & hierarchical summaries & $\bigO(H d_k d_v \log T)$ & long-term \\
+Memory Caching & segment snapshots & $\bigO(H d_k d_v\, T/C)$ & long-term \\
+Test-time-trained MLP (Titans) & whole prefix, in weights & number of memory parameters & long-term \\
+Lookup tables (Engram), MoE & corpus statistics & independent of $T$ & long-term \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{example}[Bytes per token]\label{ex:c02-bytes}
+Take a hypothetical model (not any particular release) with $L = 32$ layers, $H_{kv} = 8$ KV heads
+of dimension $d_k = 128$, stored in bfloat16 (2 bytes). Each token adds
+$2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes $= 128$\,KiB to the KV cache, so a
+context of $131{,}072$ tokens needs $16$\,GiB per sequence. A recurrent model of the same depth with
+$H = 16$ heads and $d_k = d_v = 128$, holding its state in float32, needs
+$32 \times 16 \times 128 \times 128 \times 4$ bytes $= 32$\,MiB, whatever the length. The two are
+equal at $32\,\mathrm{MiB}/128\,\mathrm{KiB} = 256$ tokens; beyond that the KV cache is larger. The
+recurrent state is therefore a lossy summary of everything after the first few hundred tokens,
+which is exactly the compression that buys its long horizon.
+\end{example}
+
+\paragraph{Two senses of ``long-term''.} It helps to distinguish (i) a horizon that extends beyond
+the local window \emph{within} one sequence, from (ii) persistence \emph{across} sequences,
+documents or sessions. Recurrent states are long-term in sense (i) but are discarded when the
+session ends, which the survey lists as a limitation of implicit memory
+(\S III-D; \cref{sec:c02-implicit-limits}). Offline explicit stores---Engram, MoE experts, the
+kNN-LM datastore---are long-term in sense (ii) by construction. Online explicit memories are
+long-term in sense (i), and in sense (ii) only if the lifecycle policy carries them across
+episodes.
+
+\paragraph{Edge cases.}
+\begin{enumerate}
+  \item \textbf{RATTENTION} \citep{wang2025rattention} is listed as short-term although it adds a
+        residual linear attention over tokens that have left the window. Table~I classifies its
+        primary mechanism, a minimal sliding window in a local--global design.
+  \item \textbf{MoBA} \citep{lu2025moba} keeps the full KV cache but routes each query to a few
+        blocks. Its horizon is still bounded by the context window, so it is short-term; sparse
+        access changes the cost of reading, not the lifetime of what is stored.
+  \item \textbf{Titans and TTT-E2E} are listed as long-term, yet in \S IV-D the survey calls them
+        ``short-timescale explicit memory'': parameters that evolve within an inference episode,
+        at a much higher frequency than pretraining. Both statements are true in the two senses
+        above: long-term relative to an attention window, short-timescale relative to the
+        lifetime of the model's other parameters.
+\end{enumerate}
+
+\subsection{Why the axes are orthogonal}\label{sec:c02-orthogonal}
+
+The three axes are logically independent: each definition refers to a different property
+(access semantics, time of writing, effective horizon). The survey illustrates this by noting
+that explicit memory can be offline or online, and that online memory can be short-term or
+long-term depending on its update and eviction policies \citep[\S II-C]{zhoubian2026memory}.
+\Cref{tab:c02-cube} fills the eight cells of the cube with examples.
+
+\begin{table}[t]
+\centering\small
+\caption{The eight combinations of the three axes, with examples from the survey's Table~I.
+A dagger marks our classification of an entry not listed that way in Table~I.}
+\label{tab:c02-cube}
+\begin{tabularx}{\textwidth}{@{}l l l >{\raggedright\arraybackslash}X@{}}
+\toprule
+Repr. & Update & Persistence & Examples \\
+\midrule
+Implicit & online & short & KV cache, StreamingLLM, Sparse Transformer, BigBird, Longformer,
+Selective Attention, MoBA, RATTENTION, HyperMLP \\
+Implicit & online & long & RetNet, Mamba/Mamba-2, Mamba-3, RWKV-7, Gated DeltaNet, KDA, Gated
+DeltaNet-2, Kaczmarz LA, Kalman LA, Log-Linear Attention, MoM, Memory Caching, Samba, Jamba, AMOR,
+HAM, Hybrid Quadratic-Linear Transformer, Expansion Span \\
+Implicit & offline & long & Next-Latent Prediction \\
+Implicit & offline & short & none in Table~I \\
+Explicit & online & long & Titans, TTT-E2E, In-Place TTT, GDWM, Nested Learning, MEMORYLLM, Hydra \\
+Explicit & online & short & none in Table~I; TTT-E2E with weights reset per document$^{\dagger}$
+(the survey's ``short-timescale explicit memory'') \\
+Explicit & offline & long & kNN-LM, PlugLM, Switch Transformer, GLaM, Mixtral, DeepSeekMoE, LM2,
+ExplicitLM, Engram, MemoryLLM (FFN) \\
+Explicit & offline & short & none in Table~I \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Reading \cref{tab:c02-cube} pairwise shows the independence. Fixing representation, both update
+regimes occur: Engram (explicit, offline) versus Titans (explicit, online); Next-Latent Prediction
+(implicit, offline) versus the KV cache (implicit, online). Fixing update dynamics, both horizons
+occur: the KV cache (online, short) versus Gated DeltaNet (online, long). Fixing persistence, both
+representations occur: Gated DeltaNet (long, implicit) versus Titans (long, explicit).
+
+The empty cells are informative. An \emph{offline} memory is not written from the current input,
+so its content cannot be ``bounded by the local context window''; it is available to every input
+for the life of the model, which makes it long-term by construction. Offline short-term memory is
+therefore a logically possible but practically empty combination. Orthogonality of definitions
+does not mean that every combination is equally useful.
+
+\begin{taxonomy}[title={How to read the taxonomy boxes in this book}]
+Every system chapter opens each system with a box like this one. For example, for Gated DeltaNet
+\citep{yang2025gdn}: \textbf{Representation:} implicit (a recurrent matrix state coupled to the
+forward pass). \textbf{Update dynamics:} online, every token. \textbf{Persistence:} long-term (fixed
+size, gated decay). \textbf{Update rule:} state-transition update (gated delta rule). Axis values
+come from Table~I and update rules from Table~II of \citet{zhoubian2026memory}; a dagger marks our
+own classification where the survey gives none.
+\end{taxonomy}
+
+% ===========================================================================
+\section{Fine-grained update rules}\label{sec:c02-rules}
+% ===========================================================================
+
+The offline/online distinction says \emph{when} memory can change, not \emph{how}. Two online
+memories may use very different rules: a recurrent state revised by a closed-form transition, a
+fast-weight module optimised by gradients, or a hybrid that updates its KV set only when an error
+signal exceeds a threshold. The survey therefore treats update rules as a secondary lens within
+the update-dynamics axis (its Table~II), not as a fourth axis \citep[\S II-B]{zhoubian2026memory}.
+The subsections below follow the order of that table. For each rule we give the mechanism, the
+representative systems and the main risks that the survey lists, a mathematical template in this
+book's notation (the templates are ours) and the chapters that develop it. The rules are not
+mutually exclusive: Titans combines optimisation-based writing with surprise gating, and HAM combines state-transition
+updates with signal-gated admission into a sparse KV cache.
+
+\subsection{Optimisation-based writing}\label{sec:c02-rule-opt}
+
+\emph{Mechanism.} Memory parameters or fast weights are updated by minimising an explicit
+objective, during training or at inference \citep[Table II]{zhoubian2026memory}. Let $\vtheta$ be
+the parameters of a memory function $f_{\vtheta}$ (a matrix, an MLP, the down-projection of an
+FFN). The template is one (or a few) gradient steps per token or per chunk:
+\begin{equation}\label{eq:c02-opt}
+  \vtheta_t = \vtheta_{t-1} - \eta_t\,\nabla_{\vtheta}\loss_t(\vtheta_{t-1}),
+  \qquad\text{e.g.}\quad
+  \loss_t(\vtheta) = \tfrac12\norm{f_{\vtheta}(\vk_t) - \vv_t}^2 .
+\end{equation}
+Variants differ in the loss, the granularity and the optimiser. Titans adds momentum and a
+forgetting gate. One way to formalise it, close to the paper's description (the exact
+parameterisation is in \cref{ch:ttt}), is
+\begin{equation}\label{eq:c02-titans}
+  \mU_t = \mu_t\,\mU_{t-1} - \eta_t\,\nabla\loss_t(\vtheta_{t-1}), \qquad
+  \vtheta_t = \alpha_t\,\vtheta_{t-1} + \mU_t ,
+\end{equation}
+where $\mU_t$ accumulates ``past surprise'', $\mu_t$ is a momentum coefficient and $\alpha_t$ a
+retention gate (the paper writes $1-\alpha_t$ with $\alpha_t$ a forgetting gate). TTT-E2E and
+In-Place TTT update chunk by chunk,
+$\vtheta_{[i]} = \vtheta_{[i-1]} - \eta\nabla\sum_{t\in[i]}\loss_t(\vtheta_{[i-1]})$; TTT-E2E uses
+the next-token loss of the whole network as $\loss_t$, while In-Place TTT writes into the FFN
+down-projection of an existing model. Nested Learning assigns parameter groups different update
+periods $C^{(\ell)}$, updating group $\ell$ only when $t$ is a multiple of $C^{(\ell)}$
+(\cref{ch:multiscale}).
+
+\emph{Risks.} \textbf{Instability}: for the squared loss in \eqref{eq:c02-opt} with linear
+$f_{\vtheta}(\vk) = \mS\vk$, the residual after one step is
+$\mS_t\vk_t - \vv_t = (1 - \eta_t\norm{\vk_t}^2)(\mS_{t-1}\vk_t - \vv_t)$ (expand
+$\mS_t = \mS_{t-1} - \eta_t(\mS_{t-1}\vk_t - \vv_t)\vk_t\T$ and multiply by $\vk_t$), so the write
+over-shoots when $\eta_t\norm{\vk_t}^2 > 1$ and diverges when it exceeds $2$. \textbf{Drift}:
+accumulated updates move $\vtheta$ away from the region the rest of the network was trained to
+read. \textbf{Objective mismatch}: the inner loss is only a proxy for downstream utility; a memory
+that minimises reconstruction error will dutifully memorise surprising noise.
+
+\subsection{State-transition updates}\label{sec:c02-rule-transition}
+
+\emph{Mechanism.} A hidden or recurrent state is updated by a learned transition, delta rule,
+projection or filtering equation. With the book's convention ($\mS_t \in \R^{d_v\times d_k}$, read
+$\vo_t = \mS_t\vq_t$), the general linear template is
+\begin{equation}\label{eq:c02-transition}
+  \mS_t = \mS_{t-1}\mA_t + \mB_t, \qquad \mA_t \in \R^{d_k\times d_k},\ \mB_t\in\R^{d_v\times d_k},
+\end{equation}
+where $\mA_t$ (the transition) acts on the key space and $\mB_t$ (the input) writes new content.
+State-space papers write the transposed form $\vh_t = \mA_t\vh_{t-1} + \mB_t\vx_t$ for a column
+state; it is the same equation. Unrolling from $\mS_0 = \mathbf{0}$,
+\begin{equation}\label{eq:c02-transition-unrolled}
+  \mS_t = (\mS_{t-2}\mA_{t-1} + \mB_{t-1})\mA_t + \mB_t = \dots
+        = \sum_{i=1}^{t}\mB_i\,\mA_{i+1}\mA_{i+2}\cdots\mA_t ,
+\end{equation}
+so every family is characterised by what it writes ($\mB_i$) and by the product of transitions that
+erodes it afterwards. That product structure is what the chunkwise algorithms of \cref{ch:linear}
+exploit. \Cref{tab:c02-transitions} lists the transitions of the main families.
+
+\begin{table}[t]
+\centering\small
+\caption{State-transition updates as instances of $\mS_t = \mS_{t-1}\mA_t + \mB_t$. Rows marked
+$^{\ddagger}$ are our summaries of richer rules; see the chapter for the exact form.}
+\label{tab:c02-transitions}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.4cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{2.6cm}l@{}}
+\toprule
+Model & Transition $\mA_t$ & Write $\mB_t$ & Chapter \\
+\midrule
+Linear attention & $\mI$ & $\vv_t\vk_t\T$ & \cref{ch:linear} \\
+RetNet & $\gamma\mI$ (fixed per head) & $\vv_t\vk_t\T$ & \cref{ch:linear} \\
+Mamba-2 (SSD) & $\alpha_t\mI$ (data-dependent scalar) & $\vv_t\vk_t\T$ & \cref{ch:linear} \\
+GLA & $\diag(\valpha_t)$ & $\vv_t\vk_t\T$ & \cref{ch:linear} \\
+DeltaNet & $\mI - \beta_t\vk_t\vk_t\T$ & $\beta_t\vv_t\vk_t\T$ & \cref{ch:linear} \\
+Gated DeltaNet & $\alpha_t(\mI - \beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ & \cref{ch:delta} \\
+KDA (Kimi Linear) & $\diag(\valpha_t)(\mI - \beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ & \cref{ch:delta} \\
+Gated DeltaNet-2 & $\diag(\valpha_t)(\mI - (\vb_t\had\vk_t)\vk_t\T)$, erase gate $\vb_t$ &
+$(\vw_t\had\vv_t)\vk_t\T$ & \cref{ch:delta} \\
+Kaczmarz LA$^{\ddagger}$ & delta rule with step $\beta_t \propto 1/\norm{\vk_t}^2$ &
+$\beta_t\vv_t\vk_t\T$ & \cref{ch:delta} \\
+DeltaProduct$^{\ddagger}$ & product of several $(\mI - \beta_{t,j}\vk_{t,j}\vk_{t,j}\T)$ & sum of
+the corresponding writes & \cref{ch:expressive} \\
+RWKV-7$^{\ddagger}$ & diagonal plus rank one, with separate removal and replacement keys &
+$\vv_t\tilde{\vk}_t\T$ & \cref{ch:expressive} \\
+Comba$^{\ddagger}$ & scalar plus low rank, with closed-loop feedback & rank one &
+\cref{ch:expressive} \\
+Mamba-3$^{\ddagger}$ & complex-valued (rotary) decay; trapezoidal discretisation & rank $r$ (MIMO) &
+\cref{ch:structured} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The Gated DeltaNet-2 row is the equation printed in
+\repofile{repos/NVlabs__GatedDeltaNet-2/README.md},
+$\mS_t = (\mI - \vk_t(\vb_t\had\vk_t)\T)\mD_t\mS_{t-1} + \vk_t(\vw_t\had\vv_t)\T$ for a
+$d_k\times d_v$ state with $\mD_t = \diag(\valpha_t)$, transposed into our convention. Two further
+families fit the template with an augmented state. Log-Linear Attention keeps a Fenwick-tree
+hierarchy of states whose number grows logarithmically with length, and MoM keeps several states
+and routes each token to a few of them (\cref{ch:structured}). Kalman Linear Attention and Gated
+KalmaNet carry extra statistics (a precision or a key covariance) so that the state can solve a
+filtering or ridge-regression problem rather than take a single step (\cref{ch:probabilistic};
+\cref{sec:c02-unify}).
+
+\emph{Risks.} \textbf{Compression loss}: by \cref{prop:c02-capacity}, a $d_v\times d_k$ state reads
+out at most $d_k$ arbitrary bindings exactly. \textbf{State interference}: with non-orthogonal keys
+every write disturbs other reads through the crosstalk term of \eqref{eq:c02-crosstalk}.
+
+\subsection{Signal-gated writing or routing}\label{sec:c02-rule-gate}
+
+\emph{Mechanism.} A surprise, uncertainty, prediction-error or utility signal $s_t$ controls
+whether a memory write, a cache admission or an expensive memory path is activated:
+\begin{equation}\label{eq:c02-gate}
+  g_t = \mathbb{I}[s_t > \tau]\ \ \text{(or } g_t = \sigmoid((s_t - \tau)/c)\text{)},\qquad
+  \mathcal{M}_t = \mathcal{M}_{t-1} + g_t\,\Delta_t
+  \quad\text{or}\quad
+  \vo_t = (1-g_t)\,\vo^{\mathrm{cheap}}_t + g_t\,\vo^{\mathrm{rich}}_t ,
+\end{equation}
+with a threshold $\tau$ and a temperature $c > 0$. The signals of the representative systems
+are, in our paraphrase of their descriptions (Titans and GDWM in \cref{ch:ttt}, AMOR and HAM in
+\cref{ch:routing}):
+\begin{itemize}
+  \item \textbf{Titans}: surprise, measured by the gradient of the memory loss. For a linear
+        memory, $\norm{\nabla\loss_t} = \norm{\mS_{t-1}\vk_t - \vv_t}\,\norm{\vk_t}$: large exactly
+        when the memory mispredicts.
+  \item \textbf{GDWM}: a write controller that scores chunks by how much they depend on long-range
+        context and spends a fixed budget of test-time gradient steps on the top-scoring ones.
+  \item \textbf{AMOR}: the normalised entropy $H(p_t)/\log\abs{\mathcal{V}}$ of the recurrent
+        backbone's next-token distribution; attention refinement runs only where it is high.
+  \item \textbf{HAM}: the recurrent state's prediction error for a token; only poorly predicted
+        tokens are admitted to the KV cache, and one threshold sets how fast the cache grows.
+\end{itemize}
+
+\emph{Risks.} \textbf{Calibration}: the signal must mean the same thing across positions, layers
+and domains. \textbf{Threshold sensitivity}: for a stationary signal with distribution function
+$F$, an admission rule stores on average $T(1 - F(\tau))$ of $T$ tokens, so where $\tau$ sits in
+the bulk of $F$ a small change of $\tau$ changes memory growth a lot. \textbf{Delayed relevance}:
+the decision is made at write time, before the query is known. A name that is perfectly
+predictable when it appears (low surprise) may be exactly what is asked for many tokens later.
+
+\subsection{Admission, eviction and consolidation}\label{sec:c02-rule-admit}
+
+\emph{Mechanism.} The memory store is modified by deciding which entries are admitted, retained,
+compressed, evicted or rewritten:
+\begin{equation}\label{eq:c02-admit}
+  \mathcal{M}_t = \mathrm{Cons}_t\big(\mathrm{Evict}_t(\mathcal{M}_{t-1}\cup\mathrm{Admit}_t(\vx_t))\big).
+\end{equation}
+StreamingLLM \citep{xiao2023streamingllm} keeps the first $s$ ``sink'' tokens and the last $w$ tokens,
+$\mathcal{M}_t = \{(\vk_i,\vv_i) : i \le s \text{ or } t - w < i \le t\}$. RATTENTION (\cref{ch:sparse}) evicts
+tokens from a sliding window but consolidates them into a residual linear-attention state, so
+eviction is not total loss. HAM's admission is the signal gate above. Bottlenecked Transformers
+consolidate by rewriting cache entries in place at reasoning-step boundaries,
+$(\mK, \mV) \leftarrow g_{\vtheta}(\mK, \mV)$. Related memory-management techniques---CommVQ's
+vector-quantised KV cache and Memory Caching's state snapshots---act on the same store
+(\cref{ch:routing}). Contrast these with \emph{access control} in sparse attention (MoBA, NSA,
+\cref{ch:sparse}): sparse attention keeps every entry and only restricts which ones a query reads,
+so nothing is lost irreversibly.
+
+\emph{Risks.} \textbf{Irreversible loss}: once an entry is dropped, compressed or overwritten, later
+retrieval may be impossible. \textbf{Retrieval bias}: what survives is biased toward recent tokens,
+sinks or high-error tokens, and the model learns to depend on that bias.
+
+\subsection{Objective-induced and structural updates}\label{sec:c02-rule-structural}
+
+\emph{Mechanism.} Memory behaviour is shaped by auxiliary objectives, architectural schedules,
+layer replacement or offline construction, rather than by per-instance online writes:
+\begin{equation}\label{eq:c02-structural}
+  \vtheta^\star = \argmin_{\vtheta}\ \E\big[\loss_{\mathrm{LM}}(\vtheta) + \lambda\,\loss_{\mathrm{aux}}(\vtheta)\big]
+  \quad\text{for a fixed architecture } \mathcal{A}.
+\end{equation}
+Here the ``update'' happens in training (through $\loss_{\mathrm{aux}}$ or through the choice of
+$\mathcal{A}$). The representative systems (MoE and Engram in \cref{ch:lookup}, Next-Latent
+Prediction in \cref{ch:probabilistic}, Priming in \cref{ch:hybrid}):
+\begin{itemize}
+  \item \textbf{Mixture of experts}: $\vy = \sum_{i\in\mathcal{S}(\vh)} g_i(\vh)\,\mathrm{Expert}_i(\vh)$
+        with a small selected set $\mathcal{S}(\vh)$ \citep[Eq.~(1)]{zhoubian2026memory}. The
+        experts store knowledge and the router addresses them; both are fixed after training.
+  \item \textbf{Engram}: embeddings of hashed $n$-grams are fetched by deterministic addressing and
+        gated by the hidden state. In the demo code
+        (\repofile{repos/deepseek-ai__Engram/engram_demo_v1.py}) several hash heads index
+        separate tables and a sigmoid gate compares a normalised projection of the fetched
+        embedding with the normalised hidden state. The tables are trained, then read-only.
+  \item \textbf{Next-Latent Prediction}: an auxiliary loss that predicts the next hidden state.
+        One way to formalise it is
+        $\loss_{\mathrm{aux}} = \E\norm{p_{\vtheta}(\vh_t, \vx_{t+1}) - \mathrm{sg}(\vh_{t+1})}^2$
+        with a stop-gradient $\mathrm{sg}$; the paper's exact parameterisation may differ.
+  \item \textbf{Priming}: a structural update that replaces selected attention layers of a
+        pretrained Transformer with state-space layers, aligns them with the original layers and
+        post-trains the hybrid. Fixed hybrid ratios such as the 3:1 layouts of Kimi Linear and
+        OLMo Hybrid are structural decisions of the same kind (\cref{ch:hybrid}).
+\end{itemize}
+
+\emph{Risks.} \textbf{Rigidity} and \textbf{limited test-time adaptability}: nothing can be written
+from the current context. \textbf{Objective mismatch}: an auxiliary loss only helps memory if what
+it rewards is what later queries need.
+
+% ===========================================================================
+\section{A unifying lens: memory as online regression}\label{sec:c02-unify}
+% ===========================================================================
+
+The survey closes by calling for a unified theory in which memory mechanisms are seen through a
+broader \emph{state-transition perspective}, differing mainly in persistence, accessibility, update
+dynamics and representational compression \citep[\S VI-A]{zhoubian2026memory}. One concrete
+version of that perspective, developed by \citet{c02-wang2025regression} and, in the language of
+``attentional bias'' and ``retention'', by \citet{c02-behrouz2025miras}, is to read every memory as
+the solution of a \emph{regression problem} posed at test time. This section previews it; the
+system chapters fill in the details.
+
+\subsection{Writing is fitting, reading is predicting}
+
+An associative memory must map keys to values. Suppose that by step $t$ the model has seen pairs
+$(\vk_i, \vv_i)$, $i \le t$. Writing means choosing a function $f_t$ that fits these pairs; reading
+means evaluating it at the query, $\vo_t = f_t(\vq_t)$. Memories differ in three choices: the
+\emph{family} of $f$ (a set of stored pairs, a matrix, an MLP), the \emph{objective} that defines a
+good fit (including how much old pairs count), and the \emph{optimiser} that turns the objective
+into an update.
+
+\paragraph{Softmax attention is non-parametric regression.} Let
+$\kappa_i = \exp(\vq_t\T\vk_i/\sqrt{d_k})$ and ask for the single vector $\vo$ that is closest to
+the stored values, weighting each by its similarity to the query:
+\begin{equation}\label{eq:c02-nw}
+  \vo_t = \argmin_{\vo}\sum_{i \le t}\kappa_i\norm{\vo - \vv_i}^2 .
+\end{equation}
+Setting the gradient $2\sum_i\kappa_i(\vo - \vv_i)$ to zero gives
+$\vo_t = \sum_i\kappa_i\vv_i/\sum_j\kappa_j$, which is exactly softmax attention. This is the
+Nadaraya--Watson kernel estimator. It is non-parametric: the ``model'' is the whole data set, which
+is why its memory (the KV cache) grows with $t$.
+
+\paragraph{Linear memories are online gradient descent.} Now let $f(\vk) = \mS\vk$ with a fixed-size
+$\mS\in\R^{d_v\times d_k}$, and update $\mS$ by one gradient step per token on a per-token loss
+$\loss_t$. Three choices of $\loss_t$ recover the main write rules. We use
+$\nabla_{\mS}\inner{\mS\vk}{\vv} = \vv\vk\T$ and
+$\nabla_{\mS}\tfrac12\norm{\mS\vk - \vv}^2 = (\mS\vk - \vv)\vk\T$ (differentiate entry by entry).
+\begin{enumerate}
+  \item \textbf{Linear (correlation) loss}, $\loss_t(\mS) = -\inner{\mS\vk_t}{\vv_t}$, step size
+        $1$: $\mS_t = \mS_{t-1} + \vv_t\vk_t\T$. This is linear attention, the fast-weight write
+        \eqref{eq:c02-fwp}.
+  \item \textbf{Linear loss with weight decay}, $\loss_t(\mS) = -\inner{\mS\vk_t}{\vv_t} +
+        \tfrac{1-\alpha_t}{2}\norm{\mS}_F^2$, step size $1$: the gradient is
+        $-\vv_t\vk_t\T + (1-\alpha_t)\mS$, so $\mS_t = \alpha_t\mS_{t-1} + \vv_t\vk_t\T$. This is
+        gated linear attention with a scalar gate (Mamba-2's form); the decay is weight decay.
+  \item \textbf{Squared loss}, $\loss_t(\mS) = \tfrac12\norm{\mS\vk_t - \vv_t}^2$, step size
+        $\beta_t$:
+        \begin{equation}\label{eq:c02-delta-derived}
+          \mS_t = \mS_{t-1} - \beta_t(\mS_{t-1}\vk_t - \vv_t)\vk_t\T
+                = \mS_{t-1}(\mI - \beta_t\vk_t\vk_t\T) + \beta_t\vv_t\vk_t\T .
+        \end{equation}
+        This is the delta rule. Shrinking first, $\mS' = \alpha_t\mS_{t-1}$, and then taking the
+        same step from $\mS'$ gives
+        $\mS_t = \alpha_t\mS_{t-1}(\mI - \beta_t\vk_t\vk_t\T) + \beta_t\vv_t\vk_t\T$, the gated
+        delta rule of Gated DeltaNet.
+\end{enumerate}
+The linear loss rewards alignment with $\vv_t$ without limit, so repeated writes of the same key
+accumulate; the squared loss rewards \emph{matching} $\vv_t$, so repeated writes converge. Choosing
+the step size well gives the projection behind Kaczmarz Linear Attention.
+
+\begin{proposition}[The normalised delta step is a projection]\label{prop:c02-kaczmarz}
+With $\beta_t = 1/\norm{\vk_t}^2$, the delta update \eqref{eq:c02-delta-derived} satisfies
+$\mS_t\vk_t = \vv_t$, and $\mS_t$ is the matrix closest to $\mS_{t-1}$ in Frobenius norm among all
+matrices with this property.
+\end{proposition}
+
+\begin{proof}
+Write $\vr = \vv_t - \mS_{t-1}\vk_t$. The update is $\mS_t = \mS_{t-1} + \vr\vk_t\T/\norm{\vk_t}^2$,
+so $\mS_t\vk_t = \mS_{t-1}\vk_t + \vr = \vv_t$. Any $\mS$ with $\mS\vk_t = \vv_t$ can be written
+$\mS_{t-1} + \mD$ with $\mD\vk_t = \vr$. Row by row, $\bm{d}_j\T\vk_t = r_j$ (here $\bm{d}_j\T$ is row $j$
+of $\mD$), and among all vectors with a prescribed inner product with $\vk_t$ the shortest is the
+multiple of $\vk_t$, $\bm{d}_j = r_j\vk_t/\norm{\vk_t}^2$: any other solution adds a component
+orthogonal to $\vk_t$, which only increases the norm. Stacking the rows gives
+$\mD = \vr\vk_t\T/\norm{\vk_t}^2$, the update above.
+\end{proof}
+
+This is the Kaczmarz method for linear systems (and the normalised least-mean-squares filter): each
+step projects the current solution onto the set of matrices that satisfy the newest equation.
+
+\paragraph{Back to the two-key example.} Apply the delta rule with $\beta = 1$ (a projection,
+since the keys of \cref{ex:c02-two-keys} have unit norm) to $(\vk_1, 1)$ and then $(\vk_2, 1)$.
+After the first write, $\mS = (1, 0)$. The second write gives
+$\mS = (1, 0)(\mI - \vk_2\vk_2\T) + \vk_2\T = (1.24,\ 0.32)$, so $\mS\vk_2 = 1$ exactly and
+$\mS\vk_1 = 1.24$. The three memories now line up:
+\begin{center}\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Write rule & $\mS$ & read at $\vk_1$ & read at $\vk_2$ \\
+\midrule
+Hebbian (linear attention) & $(1.6,\ 0.8)$ & $1.6$ & $1.6$ \\
+Delta rule, $\beta = 1$ & $(1.24,\ 0.32)$ & $1.24$ & $1$ \\
+Exact least squares & $(1,\ 0.5)$ & $1$ & $1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The Hebbian memory corrupts both reads; the delta rule makes the newest binding exact at some cost
+to the older one; solving the regression exactly recovers both, as \cref{prop:c02-capacity}
+allows.
+
+\subsection{From one step to an exact solve}
+
+The third row of the table points to the far end of a spectrum. Instead of one step per token,
+solve the regression exactly, with exponential forgetting $\gamma \in (0,1]$ and a ridge penalty
+$\lambda > 0$:
+\begin{equation}\label{eq:c02-ridge}
+  \mS_t = \argmin_{\mS}\sum_{i\le t}\gamma^{t-i}\norm{\mS\vk_i - \vv_i}^2 + \lambda\norm{\mS}_F^2
+        = \Big(\sum_{i\le t}\gamma^{t-i}\vv_i\vk_i\T\Big)\Big(\sum_{i\le t}\gamma^{t-i}\vk_i\vk_i\T + \lambda\mI\Big)^{-1}.
+\end{equation}
+(Set the gradient $2\sum_i\gamma^{t-i}(\mS\vk_i - \vv_i)\vk_i\T + 2\lambda\mS$ to zero and solve
+for $\mS$.) Both sums can be updated recursively, in $\bigO(d_vd_k)$ and $\bigO(d_k^2)$ per token;
+if the ridge term is also allowed to fade ($\gamma^t\lambda$ instead of $\lambda$), classical
+recursive least squares updates the inverse itself with the Sherman--Morrison formula in
+$\bigO(d_k^2)$ per token. Gated KalmaNet maintains the
+solution of a gated, fading ridge regression of this kind, computed with Chebyshev iteration
+(\repofile{repos/awslabs__hybrid-model-factory}); Kalman Linear Attention performs exact Kalman
+filtering in information form, so the state carries its own uncertainty (\cref{ch:probabilistic}).
+
+\subsection{Non-linear memories: test-time training}
+
+Finally, let $f_{\vtheta}$ be a small MLP and take gradient steps on
+$\tfrac12\norm{f_{\vtheta}(\vk_t) - \vv_t}^2$ (or on the language-modelling loss itself). This is
+test-time training \citep{c02-sun2024ttt}; Titans adds momentum and forgetting
+\eqref{eq:c02-titans}; TTT-E2E takes chunked steps on the next-token loss with a meta-learned
+initialisation; In-Place TTT uses an FFN matrix as $\vtheta$. When $f_{\vtheta}$ is linear the
+inner loss is the squared loss above and one step is exactly the delta rule. This is the formal
+reason why the boundary between ``implicit recurrent state'' and ``explicit test-time memory'' is
+subtle, and why \citet{liu2026tttla} can show that a broad class of TTT layers with key--value
+binding objectives behaves as learned linear attention (\cref{ch:ttt}).
+
+\Cref{lst:c02-rules} implements the linear rules of this section as literally one gradient step
+each; with it, the two-key example above takes four calls. We checked numerically, in NumPy and with
+finite-difference gradients, that its outputs equal the closed forms derived above and that the
+Kaczmarz step fits $\vv_t$ exactly.
+
+\begin{lstlisting}[caption={Reference implementation (ours): write rules as one gradient step on a regression loss (NumPy).},label={lst:c02-rules}]
+import numpy as np
+
+def write(S, k, v, loss, eta=1.0, alpha=1.0):
+    """One online-regression step on a matrix memory S (d_v x d_k) for the pair (k, v)."""
+    S = alpha * S                      # retention gate = weight decay (alpha < 1)
+    if loss == "linear":               # l(S) = -<S k, v>
+        G = -np.outer(v, k)
+    else:                              # l(S) = 0.5 * ||S k - v||^2
+        G = np.outer(S @ k - v, k)
+    return S - eta * G
+
+# linear attention: write(S, k, v, "linear")      gated linear attention: add alpha=a_t
+# delta rule: write(S, k, v, "squared", eta=b_t)  gated delta rule: add alpha=a_t
+# Kaczmarz: write(S, k, v, "squared", eta=1.0 / (k @ k));  read-out: o_t = S @ q_t
+\end{lstlisting}
+
+\begin{keyidea}[title={Key idea: the write rule is an optimiser}]
+A memory is defined by a model family (pairs, matrix, network), an objective (how to weigh old and
+new pairs) and an optimiser (one step, a projection, an exact solve). Linear attention, gated
+linear attention, the delta rule and its gated variants are \emph{single gradient steps} on
+different objectives; Kaczmarz and Kalman-style layers solve the same regression more exactly; TTT
+replaces the matrix by a network. Reading the later chapters with this lens shows what each new
+design changes: the objective, the optimiser, or the family.
+\end{keyidea}
+
+% ===========================================================================
+\section{Limitations of implicit memory}\label{sec:c02-implicit-limits}
+% ===========================================================================
+
+Implicit memory is efficient and simple: it is updated online for free as part of the forward
+pass and accessed by content. The survey identifies limitations that follow from the same tight
+coupling with computation and that appear in both attention-based and state-based designs
+\citep[\S III-D]{zhoubian2026memory}.
+
+\paragraph{Bounded and hard-to-control capacity.} For attention, capacity scales with the context
+window and the KV cache, which are bounded by quadratic or linear compute and by hardware;
+\cref{ex:c02-bytes} shows how quickly the cache grows. Even when the window is long, models often
+fail to use their nominal context length, a gap between theoretical and practical capacity that
+benchmarks such as RULER and InfiniteBench were built to expose \citep{hsieh2024ruler,zhang2024infbench};
+retrieval accuracy can also depend on where in the context the information sits
+\citep{c02-liu2024lost}. For recurrent memory, capacity is bounded by the state size.
+\Cref{prop:c02-capacity} bounds exact associative recall, and a counting argument bounds copying:
+a state of $m$ numbers stored with $b$ bits each can take at most $2^{mb}$ values, while a string of
+$T$ tokens from $\mathcal{V}$ can take $\abs{\mathcal{V}}^T$ values; if
+$T\log_2\abs{\mathcal{V}} > mb$, two different strings lead to the same state, and the model must
+fail to reproduce at least one of them. The bound is loose, but the trade-off it expresses---a
+longer span requires either a larger state or more lossy compression---is fundamental, and shows up
+empirically as a recall gap between fixed-state models and attention
+\citep{c02-jelassi2024repeat,c02-arora2023zoology,c02-arora2024based}.
+
+\paragraph{Lack of adaptable read/write semantics.} Implicit memory has no operations such as
+``replace the value stored under this key'', ``delete this fact'' or ``list what is stored''. Suppose
+a document says ``Alice lives in Paris'' and later ``Correction: Alice lives in Rome'', and the
+model represents ``Alice'' by a unit key $\vk$. A Hebbian state reads
+$\mS\vk = \vv_{\text{Paris}} + \vv_{\text{Rome}}$ (a superposition), a delta-rule state with $\beta_t = 1$ reads
+$\vv_{\text{Rome}}$ (overwritten), and a KV cache holds both and relies on learned attention
+patterns to prefer the later one. Which behaviour occurs is a side effect of the architecture, not a
+controllable policy.
+
+\paragraph{Limited persistence across contexts.} Implicit memory is tied to a few forward passes
+or one session and is discarded when the computation ends. Mechanisms that enlarge recurrent
+capacity, such as mixtures of states (MoM) or cached state snapshots (Memory Caching), improve
+retention \emph{within} a sequence rather than providing memory across documents, tasks or
+interactions \citep{du2025mom,behrouz2026memorycaching}.
+
+These limits mark what computation-coupled memory can achieve alone; capacity control, persistence
+and selective access motivate the explicit memories of \cref{ch:ttt,ch:lookup,ch:multiscale}.
+
+\begin{pitfall}
+Nominal context length is not memory capacity. A model that accepts a long context may still fail
+to retrieve, aggregate or track information across it; report what the model can \emph{do} at each
+length (\cref{sec:c02-eval}), not only what it can ingest.
+\end{pitfall}
+
+% ===========================================================================
+\section{Structural risks of explicit memory}\label{sec:c02-explicit-risks}
+% ===========================================================================
+
+Decoupling storage from transient computation enlarges the design space, but it creates new
+problems of stability, scalability and control \citep[\S IV-E]{zhoubian2026memory}.
+
+\paragraph{Capacity growth and memory scaling.} Explicit memory may scale with the number of
+parameters, slots or datastore entries rather than with the hidden size. Lookup systems can grow
+without bound, and parameterised modules can be widened, but cost grows too and returns may
+diminish, so efficient indexing, pruning and compression become necessary. Hashed tables also
+\emph{collide}. If $N$ distinct $n$-grams are hashed uniformly into $M$ rows, a given $n$-gram
+shares its row with at least one other with probability $1 - (1 - 1/M)^{N-1} \approx 1 - e^{-N/M}$.
+With $K$ independent hash functions into $K$ tables, all $K$ rows collide with probability about
+$(1 - e^{-N/M})^K$: for $N/M = 0.5$ this is about $0.39$ with one table and $0.061$ with three.
+Several hash heads per lookup, as in Engram's demo code, buy robustness to collisions with extra
+storage.
+
+\paragraph{Interference and memory drift.} Online writes coexist with older content. Consider a
+parametric memory and an earlier item $j$ with loss $\loss_j$. To first order, an update
+$\Delta\vtheta$ changes that loss by $\nabla\loss_j\T\Delta\vtheta$, so writes interfere whenever
+they have a component along old gradients. If $\mP$ has orthonormal columns spanning the gradients
+of protected items, the projected update $\Delta\vtheta' = (\mI - \mP\mP\T)\Delta\vtheta$ satisfies
+$\nabla\loss_j\T\Delta\vtheta' = 0$ for every protected $j$, because $\nabla\loss_j = \mP\bm{c}_j$
+for some coefficients $\bm{c}_j$ and $\mP\T(\mI - \mP\mP\T) = \mathbf{0}$. This first-order idea
+underlies orthogonal gradient projection as used by Muon-OGD, while OLieRA keeps multiplicative
+low-rank updates in a Lie group orthogonal to earlier tasks \citep{lu2026muonogd,cao2025olora}; penalties that anchor
+important parameters, such as elastic weight consolidation \citep{c02-kirkpatrick2017ewc}, are an
+older alternative. The survey notes that these methods are not memory modules but suggest that ``the
+geometry of the update rule may become as important as the storage form itself''
+\citep[\S IV-E]{zhoubian2026memory}; \cref{ch:multiscale} develops them. In lookup systems, stale or
+redundant entries bias retrieval in the same way.
+
+\paragraph{Optimisation and convergence.} Explicit memories add inner loops, surprise-driven rules
+and auxiliary losses that need not share the guarantees of pretraining. The step-size condition of
+\cref{sec:c02-rule-opt} ($0 < \eta_t\norm{\vk_t}^2 < 2$ for the simplest case) is the easiest
+example; nested update hierarchies make convergence analysis much harder, because several coupled
+learning processes run at different timescales.
+
+\paragraph{Consistency across episodes.} Because explicit memory can outlive one inference call,
+lifecycle questions appear: when should memory be reset, how should long-term and short-term
+storage be separated, and what keeps accumulated information relevant? These are continual-learning
+questions. They also raise governance questions---what may be stored, for whom, and how it can be
+audited or erased---that lifecycle-oriented surveys treat in depth \citep{zhang2025llmmemory}.
+
+\paragraph{Architectural complexity and interpretability.} A model with backbone weights, memory
+parameters, retrieval indices and update controllers is harder to analyse: knowing which component
+stores what, and how an update propagates, is an open problem.
+
+Implicit memory is limited by computation-bound capacity and context length but enjoys
+architectural simplicity and well-understood optimisation; explicit memory removes those limits at
+the cost of structural and training complexity. In the survey's words, the choice between them
+``is not merely a matter of capacity, but of system design philosophy: tightly coupled computation
+dynamics versus modular persistent storage'' \citep[\S IV-E]{zhoubian2026memory}.
+
+% ===========================================================================
+\section{Evaluating memory}\label{sec:c02-eval}
+% ===========================================================================
+
+Memory is harder to evaluate than language modelling: it is not a directly observable scalar like
+perplexity, but shows up in long-range dependency resolution, recall fidelity, robustness to
+interference and persistence \citep[\S V-C]{zhoubian2026memory}. Good evaluation therefore isolates
+one capability at a time and reports curves rather than single numbers. \Cref{tab:c02-eval-props}
+lists the dimensions the survey proposes---capacity, fidelity, persistence, robustness to
+interference and efficiency \citep[\S VI-F]{zhoubian2026memory}---with a probe and a metric for each
+(our suggestions).
+
+\begin{table}[t]
+\centering\small
+\caption{Memory properties, probes and metrics.}
+\label{tab:c02-eval-props}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+Property & Probe & Metric \\
+\midrule
+Capacity & MQAR with a growing number of pairs $D$ & largest $D$ recalled above a target accuracy \\
+Fidelity & NIAH, multi-value NIAH, copying & exact-match accuracy of the retrieved content \\
+Persistence & needle or binding at a controlled write--read distance & accuracy versus distance;
+distance at which accuracy halves \\
+Interference & multi-key NIAH, near-duplicate keys, overwritten bindings & accuracy versus number
+and similarity of distractors; fraction of reads returning the newest value \\
+Stability (explicit) & sequential tasks or documents written into the memory & average accuracy,
+backward transfer \eqref{eq:c02-bwt} \\
+Efficiency & all of the above at several lengths & bytes of memory per token, latency, throughput \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Synthetic retrieval: needle in a haystack}\label{sec:c02-niah}
+
+The needle-in-a-haystack (NIAH) test \citep{c02-kamradt2023niah} places one target fact inside a
+large distractor context and asks the model to recover it. Its two knobs are the context length
+$T$ and the \emph{depth} $\delta\in[0,1]$ at which the needle is inserted, and its output is an
+accuracy grid over $(T,\delta)$, usually drawn as a heat map. \Cref{alg:c02-niah} constructs it.
+
+\begin{algorithm}[htb]
+\caption{Constructing a needle-in-a-haystack test grid}\label{alg:c02-niah}
+\begin{algorithmic}[1]
+\Require filler corpus $\mathcal{D}$; needle template $n(\kappa,\nu)$; question template $u(\kappa)$;
+  instruction $\iota$; lengths $\{T_1,\dots,T_m\}$; depths $\{\delta_1,\dots,\delta_r\}$; tokenizer
+  $\mathrm{tok}$; model; samples per cell $n_s$
+\Ensure accuracy grid $A[T,\delta]$
+\For{each length $T$ and each depth $\delta$}
+  \For{$s = 1,\dots,n_s$}
+    \State draw a fresh key $\kappa$ (e.g.\ a random word pair) and value $\nu$ (e.g.\ a random number)
+    \State $\mathrm{needle} \gets n(\kappa,\nu)$
+      \Comment{``The special magic number for $\kappa$ is $\nu$.''}
+    \State $B \gets T - |\mathrm{tok}(\iota)| - |\mathrm{tok}(\mathrm{needle})| - |\mathrm{tok}(u(\kappa))|$
+      \Comment{haystack budget}
+    \State $h \gets$ the first $B$ tokens of the concatenated documents of $\mathcal{D}$
+    \State $p \gets$ the sentence boundary of $h$ nearest to position $\lfloor\delta B\rfloor$
+    \State $\mathrm{prompt} \gets \iota \,\|\, h_{<p} \,\|\, \mathrm{needle} \,\|\, h_{\ge p} \,\|\, u(\kappa)$
+    \State $\hat{y} \gets$ greedy generation from the model on $\mathrm{prompt}$
+    \State $c_s \gets \mathbb{I}[\nu \text{ occurs in } \hat{y}]$
+  \EndFor
+  \State $A[T,\delta] \gets \frac{1}{n_s}\sum_{s} c_s$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{What it probes.} A single NIAH cell tests whether one binding $(\kappa,\nu)$ written at
+depth $\delta$ survives $(1-\delta)B$ further tokens and can be retrieved by content. Sweeping $T$
+probes the horizon (persistence); sweeping $\delta$ exposes position effects such as recency bias
+or the ``lost in the middle'' pattern \citep{c02-liu2024lost}. For a sliding-window model the grid
+shows a sharp edge where the needle leaves the window; for a recurrent model it shows how
+compression erodes old content.
+
+\paragraph{Variants and caveats.} A single needle in unrelated filler is easy for attention, because the
+needle is a lexical outlier. Harder variants add
+\emph{distractor needles} with other keys (multi-key), several values under one key (multi-value),
+several questions at once (multi-query), or filler made of needle-like sentences. RULER
+\citep{hsieh2024ruler} systematises these and adds tasks beyond retrieval, so that the degradation
+of a model with length can be measured rather than a single pass/fail.
+
+\begin{implnote}[title={In the code: running NIAH and RULER}]
+The mirrored repositories run these tests through standard harnesses rather than custom code.
+\repofile{repos/fla-org__flash-linear-attention/evals/README.md} evaluates \fla{} models on RULER
+via \code{lm-evaluation-harness}, with the task list \code{niah_single_1}--\code{3},
+\code{niah_multikey_1}--\code{3}, \code{niah_multiquery}, \code{niah_multivalue}, \code{ruler_vt}
+(variable tracking), \code{ruler_cwe} and \code{ruler_fwe} (common- and frequent-word extraction),
+\code{ruler_qa_hotpot} and \code{ruler_qa_squad}, and a \code{max_seq_lengths} sweep from 4096 to
+32768 tokens. In-Place TTT does the same through OpenCompass, with one config per length
+(\repofile{repos/ByteDance-Seed__In-Place-TTT/eval_config/ruler_4k.py} up to \code{ruler_256k.py}).
+The needle wording follows RULER's ``special magic number'' template, as in
+\repofile{repos/awslabs__hybrid-model-factory/training/tests/state_compose/niah_example.py}:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak tests/\allowbreak state\_compose/\allowbreak niah\_example.py}},label={lst:c02-niah-prompt},numbers=none]
+TASK_PROMPT = (
+    "A special magic number is hidden within the following text. "
+    "Make sure to memorize it. I will quiz you about the number afterwards."
+)
+\end{lstlisting}
+\end{implnote}
+
+\subsection{Multi-query associative recall}\label{sec:c02-mqar}
+
+Multi-query associative recall (MQAR), introduced with the Zoology analysis of efficient language
+models \citep{c02-arora2023zoology}, probes the associative-memory capacity of a layer directly. The
+sequence begins with $D$ key--value pairs $k_1 v_1 k_2 v_2 \dots k_D v_D$; later, keys reappear as
+queries, and after each query key the model must output the value bound to it. Unlike NIAH, there are
+many bindings and many queries per sequence, so the task measures how many associations the memory
+holds at once. \Cref{alg:c02-mqar} gives the construction and \cref{lst:c02-mqar} a direct
+implementation.
+
+\begin{algorithm}[htb]
+\caption{Constructing one multi-query associative recall (MQAR) example}\label{alg:c02-mqar}
+\begin{algorithmic}[1]
+\Require number of pairs $D$; length $N \ge 4D$; vocabulary size $V$; number of queries $Q \le D$
+\Ensure tokens $x_1,\dots,x_N$ and labels $y_1,\dots,y_N$ (label $-100$ = not scored)
+\State draw $D$ distinct keys $k_1,\dots,k_D$ from $\{0,\dots,V/2-1\}$ and values $v_1,\dots,v_D$
+  from $\{V/2,\dots,V-1\}$
+\State fill $x$ with random filler tokens; set every $y_i \gets -100$
+\For{$i = 1,\dots,D$}
+  \State $x_{2i-1} \gets k_i$, \quad $x_{2i} \gets v_i$ \Comment{the writes}
+\EndFor
+\State choose $Q$ distinct pair indices $i_1,\dots,i_Q$ and $Q$ free two-token slots after position $2D$
+\For{$j = 1,\dots,Q$, with slot starting at position $p_j$}
+  \State $x_{p_j} \gets k_{i_j}$, \quad $x_{p_j+1} \gets v_{i_j}$, \quad $y_{p_j} \gets v_{i_j}$
+    \Comment{predict the value after its key}
+\EndFor
+\State \Return $x, y$ \Comment{metric: accuracy of $\argmax$ predictions where $y_i \neq -100$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lstlisting}[caption={Reference implementation (ours): generating one MQAR example (NumPy).},label={lst:c02-mqar}]
+import numpy as np
+
+def make_mqar(n_pairs, seq_len, vocab, n_queries, rng):
+    """Token ids x and labels y for one MQAR example (-100 = not scored)."""
+    half = vocab // 2                                    # keys < half <= values
+    keys = rng.choice(half, size=n_pairs, replace=False)
+    vals = rng.integers(half, vocab, size=n_pairs)
+    x = rng.integers(0, vocab, size=seq_len)             # random filler
+    y = np.full(seq_len, -100)
+    x[0:2 * n_pairs:2], x[1:2 * n_pairs:2] = keys, vals  # k1 v1 k2 v2 ... (writes)
+    slots = np.arange(2 * n_pairs, seq_len - 1, 2)       # free 2-token slots
+    pos = np.sort(rng.choice(slots, size=n_queries, replace=False))
+    which = rng.choice(n_pairs, size=n_queries, replace=False)
+    x[pos], x[pos + 1] = keys[which], vals[which]        # query key, then its value
+    y[pos] = vals[which]                                 # target: value after key
+    return x, y
+\end{lstlisting}
+
+\paragraph{What it probes.} By \cref{prop:c02-capacity}, a matrix state with key dimension $d_k$
+cannot recall $D > d_k$ arbitrary bindings exactly; in practice the accuracy of fixed-state models
+falls as $D$ grows relative to the state, while attention, which keeps every pair, solves the task at
+any $D$ that fits its window. The other knobs are the write--read distance, the vocabulary size and
+the placement of queries. MQAR is cheap enough to train small models on directly, which makes it the
+standard first test of a new recurrent memory (see the Zoology paper for numbers).
+
+\begin{implnote}[title={In the code: an MQAR generator in the mirrored repositories}]
+\repofile{repos/JiaxuanZou0714__KaczmarzLinearAttention/mqar_data.py} (in the unconfirmed candidate
+repository for Kaczmarz Linear Attention) contains \code{generate_mqar_data}. Like
+\cref{lst:c02-mqar}, it draws keys from the first half of the vocabulary and values from the second
+(defaults \code{vocab_size=8192}, \code{num_pairs=32}). Unlike it, query positions are drawn with
+\code{power_law_sample}, so short write--read distances are more frequent, and the value after a
+query key is not inserted into the input: it appears only as the label.
+\end{implnote}
+
+\subsection{Long-context benchmarks}\label{sec:c02-benchmarks}
+
+Aggregated benchmarks evaluate memory on natural or semi-natural tasks. \Cref{tab:c02-benchmarks}
+summarises the ones the survey discusses and what each probes. LongBench aggregates diverse
+long-context tasks, including multi-document QA, summarisation and reasoning, to assess effective
+context use; RULER and L-Eval analyse scaling with context length, measuring degradation curves
+across sequence sizes and exposing phenomena such as attention dilution and recency bias
+\citep[\S V-C]{zhoubian2026memory}. The task counts in the table are as listed in
+\repofile{repos/Elvin-Yiming-Du__Survey_Memory_in_AI/README.md}.
+
+\begin{table}[t]
+\centering\small
+\caption{Long-context benchmarks and the memory capabilities they probe.}
+\label{tab:c02-benchmarks}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{4.4cm}@{}}
+\toprule
+Benchmark & Content & Memory capability probed \\
+\midrule
+NIAH \citep{c02-kamradt2023niah} & one fact in filler text at controlled length and depth &
+single-binding retrieval over distance; position effects \\
+MQAR \citep{c02-arora2023zoology} & synthetic key--value bindings, many queries &
+associative capacity of the state \\
+RULER \citep{hsieh2024ruler} & synthetic, configurable length: NIAH variants, variable tracking,
+common/frequent-word extraction, QA & retrieval under distractors, multi-hop tracking, aggregation;
+degradation with length \\
+LongBench \citep{bai2024longbench} & bilingual multitask suite: single- and multi-document QA,
+summarisation, few-shot learning, synthetic tasks, code (14 English, 5 Chinese and 2 code tasks) &
+use of long natural context \\
+InfiniteBench \citep{zhang2024infbench} & tasks beyond 100K tokens (12 sub-tasks) & retrieval and
+reasoning at extreme length \\
+L-Eval \citep{an2023leval} & standardised long-context evaluation (20 sub-tasks), with
+closed-ended and open-ended tasks & comparable scoring across models and lengths \\
+SCROLLS \citep{shaham2022scrolls} & summarisation, QA and inference over long documents, e.g.\
+GovReport, QMSum, NarrativeQA, Qasper, QuALITY, ContractNLI & integrating information spread over a
+whole document \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Structured dependency and reasoning.} SCROLLS and NarrativeQA-style tasks test whether a
+model integrates information spread across a document. The survey reports that hybrid and
+state-space models are often more stable on them, though they may trade off fine-grained token-level
+recall \citep[\S V-C]{zhoubian2026memory}.
+
+\subsection{Forgetting, interference and stability}\label{sec:c02-forgetting}
+
+Explicit memory adds evaluation dimensions. Key aspects are how fast memory degrades, how sensitive
+it is to distractors, and how long newly acquired information persists; lookup models are scored by
+recall precision and key--value alignment, and parameter-updating memories by continual-learning
+metrics \citep[\S V-C]{zhoubian2026memory}. A standard pair of such metrics
+\citep{c02-lopezpaz2017gem}: after writing tasks (or documents) $1,\dots,N$ in sequence, let
+$a_{N,i}$ be the accuracy on task $i$ at the end and $a_{i,i}$ the accuracy right after learning it.
+Then
+\begin{equation}\label{eq:c02-bwt}
+  \mathrm{ACC} = \frac{1}{N}\sum_{i=1}^{N}a_{N,i}, \qquad
+  \mathrm{BWT} = \frac{1}{N-1}\sum_{i=1}^{N-1}\big(a_{N,i} - a_{i,i}\big),
+\end{equation}
+and a negative backward transfer (BWT) measures forgetting. The same idea applies inside one long
+context: write a binding, write $D$ further bindings or distractors, and measure how often the first
+one is still recalled; repeat with the first key overwritten by a new value to measure \emph{update
+consistency}.
+
+\subsection{Efficiency, implicit versus explicit, and unified metrics}\label{sec:c02-unified}
+
+\paragraph{Efficiency--performance trade-offs.} Long-context scores can be inflated simply by
+enlarging the memory, which may be impractical under real constraints. Evaluations should therefore
+report performance as a function of context length \emph{and} memory footprint---scaling curves
+rather than single points---especially for compressed or paged attention, where the management
+policy affects recall \citep[\S V-C]{zhoubian2026memory}. A fair comparison of recurrent layers
+matches their state sizes, as in the results below.
+
+\paragraph{Implicit versus explicit evaluation, and unified metrics.} Implicit memory is usually
+evaluated with long-range dependency tasks, accuracy across context lengths and stability under
+noise injection; explicit memory also needs update consistency, retrieval precision and latency, and
+robustness to memory growth and interference. No single metric covers all of this. The survey
+suggests decomposing memory performance into capacity, fidelity, persistence, robustness to
+interference and efficiency, with standardised stress tests---controlled interference injection,
+memory-decay measurement and update-consistency analysis---so that genuine memory improvements can
+be separated from gains due to scale, context size or data overlap \citep[\S VI-F]{zhoubian2026memory}.
+\Cref{tab:c02-eval-props} is one way to operationalise that proposal.
+
+\begin{results}[title={Reported results: RULER profiles of recurrent memories (Gated DeltaNet-2 README)}]
+Source: \repofile{repos/NVlabs__GatedDeltaNet-2/README.md}. All models have 1.3B parameters, are
+trained on 100B tokens of FineWeb-Edu, and are matched in recurrent state size. Accuracy on three
+RULER needle tasks (selected rows):
+\begin{center}\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Setting & Model & S-NIAH-2 @4K & S-NIAH-3 @2K & MK-NIAH-1 @4K \\
+\midrule
+Recurrent & Gated DeltaNet & 87.2 & 54.2 & 27.8 \\
+          & KDA & 89.0 & 63.2 & 28.0 \\
+          & Mamba-3 (MIMO) & 64.2 & 72.4 & 18.0 \\
+          & Gated DeltaNet-2 & 93.0 & 89.8 & 37.8 \\
+\midrule
+Hybrid    & Gated DeltaNet & 57.3 & 91.2 & 44.8 \\
+          & Gated DeltaNet-2 & 57.9 & 99.0 & 48.0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Two lessons for evaluation design. First, the multi-key task, whose distractor needles create
+interference, is the hardest column for every model; the README describes it as the setting
+``where memory editing matters most''. Second, adding attention layers does not raise every column:
+in this table the hybrids are higher on S-NIAH-3 and MK-NIAH-1 but lower on S-NIAH-2 at 4K. A
+single averaged score would hide both effects. See the paper for the full tables and their
+discussion.
+\end{results}
+
+% ===========================================================================
+\section{Open challenges}\label{sec:c02-open}
+% ===========================================================================
+
+The survey ends with six open problems \citep[\S VI]{zhoubian2026memory}. We list them briefly, with
+the parts of this book that bear on each; \cref{ch:synthesis} returns to them after all the systems
+have been studied.
+\begin{enumerate}[itemsep=0pt]
+  \item \textbf{A unified theory of memory} that characterises capacity by measurable properties
+        (retention fidelity, interference robustness, compression efficiency) and formalises the
+        stability--plasticity trade-off; \cref{sec:c02-unify} is a first step.
+  \item \textbf{Continual and lifelong parametric memory}: test-time updates and nested hierarchies
+        blur pretraining and inference and bring back forgetting and instability
+        (\cref{ch:ttt,ch:multiscale}).
+  \item \textbf{Robust and interpretable update rules}: each rule of \cref{sec:c02-rules} has its own
+        failure mode, and rules should become diagnosable, reversible when necessary and robust over
+        long horizons.
+  \item \textbf{Adaptive memory allocation and control}: from memory pathways fixed at design time to
+        learned controllers that allocate tokens across memories, as AMOR and HAM begin to do
+        (\cref{ch:hybrid,ch:routing}).
+  \item \textbf{Hardware--algorithm co-design}: at hundreds of thousands to millions of tokens, memory
+        bandwidth and storage hierarchies dominate, and memory designs must match accelerator memory
+        tiers (\cref{ch:foundations,ch:routing}).
+  \item \textbf{Principled, multi-dimensional evaluation} that does not conflate memory with reasoning
+        ability or scale (\cref{sec:c02-eval}).
+\end{enumerate}
+
+% ===========================================================================
+\section{Comparison: the systems of this book on the taxonomy}\label{sec:c02-master}
+% ===========================================================================
+
+\Cref{tab:c02-master} places every 2025--2026 system of this book, plus mixture-of-experts models as
+the reference point for conditional parameter memory, on the three axes and the update rules. Axis
+values come from the survey's Table~I; ``--'' marks analyses and optimisers that are not memories in
+the survey's sense, and a dagger marks our own classification of a system that Table~I or Table~II
+does not list. The justifications follow the table.
+
+\begingroup
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{4.1cm}c c c c >{\raggedright\arraybackslash}p{4.2cm}l@{}}
+\caption{Master table. Repr.: Imp(licit)/Exp(licit). Update: On(line)/Off(line). Pers.: S(hort)/L(ong).
+Rules: Opt = optimisation-based writing, ST = state transition, SG = signal-gated writing or
+routing, AEC = admission/eviction/consolidation, OS = objective-induced or structural.
+$^{\dagger}$ = our classification (not in the survey's Tables I/II for this entry).}
+\label{tab:c02-master}\\
+\toprule
+System & Year & Repr. & Update & Pers. & Update rule & Chapter \\
+\midrule
+\endfirsthead
+\multicolumn{7}{@{}l}{\small\itshape \Cref{tab:c02-master}, continued}\\
+\toprule
+System & Year & Repr. & Update & Pers. & Update rule & Chapter \\
+\midrule
+\endhead
+\midrule
+\multicolumn{7}{r@{}}{\small\itshape continued on next page}\\
+\endfoot
+\bottomrule
+\endlastfoot
+MoBA & 2025 & Imp & On & S & AEC (sparse block access)$^{\dagger}$ & \cref{ch:sparse} \\
+NSA & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & S$^{\dagger}$ & AEC (compress, select, window)$^{\dagger}$ & \cref{ch:sparse} \\
+RATTENTION & 2025 & Imp & On & S & AEC & \cref{ch:sparse} \\
+HyperMLP & 2026 & Imp & On & S & -- (append; no Table II entry) & \cref{ch:sparse} \\
+\midrule
+Gated DeltaNet & 2025 & Imp & On & L & ST & \cref{ch:delta} \\
+KDA / Kimi Linear & 2025 & Imp & On & L & ST$^{\dagger}$ & \cref{ch:delta} \\
+Gated DeltaNet-2 & 2026 & Imp & On & L & ST & \cref{ch:delta} \\
+Kaczmarz Linear Attention & 2026 & Imp & On & L & ST & \cref{ch:delta} \\
+\midrule
+DeltaProduct & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & ST$^{\dagger}$ & \cref{ch:expressive} \\
+Comba & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & ST$^{\dagger}$ & \cref{ch:expressive} \\
+RWKV-7 & 2025 & Imp & On & L & ST$^{\dagger}$ & \cref{ch:expressive} \\
+\midrule
+Log-Linear Attention & 2025 & Imp & On & L & ST$^{\dagger}$ & \cref{ch:structured} \\
+Mixture-of-Memories (MoM) & 2025 & Imp & On & L & ST + SG (routing)$^{\dagger}$ & \cref{ch:structured} \\
+Mamba-3 & 2026 & Imp & On & L & ST$^{\dagger}$ & \cref{ch:structured} \\
+\midrule
+Kalman Linear Attention & 2026 & Imp & On & L & ST & \cref{ch:probabilistic} \\
+Gated KalmaNet & 2026 & Imp & On & L & ST$^{\dagger}$ & \cref{ch:probabilistic} \\
+Next-Latent Prediction & 2026 & Imp & Off & L & OS & \cref{ch:probabilistic} \\
+\midrule
+Titans & 2025 & Exp & On & L & Opt + SG & \cref{ch:ttt} \\
+TTT-E2E & 2025 & Exp & On & L & Opt & \cref{ch:ttt} \\
+In-Place TTT & 2026 & Exp & On & L & Opt & \cref{ch:ttt} \\
+GDWM & 2026 & Exp & On & L & SG + Opt$^{\dagger}$ & \cref{ch:ttt} \\
+TTT with KV binding as linear attention & 2026 & -- & -- & -- & -- (analysis: Opt $\leftrightarrow$ ST) & \cref{ch:ttt} \\
+\midrule
+LM2 & 2025 & Exp & Off & L & ST (gated slots)$^{\dagger}$ & \cref{ch:lookup} \\
+ExplicitLM & 2025 & Exp & Off & L & OS$^{\dagger}$ & \cref{ch:lookup} \\
+Engram & 2026 & Exp & Off & L & OS & \cref{ch:lookup} \\
+MemoryLLM (FFN memory) & 2026 & Exp & Off & L & OS$^{\dagger}$ & \cref{ch:lookup} \\
+MoE (Switch, GLaM, Mixtral, DeepSeekMoE) & 2021--24 & Exp & Off & L & OS & \cref{ch:lookup} \\
+\midrule
+Nested Learning / HOPE & 2025 & Exp & On & L & Opt & \cref{ch:multiscale} \\
+OLieRA & 2025 & -- & -- & -- & Opt (constrained)$^{\dagger}$ & \cref{ch:multiscale} \\
+Muon-OGD & 2026 & -- & -- & -- & Opt (constrained)$^{\dagger}$ & \cref{ch:multiscale} \\
+\midrule
+Hybrid Quadratic-Linear Transformer & 2025 & Imp & On & L & ST + append$^{\dagger}$ & \cref{ch:hybrid} \\
+Hymba & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & ST + append$^{\dagger}$ & \cref{ch:hybrid} \\
+Falcon-H1 & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & ST + append$^{\dagger}$ & \cref{ch:hybrid} \\
+Hybrid linear attention analysis & 2025 & -- & -- & -- & OS (layer ratio)$^{\dagger}$ & \cref{ch:hybrid} \\
+Expansion Span & 2025 & Imp & On & L & AEC (retrieved span)$^{\dagger}$ & \cref{ch:hybrid} \\
+Hydra & 2025 & Exp & On & L & SG (routing) + ST$^{\dagger}$ & \cref{ch:hybrid} \\
+OLMo Hybrid & 2026 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & ST + OS (3:1 layout)$^{\dagger}$ & \cref{ch:hybrid} \\
+Priming & 2026 & Imp$^{\dagger}$ & On$^{\dagger}$ & L$^{\dagger}$ & OS & \cref{ch:hybrid} \\
+\midrule
+CommVQ & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & S$^{\dagger}$ & AEC (quantisation)$^{\dagger}$ & \cref{ch:routing} \\
+Bottlenecked Transformers & 2025 & Imp$^{\dagger}$ & On$^{\dagger}$ & S$^{\dagger}$ & AEC & \cref{ch:routing} \\
+AMOR & 2026 & Imp & On & L & SG & \cref{ch:routing} \\
+HAM & 2026 & Imp & On & L & SG + AEC & \cref{ch:routing} \\
+Memory Caching & 2026 & Imp & On & L & ST + AEC (snapshots)$^{\dagger}$ & \cref{ch:routing} \\
+\end{longtable}
+\endgroup
+
+\paragraph{Justification of the dagger entries.}
+\begin{itemize}[itemsep=0pt]
+  \item \textbf{MoBA, NSA, HyperMLP.} Token-level KV caches written by the forward pass within a
+        context window, like the sparse-attention entries of Table~I. Their rule controls
+        \emph{access}; we file it under AEC because NSA's compressed and selected blocks decide
+        which entries are read and in which form. HyperMLP's memory grows by appending, which no
+        Table~II rule names.
+  \item \textbf{Recurrent families.} KDA, DeltaProduct, Comba, RWKV-7, Log-Linear Attention, Mamba-3
+        and Gated KalmaNet are instances of \eqref{eq:c02-transition}; DeltaProduct and Comba, absent
+        from Table~I, share the coordinates of their family. MoM and Hydra route tokens among
+        memories (SG); GDWM gates writes that are gradient steps (Opt).
+  \item \textbf{LM2, ExplicitLM, MemoryLLM.} LM2 rewrites its slots with gates (a gated transition);
+        the other two build stores in training and only read them at inference (OS).
+  \item \textbf{Hymba, Falcon-H1, OLMo Hybrid, Priming, CommVQ, Bottlenecked Transformers.} They
+        inherit the coordinates of their caches and recurrent states, like Jamba, Samba and Kimi
+        Linear in Table~I; ``append'' is the KV-cache write. Fixed layouts and layer replacement are
+        structural (OS). The survey's \S V-B places Bottlenecked Transformers ``closer to short-term
+        implicit working memory''.
+  \item \textbf{Analyses and optimisers} (TTT as linear attention, the hybrid-ratio analysis, OLieRA,
+        Muon-OGD) are not memory mechanisms in the survey's sense.
+\end{itemize}
+
+Three patterns stand out. Implicit, online memory dominates, almost always with state-transition
+updates that differ only in their transitions (\cref{tab:c02-transitions}). Explicit memory splits
+into online, optimisation-based memories (\cref{ch:ttt,ch:multiscale}) and offline, structurally
+built stores (\cref{ch:lookup}). And the newest systems combine rules---gating with optimisation
+(Titans, GDWM), state transitions with admission (HAM, Memory Caching)---the direction the survey
+calls adaptive memory control.
+
+\begin{summarybox}
+\begin{itemize}[itemsep=0pt]
+  \item The survey studies \emph{model-level} memory, instantiated in the architecture or its
+        inference-time dynamics; static pretrained weights and agent-level stores are out of scope.
+  \item Fast weights---outer-product writes into a matrix during inference---are the common ancestor
+        of linear attention and test-time training; memory-augmented networks and datastore
+        retrieval are the ancestors of explicit memory.
+  \item \textbf{Representation}: implicit memory is a by-product of the forward pass (KV cache,
+        recurrent state); explicit memory has its own addressing and update semantics (Titans, LM2,
+        Engram, MoE). Materialised does not mean explicit; parametric does not mean implicit.
+  \item \textbf{Update dynamics}: offline memory is fixed after training; online memory is written
+        during inference, per token, chunk or batch, and not necessarily by gradients.
+  \item \textbf{Persistence}: the effective horizon, set by retention, granularity and compression;
+        token-level caches are short-term, compressed states and persistent stores long-term.
+  \item The axes are orthogonal; offline memory is long-term by construction.
+  \item Five update rules---optimisation-based writing, state transitions, signal gating,
+        admission/eviction/consolidation, objective-induced or structural updates---each with
+        characteristic risks.
+  \item Linear attention, the delta rule and their gated variants are single gradient steps on
+        regression objectives; softmax attention is non-parametric regression; Kaczmarz and
+        Kalman-style layers solve the regression more exactly; TTT uses a network.
+  \item Evaluate capacity (MQAR), fidelity and persistence (NIAH, RULER), interference, stability and
+        efficiency separately, and report curves rather than single numbers.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Write rules as gradient steps]\label{ex:c02-ex-grad}
+(a) Starting from $\loss_t(\mS) = \tfrac12\norm{\mS\vk_t - \vv_t}^2$, show that one gradient step of
+size $\beta_t$ taken from $\alpha_t\mS_{t-1}$ gives the gated delta rule
+$\mS_t = \alpha_t\mS_{t-1}(\mI - \beta_t\vk_t\vk_t\T) + \beta_t\vv_t\vk_t\T$.
+(b) Show that the residual satisfies $\mS_t\vk_t - \vv_t = (1 - \beta_t\norm{\vk_t}^2)(\alpha_t\mS_{t-1}\vk_t - \vv_t)$
+and deduce for which $\beta_t$ the write moves the read toward $\vv_t$ without overshooting.
+(c) Show that the eigenvalues of $\mI - \beta_t\vk_t\vk_t\T$ are $1$ (multiplicity $d_k - 1$) and
+$1 - \beta_t\norm{\vk_t}^2$, and explain why $\beta_t\norm{\vk_t}^2 \in (0, 2)$ keeps the recurrence
+\eqref{eq:c02-transition} from amplifying old content.
+\end{exercise}
+
+\begin{exercise}[Crosstalk in a Hebbian memory]\label{ex:c02-ex-crosstalk}
+Let $\vk_1,\dots,\vk_n$ be independent and uniformly distributed on the unit sphere of $\R^{d_k}$,
+and let the values be fixed unit vectors.
+(a) Show that $\E[\vk_i\T\vk_j] = 0$ and $\E[(\vk_i\T\vk_j)^2] = 1/d_k$ for $i \ne j$. (Hint: by
+symmetry every coordinate of $\vk_i$ has the same second moment, and these sum to $1$.)
+(b) For the Hebbian memory \eqref{eq:c02-hebb} with orthonormal values, show that the expected
+squared norm of the crosstalk term in \eqref{eq:c02-crosstalk} is $(n-1)/d_k$, so the
+signal-to-crosstalk ratio is about $\sqrt{d_k/(n-1)}$.
+\end{exercise}
+
+\begin{exercise}[Classify these memories]\label{ex:c02-ex-classify}
+Place each system on the three axes, name its update rule(s) and justify each choice with
+\cref{sec:c02-axes}. (a) A KV cache with least-recently-used eviction, saved to disk at the end of a
+session and reloaded at the next. (b) A LoRA adapter fine-tuned nightly on one user's conversations.
+(c) A sliding-window Transformer with a Titans-style memory MLP reset at every document. (d) A frozen,
+hashed table of $n$-gram embeddings read at every layer. (e) A recurrent model that admits into a
+small KV cache only the tokens whose next-token loss exceeds a threshold.
+\end{exercise}
+
+\begin{exercise}[A toy MQAR experiment]\label{ex:c02-ex-mqar}
+Generate examples with \cref{lst:c02-mqar}; give each token a random key embedding in $\R^{d_k}$ and a
+one-hot value in $\R^{V}$; write the $D$ prefix pairs into a memory with \cref{lst:c02-rules} and
+answer each query by the $\argmax$ of $\mS\vq$. (a) Plot accuracy against $D$ for
+$d_k \in \{16, 32, 64\}$ for the Hebbian, delta ($\beta = 1$) and Kaczmarz rules. (b) Write some keys
+twice with different values and measure how often the newer value is returned. (c) Explain the
+curves with \cref{prop:c02-capacity,prop:c02-kaczmarz} and \cref{ex:c02-ex-crosstalk}. Why can the
+best rule without rewrites differ from the best rule with them?
+\end{exercise}
+
+\begin{exercise}[Horizon and memory budget]\label{ex:c02-ex-budget}
+(a) For $\mS_t = \alpha\mS_{t-1} + \vv_t\vk_t\T$ with constant $\alpha\in(0,1)$, show from
+\eqref{eq:c02-decay-unroll} that the past writes carry total weight at most $1/(1-\alpha)$ and that a
+write's weight halves after $\ln 2/(-\ln\alpha)$ steps. (b) For the models of \cref{ex:c02-bytes},
+find the window $w$ whose KV cache uses as much memory as the recurrent state, and compare the NIAH
+grids you would expect from the two.
+\end{exercise}
+

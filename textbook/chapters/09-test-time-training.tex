@@ -1,3 +1,2183 @@
 \chapter{Test-Time Training as Memory}\label{ch:ttt}
 
-(Chapter in preparation.)
+The recurrent layers of \cref{ch:linear,ch:delta} store the past in a matrix $\mS_t$ that is
+updated by a fixed, hand-designed rule. This chapter takes the next step: the memory is a
+small neural network, and writing to it means \emph{training} it. Every time the model reads
+a chunk of its context, it takes one or more gradient steps on an auxiliary loss, and the
+updated weights carry what was read into the future. Reading from memory is a forward pass
+through those weights. Because the training happens while the model is being used, the idea
+is called \emph{test-time training} (TTT), and the weights being trained are called
+\emph{fast weights}, as opposed to the \emph{slow weights} that are fixed after pre-training.
+
+In the survey's taxonomy (\cref{ch:taxonomy}) these systems are the main examples of
+\emph{explicit, online, parameterized memory} (survey \S IV-A): there is a designated set of
+parameters that acts as storage, it has its own write rule (an optimizer step), and it is
+written during inference \citep{zhoubian2026memory}. The survey's refined update-rule table
+calls this \emph{optimization-based writing}. The appeal is capacity and flexibility: a
+deep network can store a nonlinear key-to-value map that a matrix cannot, and the write rule
+can be anything an optimizer can do (momentum, weight decay, gradient clipping, orthogonalized
+updates). The risks are the ones the survey lists for this row of its table: drift,
+instability, and a mismatch between the auxiliary objective and what the model actually needs.
+
+The chapter first builds the idea from scratch (\cref{sec:c09-background}): fast weights, the
+inner and outer loops, the memory as a function trained on key--value pairs, why one gradient
+step of a linear memory is exactly the delta rule, how mini-batch TTT is parallelized, and how
+the initialization is meta-learned. It then studies five systems: Titans, whose neural memory
+is written by ``surprise'' with momentum and forgetting (\cref{sec:c09-titans}); TTT-E2E, a
+sliding-window Transformer that keeps training on next-token prediction while it reads
+(\cref{sec:c09-e2e}); In-Place TTT, which turns the down-projection of an existing LLM's MLP
+into fast weights (\cref{sec:c09-inplace}); GDWM, which decides \emph{where} in the context to
+spend test-time gradient steps (\cref{sec:c09-gdwm}); and an analysis showing that TTT with
+key--value binding is secretly linear attention (\cref{sec:c09-tttla}), which forces us to ask
+which TTT layers really deserve the name ``explicit memory''.
+
+% ===========================================================================
+\section{Background: a memory that is trained while it is used}\label{sec:c09-background}
+
+\subsection{Fast weights, slow weights, and two loops}\label{sec:c09-fastweights}
+
+A neural network normally has one set of weights that changes only during training. The
+\emph{fast weight} idea, which goes back to \citet{schmidhuber1992fastweights} and was revived
+by \citet{ba2016fastweights}, splits the weights into two groups:
+\begin{itemize}
+  \item \textbf{Slow weights} $\vtheta$ are learned by ordinary training over a large corpus
+        and then frozen. They encode general knowledge: how to embed tokens, how to compute
+        keys and values, how to combine information.
+  \item \textbf{Fast weights} $\mW_t$ change at every step (or every chunk) of a single
+        input sequence. They are reset (or re-initialized) when a new sequence begins. They
+        encode the context: what this document has said so far.
+\end{itemize}
+\citet{c02-schlag2021linear} showed that linear attention is exactly such a system: the
+matrix $\mS_t = \sum_{s \le t} \vv_s \vk_s\T$ of \cref{ch:linear} is a fast weight matrix that
+the slow weights $\mW_K, \mW_V$ ``program'' one outer product at a time. Test-time training
+generalizes this in one specific way: the update of the fast weights is a \emph{gradient step
+on a loss}. This gives two nested optimization loops (\cref{fig:c09-loops}).
+
+\begin{definition}[Inner and outer loop]\label{def:c09-loops}
+The \emph{inner loop} runs at inference time, once per input sequence. It starts from fast
+weights $\mW_0$ and, for each token or chunk, takes an optimizer step on an
+\emph{inner loss} $\ell$ that can be computed from the context alone (it needs no labels):
+\begin{equation}\label{eq:c09-inner}
+  \mW_t = \mW_{t-1} - \eta_t \, \nabla_{\mW} \ell(\mW_{t-1}; \vx_t).
+\end{equation}
+The \emph{outer loop} is ordinary training. It adjusts the slow weights $\vtheta$ (which
+include the projections that define $\ell$, the learning rates $\eta_t$, and often the
+initialization $\mW_0$ itself) so that the outputs produced \emph{with} the fast weights
+minimize the task loss, usually next-token cross-entropy:
+\begin{equation}\label{eq:c09-outer}
+  \min_{\vtheta} \; \E_{\vx_{1:T}} \Big[ \frac{1}{T} \sum_{t=1}^{T}
+     \loss_{\text{task}}\big(\vo_t(\mW_{t}(\vtheta), \vtheta), x_{t+1}\big) \Big].
+\end{equation}
+\end{definition}
+
+The point to keep in mind is that $\mW_t$ is a function of $\vtheta$: it was produced by $t$
+inner steps whose losses were computed with $\vtheta$. Training the outer loop therefore means
+differentiating \emph{through} the inner loop. We return to this in
+\cref{sec:c09-metalearning}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  fw/.style={draw, rounded corners=2pt, fill=blue!6, minimum width=1.25cm, minimum height=0.75cm},
+  ck/.style={draw, rounded corners=2pt, fill=orange!8, minimum width=1.25cm, minimum height=0.65cm},
+  op/.style={draw, circle, inner sep=1pt, fill=gray!10},
+  arr/.style={-{Stealth[length=2mm]}, thick}]
+  \node[fw] (w0) at (0,0) {$\mW_0$};
+  \node[fw] (w1) at (3,0) {$\mW_1$};
+  \node[fw] (w2) at (6,0) {$\mW_2$};
+  \node[fw] (w3) at (9,0) {$\mW_3$};
+  \node[ck] (c1) at (1.5,1.5) {chunk $[1]$};
+  \node[ck] (c2) at (4.5,1.5) {chunk $[2]$};
+  \node[ck] (c3) at (7.5,1.5) {chunk $[3]$};
+  \node[op] (s1) at (1.5,0) {$\nabla$};
+  \node[op] (s2) at (4.5,0) {$\nabla$};
+  \node[op] (s3) at (7.5,0) {$\nabla$};
+  \draw[arr] (w0) -- (s1); \draw[arr] (s1) -- (w1);
+  \draw[arr] (w1) -- (s2); \draw[arr] (s2) -- (w2);
+  \draw[arr] (w2) -- (s3); \draw[arr] (s3) -- (w3);
+  \draw[arr] (c1) -- (s1); \draw[arr] (c2) -- (s2); \draw[arr] (c3) -- (s3);
+  \node[draw, rounded corners=2pt, fill=green!6, minimum width=1.4cm] (o1) at (1.5,-1.5) {$\vo_{[1]}$};
+  \node[draw, rounded corners=2pt, fill=green!6, minimum width=1.4cm] (o2) at (4.5,-1.5) {$\vo_{[2]}$};
+  \node[draw, rounded corners=2pt, fill=green!6, minimum width=1.4cm] (o3) at (7.5,-1.5) {$\vo_{[3]}$};
+  \draw[arr, gray] (w0) -- (o1); \draw[arr, gray] (w1) -- (o2); \draw[arr, gray] (w2) -- (o3);
+  \node[draw, rounded corners=2pt, fill=red!6, minimum width=7.5cm] (L) at (4.5,-2.8) {outer loss $\loss_{\text{task}}$ (next-token prediction)};
+  \draw[arr] (o1) -- (L.north -| o1); \draw[arr] (o2) -- (L.north -| o2); \draw[arr] (o3) -- (L.north -| o3);
+  \draw[arr, dashed, red!60!black] (L.west) -- (-1.3,-2.8) -- (-1.3,0) -- (w0.west);
+  \node[font=\scriptsize, text=red!60!black, align=right, anchor=east] at (-1.4,-1.4) {$\partial\loss/\partial\vtheta$\\through all\\inner steps};
+  \node[font=\scriptsize, align=left, anchor=west] at (9.7,0) {fast weights\\(inner loop)};
+  \node[font=\scriptsize, align=left, anchor=west] at (8.4,1.5) {context};
+\end{tikzpicture}
+\caption{The two loops of test-time training. The inner loop (top two rows) writes each chunk
+into the fast weights with a gradient step on the inner loss. Each chunk is read (bottom row)
+with the fast weights produced by the earlier chunks. The outer loop backpropagates the task
+loss through the whole chain, so it can learn the initialization $\mW_0$ and everything that
+defines the inner loss.}
+\label{fig:c09-loops}
+\end{figure}
+
+\subsection{A memory is a function trained on key--value pairs}\label{sec:c09-memfunction}
+
+What should the inner loss be? The most common answer, used by the first TTT layers
+\citep{c02-sun2024ttt} and by Titans \citep{behrouz2025titans}, is \emph{associative
+recall}. From each token $\vx_t$ the slow weights produce a key, a value and a query,
+\begin{equation}
+  \vk_t = \mW_K\T \vx_t \in \R^{d_k}, \qquad \vv_t = \mW_V\T \vx_t \in \R^{d_v}, \qquad
+  \vq_t = \mW_Q\T \vx_t \in \R^{d_k},
+\end{equation}
+and the memory is a parametric function $\mathcal{M}(\cdot\,; \mW) : \R^{d_k} \to \R^{d_v}$
+with fast weights $\mW$. Writing token $t$ means making the memory map $\vk_t$ to $\vv_t$:
+\begin{equation}\label{eq:c09-assoc-loss}
+  \ell(\mW; \vk_t, \vv_t) = \tfrac{1}{2} \norm{\mathcal{M}(\vk_t; \mW) - \vv_t}^2 .
+\end{equation}
+Reading means evaluating the memory at the query, $\vo_t = \mathcal{M}(\vq_t; \mW_t)$, with
+no weight change. The keys, values and queries play exactly the roles they play in attention
+(\cref{ch:foundations}); the difference is where the key--value pairs go. Attention keeps every
+pair in a cache whose size grows with $t$. A TTT memory \emph{compresses} all pairs into a
+fixed number of parameters, so its state size does not grow, at the price of being an
+approximation.
+
+This view (memory = a regression model fitted online to key--value pairs) is developed
+systematically by \citet{c02-wang2025regression}, who show that many sequence layers
+differ only in the regression objective, the function class and the optimizer used to fit it.
+We now work through the simplest function class.
+
+\subsection{The linear case: one gradient step is the delta rule}\label{sec:c09-linear-case}
+
+Take a linear memory $\mathcal{M}(\vk; \mS) = \mS\vk$ with $\mS \in \R^{d_v \times d_k}$, the
+same shape as the recurrent state of \cref{ch:linear}. The gradient of
+\eqref{eq:c09-assoc-loss} with respect to $\mS$ follows from
+$\ell = \frac12 (\mS\vk - \vv)\T(\mS\vk - \vv)$: a small change $d\mS$ changes $\ell$ by
+$(\mS\vk - \vv)\T d\mS\,\vk = \tr\big(\vk (\mS\vk-\vv)\T d\mS\big)$, so
+\begin{equation}\label{eq:c09-lin-grad}
+  \nabla_{\mS}\, \ell(\mS; \vk, \vv) = (\mS\vk - \vv)\,\vk\T .
+\end{equation}
+The gradient is an outer product of the \emph{prediction error} $\mS\vk - \vv$ with the key.
+One SGD step with learning rate $\eta_t$ gives
+\begin{equation}\label{eq:c09-delta}
+  \mS_t = \mS_{t-1} - \eta_t (\mS_{t-1}\vk_t - \vv_t)\vk_t\T
+        = \mS_{t-1}\big(\mI - \eta_t \vk_t\vk_t\T\big) + \eta_t \vv_t\vk_t\T .
+\end{equation}
+This is the delta rule of \cref{ch:linear} with write strength $\beta_t = \eta_t$. Two other
+choices of inner objective give the other members of the family.
+
+\begin{proposition}[Inner losses that give known recurrences]\label{prop:c09-family}
+Let $\mathcal{M}(\vk;\mS) = \mS\vk$ and take one SGD step per token with rate $\eta_t$.
+\begin{enumerate}
+  \item With the \emph{dot-product loss} $\ell = -\inner{\mS\vk_t}{\vv_t}$ the step is
+        $\mS_t = \mS_{t-1} + \eta_t \vv_t\vk_t\T$: (weighted) linear attention.
+  \item With the squared loss \eqref{eq:c09-assoc-loss} the step is the delta rule
+        \eqref{eq:c09-delta}.
+  \item With the squared loss plus weight decay, $\ell + \frac{\lambda_t}{2}\norm{\mS}_F^2$,
+        the step is $\mS_t = \mS_{t-1}(\alpha_t \mI - \eta_t\vk_t\vk_t\T) + \eta_t\vv_t\vk_t\T$
+        with $\alpha_t = 1 - \eta_t\lambda_t$.
+  \item If the state is first decayed, $\mS \leftarrow \alpha_t\mS_{t-1}$, and the squared-loss
+        step is then taken at the decayed state, the result is the gated delta rule
+        $\mS_t = \alpha_t\mS_{t-1}(\mI - \eta_t\vk_t\vk_t\T) + \eta_t\vv_t\vk_t\T$ of
+        \cref{ch:delta}.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(1) $\inner{\mS\vk}{\vv} = \vv\T\mS\vk = \tr(\vk\vv\T\mS)$, so its gradient is $\vv\vk\T$ and
+the descent step on its negative adds $\eta_t\vv_t\vk_t\T$. (2) is \eqref{eq:c09-delta}.
+(3) The gradient of $\frac{\lambda}{2}\norm{\mS}_F^2$ is $\lambda\mS$, so the step is
+$\mS - \eta(\mS\vk-\vv)\vk\T - \eta\lambda\mS = \mS\big((1-\eta\lambda)\mI - \eta\vk\vk\T\big)
++ \eta\vv\vk\T$. (4) Substitute $\alpha_t\mS_{t-1}$ for $\mS_{t-1}$ in \eqref{eq:c09-delta}.
+\end{proof}
+
+Items 3 and 4 differ only in the order of ``forget'' and ``write'': weight decay inside the
+loss evaluates the error at the undecayed state, the gated delta rule evaluates it at the
+decayed state. Both are forgetting mechanisms, and both appear below (Titans uses a form of
+item 3). A NumPy check in our scratch space confirms all four identities to machine precision
+($\le 4\times10^{-16}$ over 20 random tokens).
+
+\begin{example}[Delta rule versus linear attention with $d_k = d_v = 2$]\label{ex:c09-delta}
+Let $\mS_0 = \bm{0}$, $\eta = 1$, and write two pairs:
+$\vk_1 = (1, 0)\T, \vv_1 = (1, 2)\T$ and $\vk_2 = (0.6, 0.8)\T, \vv_2 = (-1, 1)\T$.
+Both keys have unit norm, but they are not orthogonal ($\vk_1\T\vk_2 = 0.6$).
+
+\emph{Delta rule.} After the first step $\mS_1 = \vv_1\vk_1\T =
+\begin{psmallmatrix} 1 & 0 \\ 2 & 0 \end{psmallmatrix}$. Before writing the second pair the
+memory predicts $\mS_1\vk_2 = (0.6, 1.2)\T$, so the error is $(1.6, 0.2)\T$ and
+\[
+  \mS_2 = \mS_1 - \begin{pmatrix} 1.6 \\ 0.2\end{pmatrix}\begin{pmatrix}0.6 & 0.8\end{pmatrix}
+        = \begin{pmatrix} 0.04 & -1.28 \\ 1.88 & -0.16 \end{pmatrix}, \qquad
+  \mS_2\vk_2 = \begin{pmatrix} -1 \\ 1 \end{pmatrix} = \vv_2 .
+\]
+The second pair is recalled exactly; the first is partly overwritten,
+$\mS_2\vk_1 = (0.04, 1.88)\T$, because the keys overlap.
+
+\emph{Linear attention.} $\mS_2 = \vv_1\vk_1\T + \vv_2\vk_2\T =
+\begin{psmallmatrix} 0.4 & -0.8 \\ 2.6 & 0.8 \end{psmallmatrix}$, so
+$\mS_2\vk_2 = (-0.4, 2.2)\T$: the newest value is buried under interference from the old one.
+The delta rule spends its update on the part of $\vv_2$ that the memory does not yet predict;
+linear attention adds $\vv_2$ blindly. This is the whole argument for error-driven writes, and
+TTT inherits it.
+\end{example}
+
+\subsection{TTT layers: linear and MLP inner models}\label{sec:c09-tttlayers}
+
+\citet{c02-sun2024ttt} proposed to use \eqref{eq:c09-inner} directly as a sequence-modeling
+layer, the \emph{TTT layer}, and to make the inner model more expressive than a matrix. They
+studied two instances:
+\begin{itemize}
+  \item \textbf{TTT-Linear}: $\mathcal{M}(\vk; \mW) = \vk + \LayerNorm(\mW\vk + \vb)$, a
+        linear map wrapped in a layer norm and a residual connection (so $d_v = d_k$ and the
+        reconstruction target for the linear part is $\vv - \vk$).
+  \item \textbf{TTT-MLP}: the same wrapper around a two-layer MLP
+        $\mW_2\, g(\mW_1\vk)$, with an elementwise nonlinearity $g$ (GELU in TTT-MLP) and a
+        hidden width of $4 d_k$.
+\end{itemize}
+The residual and the layer norm keep the memory's output well-scaled however large the fast
+weights become, which stabilizes long inner loops. The slow weights learned by the outer loop
+are the projections $\mW_K, \mW_V, \mW_Q$ (Sun et al.\ call them the training, label and test
+views), the initial fast weights $\mW_0$, and a token-dependent inner learning rate, a gate of
+the form $\eta_t = \eta_{\text{base}}\,\sigmoid(\vw_\eta\T\vx_t)$.
+
+\paragraph{Gradient of an MLP memory.} For the MLP the gradient is ordinary backpropagation
+through two layers. Write $\vz = \mW_1\vk$, $\vh = g(\vz)$, the prediction
+$\hat\vv = \mW_2\vh$, and the error $\ve = \hat\vv - \vv$. For the squared loss,
+\begin{equation}\label{eq:c09-mlp-grad}
+  \nabla_{\mW_2}\ell = \ve\,\vh\T, \qquad
+  \bm{\delta} = (\mW_2\T\ve) \had g'(\vz), \qquad
+  \nabla_{\mW_1}\ell = \bm{\delta}\,\vk\T .
+\end{equation}
+Each layer's gradient is again an outer product: an error signal times the layer's input.
+That structure is what makes everything in this chapter parallelizable, so it is worth
+remembering. (Our scratch check compares \eqref{eq:c09-mlp-grad} with finite differences for a
+SiLU MLP; the largest difference is $4\times10^{-10}$.)
+
+\subsection{Mini-batch TTT: chunks and their parallel form}\label{sec:c09-minibatch}
+
+The per-token recurrence \eqref{eq:c09-inner} is sequential: step $t$ needs $\mW_{t-1}$. On a
+GPU this is slow, for the same reason the naive delta rule is slow (\cref{ch:linear}).
+\citet{c02-sun2024ttt} break the dependency with \emph{mini-batch TTT}. Split the sequence into
+chunks of $C$ tokens and let $\mW_{[i]}$ be the fast weights at the start of chunk $i$. Inside
+the chunk, every gradient is taken at $\mW_{[i]}$ instead of at the latest weights:
+\begin{equation}\label{eq:c09-minibatch}
+  \mW_t = \mW_{[i]} - \sum_{s \in [i],\, s \le t} \eta_s \nabla\ell(\mW_{[i]}; \vk_s, \vv_s),
+  \qquad \vo_t = \mathcal{M}(\vq_t; \mW_t), \qquad \mW_{[i+1]} = \mW_{\text{last token of } [i]} .
+\end{equation}
+Within a chunk all $C$ gradients are now independent and can be computed at once; only the
+chunk boundaries are sequential. The price is \emph{staleness}: a token's gradient does not
+see the writes of the earlier tokens of the same chunk. $C = 1$ recovers the exact recurrence;
+$C = T$ means a single gradient step on the whole sequence (one ``batch'' gradient descent
+step). The chunk size is therefore a knob between expressiveness (more, smaller sequential
+steps) and hardware efficiency (fewer, larger parallel ones).
+
+\paragraph{The parallel (dual) form for a linear memory.} With $\mathcal{M}(\vk;\mS) = \mS\vk$
+the sum in \eqref{eq:c09-minibatch} can be written as matrix products, so the per-token states
+$\mS_t$ never need to be formed. Stack the chunk's queries, keys and values as rows,
+$\mQ_{[i]}, \mK_{[i]} \in \R^{C\times d_k}$, $\mV_{[i]}\in\R^{C\times d_v}$, and the learning
+rates in $\bm{\eta}_{[i]} \in \R^{C}$. The residuals at the chunk-start state are the rows of
+\begin{equation}
+  \mathbf{E}_{[i]} = \mK_{[i]}\mS_{[i]}\T - \mV_{[i]} \in \R^{C\times d_v}
+  \quad(\text{row } s \text{ is } (\mS_{[i]}\vk_s - \vv_s)\T).
+\end{equation}
+By \eqref{eq:c09-lin-grad}, $\mS_t = \mS_{[i]} - \sum_{s\le t}\eta_s \ve_s\vk_s\T$, so
+\begin{equation}
+  \vo_t = \mS_t\vq_t = \mS_{[i]}\vq_t - \sum_{s \le t} \eta_s\, (\vk_s\T\vq_t)\, \ve_s .
+\end{equation}
+The coefficient $\eta_s\vk_s\T\vq_t$ is an entry of the causally masked matrix
+$\mathbf{A}_{[i]} = \operatorname{tril}(\mQ_{[i]}\mK_{[i]}\T)\diag(\bm{\eta}_{[i]})$, which gives
+\begin{equation}\label{eq:c09-dual}
+  \mO_{[i]} = \mQ_{[i]}\mS_{[i]}\T - \mathbf{A}_{[i]}\mathbf{E}_{[i]}, \qquad
+  \mS_{[i+1]} = \mS_{[i]} - \mathbf{E}_{[i]}\T\diag(\bm{\eta}_{[i]})\,\mK_{[i]} .
+\end{equation}
+Sun et al.\ call this the \emph{dual form}. It is the chunkwise-parallel form of
+\cref{ch:linear} with one twist: the ``values'' that the intra-chunk attention mixes are the
+residuals $\ve_s$, which depend on the chunk-start state. The cost per chunk is
+$\bigO(C^2 d_k + C d_k d_v)$, all in matrix multiplications. We checked \eqref{eq:c09-dual}
+against the token-by-token computation of \eqref{eq:c09-minibatch} (largest difference
+$2\times10^{-16}$), and that $C = 1$ reproduces the delta rule.
+
+The same trick works for the MLP memory, layer by layer. Inside a chunk,
+\eqref{eq:c09-mlp-grad} gives $\mW_{1,t} = \mW_{1,[i]} - \sum_{s\le t}\eta_s\bm{\delta}_s\vk_s\T$
+and $\mW_{2,t} = \mW_{2,[i]} - \sum_{s\le t}\eta_s\ve_s\vh_s\T$, where $\bm{\delta}_s,\ve_s,\vh_s$
+are all computed at the chunk-start weights. Hence
+\begin{equation}\label{eq:c09-dual-mlp}
+  \vz_t' = \mW_{1,[i]}\vq_t - \sum_{s\le t}\eta_s(\vk_s\T\vq_t)\bm{\delta}_s, \qquad
+  \vo_t = \mW_{2,[i]}\, g(\vz_t') - \sum_{s\le t}\eta_s\big(\vh_s\T g(\vz_t')\big)\ve_s ,
+\end{equation}
+two masked ``attention'' products in sequence. The layer norm of TTT-Linear adds a few more
+terms (its backward pass), but the structure is the same.
+
+\begin{implnote}[title={In the code: the dual form in \fla}]
+The \fla{} library mirrored at \repo{fla-org__flash-linear-attention} contains a readable
+reference for TTT-Linear in \repofile{fla/ops/ttt/naive.py} (function \code{ttt_linear},
+called by \code{chunk_ttt_linear_ref}). Tensors are \texttt{[NT, B, H, BT, D]}, i.e.\ the
+sequence is cut into \code{NT} mini-batches of \texttt{BT = mini\_batch\_size} tokens (default
+16). The loop body below is \eqref{eq:c09-dual} plus the layer norm: \code{kh} is the inner
+model's output on the keys, \code{v_new} is the gradient of the loss with respect to the
+pre-norm output (the residual $\ve_s$ after backpropagating through the layer norm),
+\code{Attn} is $\operatorname{tril}(\mQ\mK\T)$, and the state \code{h} is advanced with the
+learning rate of the last token of the chunk.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}ttt/\allowbreak{}naive.py}},label={lst:c09-fla-ttt}]
+    for i in range(NT):
+        q_i, k_i, v_i, eta_i = [x[i] for x in [_q, _k, _v, _eta]]
+        kh = k_i @ h + hb
+        reconstruction_target = v_i - k_i
+
+        mean = kh.mean(-1, True)
+        var = kh.var(-1, unbiased=False, keepdim=True).to(torch.float32)
+        rstd = torch.sqrt(var + eps).to(torch.float32)
+        kh_hat = (kh - mean) / rstd
+
+        g = w * kh_hat + b - reconstruction_target
+        g *= w
+        v_new = (D * g - g.sum(-1, True) - kh_hat * (g * kh_hat).sum(-1, True)) / (rstd * D)
+
+        Attn = torch.tril(q_i @ k_i.transpose(-2, -1))
+        o_i = q_i @ h - (eta_i * Attn) @ v_new + hb - torch.tril(eta_i.expand_as(Attn)) @ v_new
+        h = h - (eta_i[:, :, -1, :, None] * k_i).transpose(-1, -2) @ v_new
+        hb = hb - torch.sum(eta_i[:, :, -1, :, None] * v_new, dim=-2, keepdim=True)
+\end{lstlisting}
+
+Note one convention difference: in this code the row of \code{Attn} for query $t$ is scaled
+by the query token's rate \code{eta_i} (broadcast over columns), whereas
+\eqref{eq:c09-dual} scales column $s$ by the key token's rate. Both are valid
+parameterizations of a token-dependent inner learning rate; the derivation is the same.
+
+\begin{lstlisting}[caption={Reference implementation (ours): mini-batch TTT-Linear in its dual form, without the layer norm.},label={lst:c09-ttt-linear}]
+import torch
+
+def ttt_linear_chunked(q, k, v, eta, S0, C):
+    """Mini-batch TTT with linear memory M(x) = S x and loss 0.5*||S k - v||^2.
+    q, k: [T, dk]; v: [T, dv]; eta: [T]; S0: [dv, dk] (learned initial state).
+    All gradients of a chunk are taken at the chunk-start state S."""
+    T = q.shape[0]
+    S, out = S0, []
+    for i in range(0, T, C):
+        Q, K, V, e = q[i:i+C], k[i:i+C], v[i:i+C], eta[i:i+C]
+        E = K @ S.T - V                        # residuals at chunk start [C, dv]
+        A = torch.tril(Q @ K.T) * e[None, :]   # A[t, s] = eta_s * q_t.k_s, s <= t
+        out.append(Q @ S.T - A @ E)            # o_t = S_t q_t for all t in the chunk
+        S = S - E.T @ (e[:, None] * K)         # S_[i+1] = S_[i] - sum_s eta_s e_s k_s^T
+    return torch.cat(out), S
+\end{lstlisting}
+
+A NumPy transcription of \cref{lst:c09-ttt-linear} matches a token-by-token loop to
+$4\times10^{-16}$, including a last chunk shorter than $C$.
+
+\subsection{Meta-learning the initialization: the outer loop through the inner loop}\label{sec:c09-metalearning}
+
+The outer loop trains every slow parameter by backpropagating the task loss
+\eqref{eq:c09-outer}. Because the outputs depend on the fast weights, and the fast weights are
+the result of inner gradient steps, the outer gradient flows backward through those steps.
+This is the same computation as model-agnostic meta-learning \citep{c09-finn2017maml}, where
+a network's initialization is trained so that a few gradient steps on a new task work well.
+Here the ``task'' is a single sequence, and the learned initialization $\mW_0$ is the memory's
+prior: what it believes before it has read anything.
+
+\paragraph{One step, worked out.} Let a linear memory take one inner step on $(\vk, \vv)$ and
+then answer a query $\vq$ whose target is $\vy$, with outer loss
+$\loss = \frac12\norm{\mS_1\vq - \vy}^2$. From \eqref{eq:c09-delta},
+$\mS_1 = \mS_0\mP + \eta\vv\vk\T$ with $\mP = \mI - \eta\vk\vk\T$. Writing $\vr = \mS_1\vq-\vy$,
+we have $\partial\loss/\partial\mS_1 = \vr\vq\T$, and since $\mS_1$ depends on $\mS_0$ only
+through the right factor $\mP$ (which is symmetric),
+\begin{equation}\label{eq:c09-metagrad}
+  \frac{\partial\loss}{\partial\mS_0} = \vr\,\vq\T\mP = \vr\,\vq\T\big(\mI - \eta\vk\vk\T\big).
+\end{equation}
+The meta-gradient is the plain gradient $\vr\vq\T$ corrected by the inner step: the component
+of the query along the key that was just written is discounted, because the inner step will
+have overwritten that direction anyway. After $n$ steps the correction is the product
+$\mP_n\cdots\mP_1$ (our finite-difference check of this formula through four inner steps
+agrees to $8\times10^{-10}$). The outer loop can also differentiate with respect to the inner
+learning rate: for the last step, $\partial\loss/\partial\eta_n = -\vr\T\ve_n\,(\vk_n\T\vq)$,
+which is how gates such as $\eta_t = \eta_{\text{base}}\sigmoid(\vw_\eta\T\vx_t)$ are learned.
+
+\paragraph{What it costs.} For a general inner model the Jacobian of one step,
+$\partial\mW_t/\partial\mW_{t-1} = \mI - \eta_t\nabla^2\ell$, contains the Hessian of the inner
+loss. Reverse-mode autodiff never forms it; it computes Hessian-vector products, which cost a
+small constant times a gradient. The real cost is memory: the backward pass needs the fast
+weights at every inner step. Implementations keep only the chunk-start weights and recompute
+the rest during the backward pass (gradient checkpointing, called rematerialization in JAX).
+Mini-batch TTT helps here too: with $T/C$ chunks only $T/C$ copies of the fast weights are
+needed.
+
+\begin{pitfall}[title={Pitfall: ``test time'' does not mean ``untrained''}]
+The inner loop runs at test time, but it is also run, in exactly the same way, during
+training, so that the outer loop can learn to use it. A TTT model whose outer loop never saw
+the inner loop (for example, fine-tuning an ordinary model on each test document) is a
+different method: its initialization was not meta-learned and nothing guarantees that a few
+inner steps help. Titans, TTT-E2E and In-Place TTT all train through their inner loop; for GDWM
+the material we could access does not say.
+\end{pitfall}
+
+\subsection{How TTT generalizes linear attention and the delta rule}\label{sec:c09-generalizes}
+
+\Cref{prop:c09-family} shows that the recurrent layers of \cref{ch:linear,ch:delta} are TTT
+layers whose inner model is a matrix, whose inner loss is a dot product or a squared error,
+and whose optimizer is one SGD step per token (possibly with decay). Test-time training
+opens three more axes.
+\begin{enumerate}
+  \item \textbf{The inner model.} A matrix can store at most $d_k$ linearly independent keys
+        without interference. An MLP memory can represent a nonlinear key-to-value map with
+        more parameters per head.
+  \item \textbf{The inner optimizer.} Momentum (Titans), weight decay (Titans), gradient
+        clipping (TTT-E2E), several steps per chunk (GDWM), or orthogonalized updates with the
+        Newton--Schulz iteration of the Muon optimizer \citep{c01-jordan2024muon} (used by
+        LaCT \citep{c09-zhang2025lact} and as an option in the Titans code).
+  \item \textbf{The inner objective and the parameters it touches.} Instead of a separate
+        key--value memory, the fast weights can be a slice of the language model itself and
+        the inner loss can be the language-modeling loss (TTT-E2E), or an objective designed
+        to be aligned with it (In-Place TTT).
+\end{enumerate}
+
+\begin{table}[t]
+\centering\small
+\caption{Recurrent layers as test-time training. Each row is one inner model, one inner loss
+and one inner optimizer. ``Chunk'' means mini-batch TTT with gradients at the chunk start.}
+\label{tab:c09-family}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.1cm} >{\raggedright\arraybackslash}p{2.7cm} >{\raggedright\arraybackslash}p{2.6cm} >{\raggedright\arraybackslash}X@{}}
+\toprule
+Inner model & Inner loss & Inner optimizer & Resulting layer \\
+\midrule
+matrix $\mS$ & $-\inner{\mS\vk}{\vv}$ & SGD, per token & linear attention (\cref{ch:linear}) \\
+matrix $\mS$ & $\frac12\norm{\mS\vk-\vv}^2$ & SGD, per token & delta rule / DeltaNet \\
+matrix $\mS$ & squared, after decay & SGD, per token & gated delta rule (\cref{ch:delta}) \\
+LN + residual + matrix & squared & SGD, chunk & TTT-Linear \\
+LN + residual + MLP & squared & SGD, chunk & TTT-MLP \\
+MLP & squared & momentum + decay, chunk & Titans neural memory (\cref{sec:c09-titans}) \\
+SwiGLU MLP & dot product & Muon, large chunk & LaCT (\cref{sec:c09-tttla}) \\
+MLPs of the last blocks of a Transformer & next-token cross-entropy & SGD + clipping, chunk & TTT-E2E (\cref{sec:c09-e2e}) \\
+MLP down-projection & dot product with a next-token target & SGD, chunk & In-Place TTT (\cref{sec:c09-inplace}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:c09-family} summarizes the correspondence. Keep it in mind while reading the
+systems: each one is a choice of row, plus engineering to make that row fast.
+
+% ===========================================================================
+\section{Titans: a neural memory written by surprise}\label{sec:c09-titans}
+
+\subsection{Motivation}
+
+A Transformer has a precise but short memory: attention recalls any token in its window
+exactly, and nothing outside it. A linear recurrent layer has a long but lossy memory: a
+fixed-size matrix summarizes everything. \citet{behrouz2025titans} argue that a good model
+needs both, plus a third kind of memory for task knowledge that does not depend on the input,
+and they build all three into one architecture called \emph{Titans}. The new component is a
+\emph{long-term neural memory}: a deep MLP that is trained at test time with the associative
+loss \eqref{eq:c09-assoc-loss}. Three ideas distinguish its write rule from a plain TTT layer.
+\begin{enumerate}
+  \item \textbf{Surprise.} The gradient of the associative loss is large when the memory
+        predicts the value badly, i.e.\ when the token is surprising. Titans calls the
+        gradient the \emph{momentary surprise} and writes in proportion to it, so expected
+        tokens barely change the memory.
+  \item \textbf{Momentum.} A surprising event is often followed by tokens that are not
+        surprising in isolation but belong to the same event. Titans accumulates surprise
+        with momentum (\emph{past surprise}), so the memory keeps writing for a while after
+        the surprise.
+  \item \textbf{Forgetting.} Fixed capacity means old content must eventually go. Titans
+        decays the memory's weights with a data-dependent factor, a form of weight decay
+        (item 3 of \cref{prop:c09-family}).
+\end{enumerate}
+
+\begin{taxonomy}
+\textbf{Representation:} explicit (a dedicated parameter set, the memory MLP, with its own
+read and write interface). \textbf{Update dynamics:} online, written during inference.
+\textbf{Persistence:} long-term in the survey's Table I; the survey's \S IV-D also describes
+the Titans memory as \emph{short-timescale explicit memory}, persistent parameters that
+evolve within an inference episode, and the persistent-memory tokens are offline, long-term
+parameters. \textbf{Update rule:} optimization-based writing \emph{and} signal-gated writing
+(surprise): Titans is listed in both rows of Table II, and the survey notes that some memories
+combine optimization-based writing with surprise-driven modulation \citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation}
+
+\paragraph{Notation.} The paper uses $\eta_t$ for the momentum coefficient, $\theta_t$ for the
+learning rate, $S_t$ for the momentum buffer and $(1-\alpha_t)$ for the retention factor.
+To stay consistent with the rest of the book we rename them:
+\begin{center}\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+ & learning rate & momentum coefficient & retention (forget gate) \\
+\midrule
+Titans paper & $\theta_t$ & $\eta_t$ & $1 - \alpha_t$ \\
+this chapter & $\eta_t$ & $\mu_t$ & $\alpha_t$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+The memory is $\mathcal{M}(\cdot\,;\mW)$ with fast weights $\mW$ (all parameters of the MLP),
+and the momentum buffer, which has the same shape, is $\mU$.
+
+\paragraph{Write.} Keys and values come from the current token, $\vk_t = \mW_K\T\vx_t$ and
+$\vv_t = \mW_V\T\vx_t$. With the associative loss
+$\ell(\mW;\vx_t) = \frac12\norm{\mathcal{M}(\vk_t;\mW) - \vv_t}^2$ (the paper omits the
+$\frac12$; the factor 2 is absorbed into the learning rate), the memory is updated by
+\begin{align}
+  \mU_t &= \mu_t\, \mU_{t-1} - \eta_t\, \nabla_{\mW}\ell(\mW_{t-1}; \vx_t)
+     && \text{(past surprise + momentary surprise)} \label{eq:c09-titans-mom}\\
+  \mW_t &= \alpha_t\, \mW_{t-1} + \mU_t
+     && \text{(forgetting + write)} \label{eq:c09-titans-forget}
+\end{align}
+with $\mU_0 = \bm{0}$. The three coefficients are data-dependent gates computed from the token,
+for example $\eta_t = \eta_{\max}\sigmoid(\vw_\eta\T\vx_t)$, $\mu_t = \sigmoid(\vw_\mu\T\vx_t)$,
+$\alpha_t = \sigmoid(\vw_\alpha\T\vx_t)$. When $\mu_t = 0$ this is one SGD step with weight
+decay; with $\alpha_t = 1$ and $\mu_t = 0$ and a linear memory it is the delta rule.
+For a linear memory $\mathcal{M}(\vk;\mS) = \mS\vk$ and $\mu_t = 0$,
+\eqref{eq:c09-titans-forget} reads $\mS_t = \mS_{t-1}(\alpha_t\mI - \eta_t\vk_t\vk_t\T) +
+\eta_t\vv_t\vk_t\T$, item 3 of \cref{prop:c09-family}. Momentum is the genuinely new part:
+unrolling \eqref{eq:c09-titans-mom},
+\begin{equation}
+  \mU_t = -\sum_{s \le t} \Big(\prod_{j=s+1}^{t}\mu_j\Big)\eta_s\nabla\ell(\mW_{s-1};\vx_s),
+\end{equation}
+so the write at time $t$ still contains a decaying echo of every earlier surprise.
+
+\paragraph{Read.} The memory is queried without changing it:
+$\vy_t = \mathcal{M}(\vq_t; \mW)$, $\vq_t = \mW_Q\T\vx_t$. Like the TTT layers of
+\cref{sec:c09-tttlayers}, $\mathcal{M}$ is an MLP with $L_{\mathcal{M}} \ge 1$ layers;
+the paper reports that deeper memories are more expressive but slower.
+
+\paragraph{Persistent memory.} A set of $N_p$ learnable vectors $\mP\in\R^{N_p\times d}$,
+independent of the input, is prepended to the sequence: $\tilde\mX = [\mP; \mX]$. These are
+ordinary slow weights (offline memory). Titans motivates them as storage for task knowledge;
+one can also see them as a fixed place where attention can put weight when nothing in the
+window is relevant, much like the attention sinks of StreamingLLM \citep{xiao2023streamingllm}.
+
+\paragraph{Three ways to use the memory.} The paper combines the neural memory with attention
+in three architectures (\cref{fig:c09-titans}). Let the sequence be cut into segments
+$\mX^{(1)}, \mX^{(2)}, \dots$ of fixed length.
+\begin{itemize}
+  \item \textbf{Memory as a context (MAC).} For segment $i$, retrieve from the memory as it was
+        after the previous segments, $\mH^{(i)} = \mathcal{M}(\mQ^{(i)}; \mW^{(i-1)})$; run
+        causal attention over the concatenation $[\mP;\, \mH^{(i)};\, \mX^{(i)}]$ to get
+        $\mY^{(i)}$; write $\mY^{(i)}$ into the memory to obtain $\mW^{(i)}$; and output
+        $\mO^{(i)} = \mY^{(i)} \otimes \mathcal{M}(\mY^{(i)}; \mW^{(i)})$, where $\otimes$ is a
+        gated combination. Attention decides what in the retrieved history is useful, and
+        what the memory stores is attention's output.
+  \item \textbf{Memory as a gate (MAG).} Two parallel branches on $\tilde\mX = [\mP;\mX]$:
+        sliding-window attention, and the neural memory, which writes and reads token by
+        token. The output is $\mO = \operatorname{SWA}(\tilde\mX) \otimes \mathcal{M}(\tilde\mX)$.
+  \item \textbf{Memory as a layer (MAL).} The memory is a sequence layer stacked before
+        attention: $\mO = \operatorname{SWA}(\mathcal{M}(\tilde\mX))$. This is the usual hybrid
+        layout of \cref{ch:hybrid}, with a TTT layer in place of a linear-attention layer.
+\end{itemize}
+The paper also evaluates the memory alone (no attention) as a sequence model. Of the three,
+MAC lets the memory and the attention interact most closely; the paper reports it to be the
+strongest on long-range recall tasks.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small,
+  bx/.style={draw, rounded corners=2pt, minimum height=0.6cm, align=center, inner sep=3pt},
+  arr/.style={-{Stealth[length=2mm]}, thick}]
+  % MAC
+  \node[font=\bfseries] at (0,3.3) {MAC};
+  \node[bx, fill=violet!8] (p1) at (-1.15,0) {$\mP$};
+  \node[bx, fill=blue!8] (h1) at (-0.3,0) {$\mH^{(i)}$};
+  \node[bx, fill=orange!10] (x1) at (0.75,0) {$\mX^{(i)}$};
+  \node[bx, fill=gray!10, minimum width=3cm] (a1) at (-0.2,1.2) {attention};
+  \node[bx, fill=blue!8] (m1) at (-0.2,2.4) {memory $\mathcal{M}$};
+  \draw[arr] (-0.2,0.3) -- (a1);
+  \draw[arr] (a1) -- node[right, font=\scriptsize]{write $\mY^{(i)}$} (m1);
+  \draw[arr, dashed] (m1.west) -| (-2.0,-0.65) -| node[pos=0.25, below, font=\scriptsize]{read $\mH^{(i)}$} (h1.south);
+  % MAG
+  \node[font=\bfseries] at (4.5,3.3) {MAG};
+  \node[bx, fill=orange!10] (x2) at (4.5,0) {$[\mP;\mX]$};
+  \node[bx, fill=gray!10] (a2) at (3.6,1.2) {SWA};
+  \node[bx, fill=blue!8] (m2) at (5.4,1.2) {memory $\mathcal{M}$};
+  \node[bx, circle, inner sep=1pt] (g2) at (4.5,2.4) {$\otimes$};
+  \draw[arr] (x2) -- (a2); \draw[arr] (x2) -- (m2);
+  \draw[arr] (a2) -- (g2); \draw[arr] (m2) -- (g2);
+  % MAL
+  \node[font=\bfseries] at (8.6,3.3) {MAL};
+  \node[bx, fill=orange!10] (x3) at (8.6,0) {$[\mP;\mX]$};
+  \node[bx, fill=blue!8] (m3) at (8.6,1.2) {memory $\mathcal{M}$};
+  \node[bx, fill=gray!10] (a3) at (8.6,2.4) {SWA};
+  \draw[arr] (x3) -- (m3); \draw[arr] (m3) -- (a3);
+\end{tikzpicture}
+\caption{The three Titans variants. MAC: the segment attends over persistent tokens, memory
+retrievals and itself, and attention's output is written to the memory. MAG: memory and
+sliding-window attention (SWA) run in parallel and are combined by a gate. MAL: the memory is
+a layer below attention.}
+\label{fig:c09-titans}
+\end{figure}
+
+\subsection{Parallel training of the memory}\label{sec:c09-titans-parallel}
+
+Written per token, \eqref{eq:c09-titans-mom}--\eqref{eq:c09-titans-forget} are sequential.
+Titans parallelizes them in the same way as mini-batch TTT (\cref{sec:c09-minibatch}): the
+sequence is cut into chunks of $C$ tokens, and every gradient inside chunk $[i]$ is taken at
+the chunk-start weights $\mW_{[i]}$. Then the per-token gradients
+$\mathbf{G}_t = \nabla\ell(\mW_{[i]};\vx_t)$ are all independent, and what remains are two
+\emph{linear} recurrences in $t$,
+\begin{equation}
+  \mU_t = \mu_t\mU_{t-1} - \eta_t\mathbf{G}_t, \qquad \mW_t = \alpha_t\mW_{t-1} + \mU_t ,
+\end{equation}
+which can be solved with a parallel scan or in closed form.
+
+\paragraph{Closed form.} Inside a chunk, index tokens $1,\dots,C$, write $\mW_0 = \mW_{[i]}$,
+$\mU_0$ for the momentum carried in, and define the lower-triangular decay matrices
+\begin{equation}
+  \mathbf{A}_{ts} = \prod_{j=s+1}^{t}\alpha_j, \qquad
+  \mathbf{M}_{ts} = \prod_{j=s+1}^{t}\mu_j \qquad (s \le t,\ \text{zero above the diagonal}).
+\end{equation}
+Unrolling the momentum gives
+$\mU_r = (\prod_{j\le r}\mu_j)\mU_0 - \sum_{s\le r}\mathbf{M}_{rs}\eta_s\mathbf{G}_s$, and
+unrolling the weights gives $\mW_t = (\prod_{j\le t}\alpha_j)\mW_0 + \sum_{r\le t}\mathbf{A}_{tr}\mU_r$.
+Substituting the first into the second and exchanging the sums,
+\begin{equation}\label{eq:c09-titans-closed}
+  \mW_t = a_t\mW_0 + b_t\mU_0 - \sum_{s\le t}\Gamma_{ts}\,\eta_s\mathbf{G}_s, \qquad
+  \bm{\Gamma} = \mathbf{A}\mathbf{M},
+\end{equation}
+with $a_t = \prod_{j\le t}\alpha_j$ and $b_t = \sum_{r\le t}\mathbf{A}_{tr}\prod_{j\le r}\mu_j$.
+So momentum and forgetting together just reweight the gradients by a lower-triangular matrix
+$\bm{\Gamma}$, the product of two decay matrices. Without momentum, $\bm{\Gamma} = \mathbf{A}$
+and \eqref{eq:c09-titans-closed} becomes $\mW_t = a_t\mW_0 - \sum_{s\le t}(a_t/a_s)\eta_s
+\mathbf{G}_s$, the form given in the Titans paper.
+
+\paragraph{Linear memory: a dual form with decay.} For $\mathcal{M}(\vk;\mS) = \mS\vk$ the
+gradients are $\mathbf{G}_s = \ve_s\vk_s\T$ with $\ve_s = \mS_{[i]}\vk_s - \vv_s$, and the
+outputs $\vo_t = \mS_t\vq_t$ of a whole chunk are, by \eqref{eq:c09-titans-closed},
+\begin{equation}\label{eq:c09-titans-dual}
+  \mO_{[i]} = \diag(\va)\,\mQ\mS_{[i]}\T + \diag(\vb)\,\mQ\mU_{[i]}\T
+     - \big(\bm{\Gamma}\had\mQ\mK\T\big)\diag(\bm{\eta})\,\mathbf{E},
+\end{equation}
+which is the dual form \eqref{eq:c09-dual} with the causal mask replaced by the decay-weighted
+mask $\bm{\Gamma}$ (compare the gated forms in \cref{ch:linear}). Our NumPy check runs
+\eqref{eq:c09-titans-mom}--\eqref{eq:c09-titans-forget} token by token with chunk-start
+gradients and compares it with \eqref{eq:c09-titans-dual} over four chunks: outputs, final
+weights and final momentum agree to $5\times10^{-15}$. For a deep memory the same reasoning
+applies layer by layer, as in \eqref{eq:c09-dual-mlp}.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{Titans neural memory, chunk-parallel training of one layer (one head).}
+\label{alg:c09-titans}
+\begin{algorithmic}[1]
+\Require token states $\mX\in\R^{T\times d}$; memory MLP $\mathcal{M}$ with initial weights $\mW_0$ (slow); chunk size $C$
+\Ensure outputs $\vy_t$ for all $t$
+\State $\mK, \mV, \mQ \gets \mX\mW_K, \mX\mW_V, \mX\mW_Q$; gates $\eta_t, \mu_t, \alpha_t$ from $\vx_t$
+\State $\mW \gets \mW_0$; $\mU \gets \bm{0}$
+\For{each chunk $[i]$}
+  \State $\mathbf{G}_t \gets \nabla_{\mW}\tfrac12\norm{\mathcal{M}(\vk_t;\mW)-\vv_t}^2$ for all $t\in[i]$ \Comment{in parallel, at chunk-start $\mW$}
+  \State $\mU_t \gets \mu_t\mU_{t-1} - \eta_t\mathbf{G}_t$; $\ \mW_t \gets \alpha_t\mW_{t-1} + \mU_t$ \Comment{two parallel scans}
+  \State $\vy_t \gets \mathcal{M}(\vq_t;\mW_t)$ for all $t \in [i]$ \Comment{dual form \eqref{eq:c09-titans-dual} for linear layers}
+  \State $\mW, \mU \gets \mW_{\text{last}}, \mU_{\text{last}}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Titans MAC, processing segment $i$ (training or prefill).}
+\label{alg:c09-mac}
+\begin{algorithmic}[1]
+\Require segment $\mX^{(i)}$; persistent tokens $\mP$; memory weights $\mW^{(i-1)}$
+\State $\mH^{(i)} \gets \mathcal{M}(\mX^{(i)}\mW_Q; \mW^{(i-1)})$ \Comment{retrieve history}
+\State $\mY^{(i)} \gets \operatorname{CausalAttn}([\mP;\mH^{(i)};\mX^{(i)}])$, keep the rows of $\mX^{(i)}$
+\State $\mW^{(i)} \gets$ \Call{Write}{$\mW^{(i-1)}$, $\mY^{(i)}$} \Comment{\cref{alg:c09-titans} on the segment}
+\State \Return $\mO^{(i)} \gets \mY^{(i)} \otimes \mathcal{M}(\mY^{(i)}\mW_Q; \mW^{(i)})$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Let $P$ be the number of memory parameters per head; for a two-layer
+memory with hidden width $e\,d_k$ (and $d_v = d_k$), $P = 2e\,d_k^2$. The recurrent state is
+the memory \emph{and} its momentum, $2P$ numbers per head, independent of $T$. One write or
+read costs $\bigO(P)$ per token, so the memory costs $\bigO(TP)$ in total, linear in $T$.
+Training with chunks of size $C$ adds the intra-chunk terms of the dual form,
+$\bigO(T C d_k)$ per layer of the memory, and stores one copy of the weights per chunk for the
+backward pass, $\bigO(PT/C)$ memory. In MAC, attention runs only within a segment of length
+$N_s$ (plus $N_p$ persistent and the retrieved tokens), so its cost is
+$\bigO(T(2N_s + N_p))$, also linear in $T$. During decoding the memory is updated once per
+token (or once per chunk if writes are buffered), with $\bigO(P)$ work and no growing cache.
+
+\subsection{Implementation walkthrough: \texttt{titans-pytorch} (unofficial)}
+
+Google has not released code for Titans. The mirrored \repo{lucidrains__titans-pytorch} is an
+\emph{unofficial} reimplementation (its README says so), and several of its choices are the
+author's own explorations rather than the paper's. We read it because it is the most widely
+used implementation and because it shows, very concretely, how test-time gradient steps are
+written in PyTorch.
+
+\begin{implnote}[title={In the code: the \texttt{NeuralMemory} module}]
+\repofile{titans_pytorch/neural_memory.py} defines \code{NeuralMemory}. Its main arguments
+are \code{chunk_size} (default 1; the granularity at which weights are materialized and at
+which momentum and decay are shared), \code{batch_size} (default \code{None}; the TTT
+mini-batch, i.e.\ how often the weights used for computing gradients are refreshed),
+\code{heads}, and \code{model}, the memory network. The default memory is
+\texttt{MemoryMLP(dim\_head, depth = 2, expansion\_factor = 4.)} from
+\repofile{titans_pytorch/memory_models.py}: plain weight matrices with GELU in between,
+wrapped by \code{ResidualNorm} (output $= \LayerNorm(\mathcal{M}(\vx)) + \vx$; the comment
+credits the original TTT paper). The memory's initial weights are slow parameters stored in
+\code{self.memory_model_parameters}, one copy per head.
+
+\textbf{Per-sample gradients.} The write needs one gradient per chunk, computed for all chunks
+at once. The code builds it with \code{torch.func}:
+\texttt{forward\_and\_loss(params, inputs, loss\_weights, target)} runs
+\texttt{functional\_call(self.memory\_model, params, inputs)}, computes the per-token MSE (mean
+over the feature dimension), multiplies it by \code{loss_weights} and sums; then
+\texttt{self.per\_sample\_grad\_fn = vmap(grad(forward\_and\_loss, has\_aux = True), in\_dims = (0, 0, 0, 0))}.
+The learning rate is passed as the \emph{loss weight}: \code{adaptive_lr} is
+\code{to_adaptive_step(seq)}, a linear map per token and head, squashed by
+\code{default_adaptive_step_transform}, i.e.\ \texttt{sigmoid() * max\_lr}. Hence the gradient
+for one chunk is $\sum_{t\in\text{chunk}}\eta_t\nabla\ell_t$, and \texttt{surprises = grads.mul(-1)}
+is already $-\eta\nabla\ell$.
+
+\textbf{Gates per chunk.} Momentum and decay coefficients are computed from a pooled chunk
+representation (\code{reduce_to_chunk_rep}, mean or attention pooling):
+\texttt{adaptive\_momentum = self.to\_momentum(chunked\_seq).sigmoid()} and
+\texttt{decay\_factor = self.to\_decay\_factor(chunked\_seq).sigmoid()}. A code comment says the
+paper shares the adaptive step, momentum and decay within a chunk.
+\end{implnote}
+
+The heart of \code{store_memories} is the loop below. \texttt{self.assoc\_scan(gates, inputs, prev)}
+computes the linear recurrence $\vh_n = \text{gate}_n\vh_{n-1} + \text{input}_n$ over the chunk
+axis (it comes from the external \code{assoc_scan} package, which is not mirrored). The first
+scan is the momentum \eqref{eq:c09-titans-mom}; the second, with gate
+\texttt{1. - decay\_factor}, is the forgetting step \eqref{eq:c09-titans-forget}. Because its
+\code{prev} is the previous weights, the scan's outputs are the memory weights themselves, one
+set per chunk. The elided lines handle higher-order momentum (a learned combination of several
+momentum buffers) and the optional spectral normalization of the update.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}lucidrains\_\_titans-pytorch/\allowbreak{}titans\_pytorch/\allowbreak{}neural\_memory.py} (\texttt{NeuralMemory.store\_memories})},label={lst:c09-titans-store}]
+        for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
+
+            update = surprise
+
+            # derive momentum with associative scan - eq (10)
+
+            if has_momentum:
+                momentum = surprise
+                # ...
+                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
+                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
+
+                    momentums.append(momentum)
+
+                momentums = stack(momentums)
+
+                next_last_momentum[param_name] = momentums[:, :, -1] # momentums shape is Float['o bh n 1']
+                # ...
+                if not learned_combine:
+                    update = momentums[-1]
+            # ...
+            update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
+
+            updates[param_name] = update
+            next_last_update[param_name] = update[:, -1]
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: reading, mini-batches and the MAC transformer}]
+\textbf{Read.} \texttt{retrieve\_memories(seq, weights)} pads the sequence with one position at
+the front, reshapes the queries into chunks, and evaluates
+\texttt{functional\_call(self.memory\_model, dict(weights), queries)} with a different weight set
+per chunk. The one-position shift aligns each query with the weights written by the complete
+chunks that end at or before its own position, so a token never reads a later token's write. When a single token is decoded with a single weight set, the code switches to
+\texttt{chunk\_size = 1}.
+
+\textbf{TTT mini-batches.} In \code{forward}, the stored sequence is split at multiples of
+\code{batch_size}. Within one piece, every chunk's gradient is computed at the same weights
+(the code comment: \texttt{minibatch\_init\_weight corresponds to W0 in figure 7 of TTT paper});
+at each boundary \texttt{weights = last\_update}. With \texttt{batch\_size = None} the whole call is
+one mini-batch. The returned \code{NeuralMemState} (sequence index, weights, cached remainder
+tokens, last weights and momentum, per-chunk weights) is the recurrent state carried between
+calls.
+
+\textbf{MAC transformer.} \repofile{titans_pytorch/mac_transformer.py} implements a
+memory-as-context model, but not literally the paper's \cref{alg:c09-mac}. Persistent memory is
+a learned set of key--value pairs per head prepended inside attention
+(\texttt{self.persistent\_memory = nn.Parameter(torch.zeros(2, heads, num\_persist\_mem\_tokens, dim\_head))});
+learned ``long-term memory tokens'' (\code{num_longterm_mem_tokens}) are interspersed into every
+segment; and the neural memory's retrievals are added to the residual stream (or, with
+\code{neural_mem_gate_attn_output}, used as a sigmoid gate on the attention output).
+Attention is segmented or sliding-window (\code{sliding_window_attn}).
+
+\textbf{Defaults of the example run.} \repofile{train_mac.py} trains a byte-level model on
+enwik8: \texttt{dim = 384}, \texttt{depth = 8}, segment (window) 32, neural memory in layers
+\texttt{(2, 4, 6)} with a two-layer \texttt{MemoryMLP(dim = 64)}, \texttt{heads = 4},
+\texttt{NEURAL\_MEM\_SEGMENT\_LEN = 4} (chunk size), \texttt{NEURAL\_MEM\_BATCH\_SIZE = 128} (TTT
+mini-batch), \texttt{NEURAL\_MEM\_MAX\_LR = 1e-1}, 4 persistent and 4 long-term memory tokens.
+It also turns on several options that go beyond the paper (the comments in \repofile{train_mac.py}
+explain their origin):
+spectral normalization of the surprise with the Newton--Schulz iteration (\code{newtonschulz5},
+as in Muon), a learned residual from the previous memory layer's weights
+(\code{neural_mem_weight_residual}), and letting the memory choose its key, value and query
+inputs from different earlier layers (\code{qkv_receives_diff_views}). An option
+\code{store_with_lookahead_value} (off by default) stores the \emph{next} token's value with
+the current key, following \citet{c09-zhao2026fwpkm}.
+\end{implnote}
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c09-titans} writes the memory with \code{torch.func}, like the unofficial code, but
+with the chunk loop made explicit. The learning rate enters as a loss weight, gradients of a
+TTT mini-batch of \code{nb} chunks are taken at the mini-batch's starting weights, and a chunk
+reads the memory before it writes, so the read is strictly causal at chunk granularity.
+
+\begin{lstlisting}[caption={Reference implementation (ours): Titans-style neural memory with momentum and forgetting.},label={lst:c09-titans}]
+import torch
+from torch.func import functional_call, grad, vmap
+
+def titans_memory(mem, W0, k, v, q, eta, mu, alpha, C, nb):
+    """mem: nn.Module used as a pure function of its weights (e.g. a 2-layer MLP).
+    W0: dict name -> tensor, the initial memory (slow weights, learned outside).
+    k, v, q: [T, d]; eta: [T] per-token lr; mu, alpha: [T // C] per-chunk gates.
+    Returns the read-outs [T, d] and the final memory weights."""
+    def chunk_loss(W, kc, vc, ec):            # sum_t eta_t * 0.5 * ||M(k_t) - v_t||^2
+        err = functional_call(mem, W, (kc,)) - vc
+        return 0.5 * (ec[:, None] * err ** 2).sum()
+    chunk_grads = vmap(grad(chunk_loss), in_dims=(None, 0, 0, 0))
+
+    n = k.shape[0] // C
+    kc, vc, qc = (x.reshape(n, C, -1) for x in (k, v, q))
+    ec = eta.reshape(n, C)
+    W = dict(W0)
+    U = {name: torch.zeros_like(p) for name, p in W.items()}   # momentum
+    out = []
+    for b0 in range(0, n, nb):                                  # one TTT mini-batch
+        b1 = min(b0 + nb, n)
+        G = chunk_grads(W, kc[b0:b1], vc[b0:b1], ec[b0:b1])    # all at batch-start W
+        for j, i in enumerate(range(b0, b1)):
+            out.append(functional_call(mem, W, (qc[i],)))       # read before write
+            for name in W:
+                U[name] = mu[i] * U[name] - G[name][j]          # surprise + momentum
+                W[name] = alpha[i] * W[name] + U[name]          # forgetting + write
+    return torch.cat(out), W
+\end{lstlisting}
+
+The listing materializes one weight set per chunk, as the unofficial code does; for a linear
+memory, \eqref{eq:c09-titans-dual} gives token-level reads without materializing anything. We
+checked a NumPy transcription of \cref{lst:c09-titans} for a linear memory (where the gradient
+is the closed form \eqref{eq:c09-lin-grad}) against an independent token loop that accumulates
+the chunk gradient and updates at chunk ends; they agree to $1.4\times10^{-15}$.
+
+\begin{results}
+\textbf{Source files:} \repofile{repos/lucidrains__titans-pytorch/README.md}; survey PDF in
+\repofile{papers/}. Neither the unofficial repository nor the survey reports benchmark numbers
+for Titans; the repository's README contains installation and usage instructions only.
+Qualitatively, the paper reports that Titans outperforms Transformers and modern linear
+recurrent models on language modeling and commonsense reasoning at the scales it studies, and
+that it handles very long contexts better than the baselines on needle-in-a-haystack style
+recall, with MAC the strongest variant on such tasks. See the paper for the numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} Titans packages three memories with clear roles: attention for the recent
+window, a neural memory for the long past, and persistent tokens for task knowledge. The write
+rule is interpretable (surprise, momentum, forgetting), and \eqref{eq:c09-titans-closed} shows
+it remains parallelizable: momentum and decay only reweight gradients.
+
+\textbf{Limitations.} A deep memory costs more per token than a matrix memory, and the dual
+form, while exact, has to backpropagate through every memory layer for every chunk. The
+gradients inside a chunk are stale, so the chunk size trades quality for speed. Surprise is a
+proxy for importance: an unpredictable but useless token (noise, a random identifier that will
+never be asked about) is written strongly, a risk the survey lists for signal-gated writing.
+The forget gate is the only defense, and it decays everything, not just the useless content.
+
+\textbf{Relations.} With a linear memory, Titans is a gated delta rule with momentum, close to
+the ``momentum delta rule'' variants in \cref{ch:delta}. Nested Learning / HOPE
+(\cref{ch:multiscale}) builds on the Titans memory with several update frequencies, and Memory
+Caching (\cref{ch:routing}) checkpoints such memories at segment boundaries. The analysis of
+\cref{sec:c09-tttla} bears directly on Titans: its MSE loss makes the value depend on the
+state, so it is a delta-rule-type layer rather than plain linear attention.
+
+% ===========================================================================
+\section{TTT-E2E: a Transformer that keeps training on its context}\label{sec:c09-e2e}
+
+\subsection{Motivation}
+
+Titans and the TTT layers add a special memory module with its own reconstruction loss. That
+loss is a \emph{proxy}: the model does not actually need to map $\vk_t$ to $\vv_t$; it needs to
+predict the next token. \citet{tandon2025ttte2e} remove the proxy. Their README states the idea
+as treating long-context language modeling ``as a problem in continual learning rather than
+architecture design'': take a standard Transformer whose attention only sees a sliding window,
+and let it \emph{keep training on next-token prediction} over the context it reads, so that
+what falls out of the window is compressed into the weights. The method is end-to-end in two
+senses: at test time the inner loss is the model's own language-modeling loss, and at training
+time the initialization of the fast weights is meta-learned through the inner loop
+(\cref{sec:c09-metalearning}).
+
+\begin{taxonomy}
+\textbf{Representation:} explicit, in the survey's reading: a designated subset of parameters
+(here, extra MLPs in the last blocks) is operated as writable memory. \textbf{Update dynamics:}
+online; the survey's \S V-A describes it as performing batch-style parameter updates during
+inference. \textbf{Persistence:} long-term in Table I; \S IV-D groups it with Titans as
+short-timescale explicit memory that evolves within an inference episode. \textbf{Update rule:}
+optimization-based writing (Table II), with an inner objective that is the task objective
+itself \citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation}
+
+\paragraph{The model.} The backbone is a decoder-only Transformer with $L$ blocks whose
+attention is sliding-window attention (SWA) with window $w$. The last $L_s$ blocks (the
+\emph{suffix}) each receive one extra SwiGLU MLP, called the \emph{prime} MLP in the code,
+inserted between attention and the block's ordinary MLP:
+\begin{equation}
+  \vh \gets \vh + \operatorname{SWA}(\vh), \qquad
+  \vh \gets \vh + \operatorname{MLP}'(\vh; \mW), \qquad
+  \vh \gets \vh + \operatorname{MLP}(\vh),
+\end{equation}
+each sublayer with its own pre- and post-RMSNorm. The weights $\mW$ of the prime MLPs of the
+suffix blocks are the fast weights; everything else (embeddings, all attention layers, all
+ordinary MLPs, the first $L - L_s$ blocks) is slow. Collect the slow weights in $\vtheta$, and
+note that $\vtheta$ also contains the \emph{initial value} $\mW_0$ of the fast weights.
+
+\paragraph{Inner loop.} Cut the sequence into chunks of $C$ tokens (the code calls $C$
+\code{mini_batch_size}; the released configs use $C = 1024$). Let $\loss_i(\mW)$ be the mean
+next-token cross-entropy of chunk $i$ when the model runs with fast weights $\mW$ (and with
+SWA over the window that ends at each token, which reaches back into earlier chunks). Then
+\begin{equation}\label{eq:c09-e2e-inner}
+  \mW_i = \mW_{i-1} - \eta\,\operatorname{clip}\big(\nabla_{\mW}\loss_i(\mW_{i-1})\big),
+  \qquad i = 1, \dots, T/C,
+\end{equation}
+where $\operatorname{clip}$ rescales the gradient to global norm at most 1 and $\eta$ is a
+scalar inner learning rate. Chunk $i$'s predictions are made with $\mW_{i-1}$, i.e.\ with
+weights that have been trained on chunks $1,\dots,i-1$ only, so the scheme is causal:
+\emph{predict, then learn}.
+
+\paragraph{Outer loop.} The training objective is the average of the chunk losses
+\emph{before} each update,
+\begin{equation}\label{eq:c09-e2e-outer}
+  \loss_{\text{outer}}(\vtheta) = \frac{C}{T}\sum_{i=1}^{T/C}\loss_i\big(\mW_{i-1}(\vtheta)\big),
+\end{equation}
+which is exactly the next-token loss of the model as it would be used at test time. Its
+gradient with respect to $\vtheta$ (including $\mW_0$) flows through every inner step
+\eqref{eq:c09-e2e-inner}: a second-order, MAML-style computation
+(\cref{sec:c09-metalearning}). This is what ``meta-learned initialization'' means here: the
+prime MLPs are trained to be good \emph{starting points for further training on the current
+document}, not only good weights in themselves.
+
+\paragraph{Why only the last blocks?} Updating only suffix parameters has a large practical
+benefit: the first $L - L_s$ blocks do not depend on the fast weights, so their outputs can be
+computed \emph{once} for the whole sequence, in parallel, with an ordinary SWA kernel. The
+inner loop then only has to run, differentiate and update the $L_s$ suffix blocks chunk by
+chunk. The inner gradient also only needs to backpropagate through those blocks.
+
+\paragraph{Where the memory lives.} Within the window, recall is exact (attention). Beyond it,
+the only path from an old token to the current prediction is through $\mW_{i-1}$: the old
+chunk changed the prime MLPs when it was trained on. There is no key--value structure: the
+``write'' is whatever change of the MLP weights best reduces the next-token loss of that chunk,
+and the ``read'' is simply running the network.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{TTT-E2E on one sequence (training, prefill and evaluation all run this).}
+\label{alg:c09-e2e}
+\begin{algorithmic}[1]
+\Require tokens $x_{1:T+1}$; slow weights $\vtheta$ containing $\mW_0$; chunk size $C$; window $w$; inner rate $\eta$
+\Ensure loss $\loss_{\text{outer}}$; final fast weights $\mW_{T/C}$
+\State $\mathbf{Z} \gets$ prefix blocks $1..L-L_s$ applied to the whole sequence with SWA \Comment{parallel, once}
+\State $\mW \gets \mW_0$; KV caches of the suffix blocks $\gets$ empty
+\For{$i = 1, \dots, T/C$}
+  \State run suffix blocks on $\mathbf{Z}_{[i]}$ with fast weights $\mW$, attending to the cached last $w$ keys/values
+  \State $\loss_i \gets$ next-token cross-entropy of chunk $i$
+  \State $\mathbf{G} \gets \nabla_{\mW}\loss_i$ \Comment{backward through the suffix only}
+  \State $\mW \gets \mW - \eta\,\mathbf{G}\cdot\min(1, 1/\norm{\mathbf{G}})$; update KV caches
+\EndFor
+\State $\loss_{\text{outer}} \gets$ mean of $\loss_i$ \Comment{training: backpropagate to $\vtheta$ through the loop}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Per token, the forward cost is that of an SWA Transformer,
+$\bigO(L w d + L d^2)$, independent of $T$, plus the inner backward pass over the suffix,
+roughly two more forward-passes' worth of the $L_s$ suffix blocks. The state that is carried
+from chunk to chunk is the suffix KV caches ($2 L_s w d$ numbers; an incremental decoder would
+also keep SWA caches for the prefix blocks, while the released code evaluates whole sequences)
+plus the fast weights, $L_s$ SwiGLU MLPs of
+$3 d\, d_{\text{ff}}'$ parameters each. Neither grows with $T$, which is why the model has
+constant per-token latency, like an RNN. Training is the expensive part: the outer gradient
+needs the fast weights of every chunk (stored or recomputed) and second-order terms through
+every inner step, so the code rematerializes each chunk during the backward pass.
+
+\subsection{Implementation walkthrough: \texttt{test-time-training/e2e} (official, JAX)}
+
+The official code in \repo{test-time-training__e2e} is written in JAX with Equinox modules and
+Hydra configs. The whole method fits in two files:
+\repofile{ttt/model/transformer.py} (model, inner loop, outer loss) and
+\repofile{ttt/model/loop.py} (outer training step).
+
+\begin{implnote}[title={In the code: which parameters are fast}]
+In \repofile{ttt/model/transformer.py}, \code{Block} has optional fields
+\code{feed_forward_prime}, \code{ffn_prime_norm} and \code{ffn_prime_post_norm}. Their
+parameters are created once, for the $L_s$ suffix blocks, in \code{PrimeStorage} (with
+\texttt{config.prime = True}), and \code{BlockCollectionSplit} splits the stacked blocks into
+\code{prefix_blocks} and \code{suffix_blocks} (the last \code{suffix_len}) and copies the prime
+MLPs into the suffix. In \code{Block.__call__} the prime MLP runs after the sequence-mixing
+sublayer and before the ordinary \code{feed_forward}, both with residual connections. The
+fast/slow split is expressed by glob patterns over parameter paths: the E2E experiment configs
+set \texttt{spec\_inner: ["language\_model.**.suffix\_blocks.feed\_forward\_prime.**"]}, while
+\code{spec_outer} keeps its default \texttt{["**"]} (\repofile{ttt/config.py}), so the outer loop
+trains everything, including the prime MLPs' initial values. The inner optimizer is SGD
+without momentum (\repofile{ttt/optimizers.py}, \code{make_sgd_optimizer}), with
+\texttt{lr: 1} and \texttt{clip\_gradient: 1.0} in the configs, and its learning rate is multiplied
+by \code{get_ilr_multiplier}, a linear warm-up of the inner learning rate from
+\code{ilr_init} to \code{optimizer_inner.lr} over \code{ilr_warmup_steps} outer steps.
+\end{implnote}
+
+The inner loop is \code{MetaModel.loss_for_sequence} with \texttt{train\_mode == "meta"}. Before
+the loop, the prefix is run once over the whole sequence; the excerpt below is what follows.
+\code{process_suffix_chunk} re-assembles the model from the current inner parameters and the
+untouched outer parameters (\code{eqx.partition}/\code{eqx.combine}), calls
+\code{inner_loop_step}, and \code{scan_remat_chunk} scans it over the chunks while
+rematerializing every \code{inner_remat_freq} chunks in the backward pass.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}test-time-training\_\_e2e/\allowbreak{}ttt/\allowbreak{}model/\allowbreak{}transformer.py} (\texttt{MetaModel.loss\_for\_sequence})},label={lst:c09-e2e-loop}]
+            def process_suffix_chunk(model__opt_state__state, inputs: tuple[Batch, jnp.ndarray]):
+                model_inner, inner_opt_state, state_tuple = model__opt_state__state
+                suffix_chunk, prefix_chunk = inputs
+
+                spec_inner = get_filter_spec(model_inner, self.config.training.spec_inner, "inner parameters")
+                inner_params, _ = eqx.partition(model_inner, spec_inner)
+                _, outer_params = eqx.partition(model, spec_inner)
+                model_inner: MetaModel = eqx.combine(inner_params, outer_params)
+
+                new_model, inner_opt_state, state_tuple, metrics = MetaModel.inner_loop_step(
+                    model_inner, inner_opt_state, state_tuple, suffix_chunk, prefix_chunk
+                )
+
+                return (new_model, inner_opt_state, state_tuple), metrics
+
+            seq = tree_rearrange(seq, "(chunk token) ... -> chunk token ...", token=tokens_per_chunk)
+            prefix_output = tree_rearrange(prefix_output, "(chunk token) ... -> chunk token ...", token=tokens_per_chunk)
+
+            carry, metrics = scan_remat_chunk(
+                eqx.filter_checkpoint(process_suffix_chunk, prevent_cse=False),
+                (model, inner_opt_state, (state_all, state_suffix)),
+                (seq, prefix_output),
+                remat_n_loops=cfg.training.inner_remat_freq,
+                unroll=cfg.model.unroll_inner_scan,
+            )
+\end{lstlisting}
+
+One inner step is a value-and-gradient of the language-model loss of one chunk, run through
+the suffix only (\code{prefix_outputs} is given), followed by an optimizer update of the inner
+parameters. The loss returned in \code{md[M.loss]} is computed with the weights \emph{before}
+the update, which is what makes the outer loss \eqref{eq:c09-e2e-outer} causal.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}test-time-training\_\_e2e/\allowbreak{}ttt/\allowbreak{}model/\allowbreak{}transformer.py} (\texttt{MetaModel.inner\_loop\_step})},label={lst:c09-e2e-step}]
+        value_and_grad_fn = eqx.filter_value_and_grad(MetaModel.lm_loss, has_aux=True)
+
+        (_loss_with_aux, (md[M.loss], md[M.token_nll_loss], new_suffix_state)), grads = value_and_grad_fn(
+            self, seq, suffix_state, prefix_outputs=prefix_outputs
+        )
+
+        inner_grads = grads.inner_parameters()
+        updates, new_optimizer_state = self.inner_optimizer(state_all).update(inner_grads, opt_state, self.inner_parameters())
+        new_model = filter_apply_updates(self, updates)
+
+        new_state_tuple = (state_all, new_suffix_state)
+
+        return MetaModel.InnerLoopStepResult(new_model=new_model, new_optimizer_state=new_optimizer_state, new_state=new_state_tuple, metrics=md)
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: sliding-window attention across chunks}]
+In \repofile{ttt/model/attention.py}, \code{SWA} keeps a state of the last
+\code{window_size} keys and values (\code{kv_cache_index}) and a chunk counter
+(\code{chunk_index}). For a suffix chunk it concatenates the cached keys/values with the
+chunk's own ($[w + C]$ keys for $C$ queries), applies RoPE with positions relative to that
+buffer, and masks with \code{sw_causal_mask} (below): query $q_i$ may see key $k_j$ if
+$j \le i < j + w$ and $j \ge 0$. The prefix blocks instead call \code{full_sw_attention}, a
+single cuDNN call with \texttt{local\_window\_size=(window\_size - 1, 0)}. The cache stores keys
+before RoPE and re-applies RoPE at every chunk, so relative positions are consistent.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}test-time-training\_\_e2e/\allowbreak{}ttt/\allowbreak{}model/\allowbreak{}attention.py} (\texttt{SWA.sw\_causal\_mask})},label={lst:c09-e2e-mask}]
+    def sw_causal_mask(self, chunk_id):
+        nk = self.window_size + self.mini_batch_size
+        nq = self.mini_batch_size
+
+        starting_query_idx = chunk_id * nq
+        ending_query_idx = starting_query_idx + self.mini_batch_size
+        ending_key_idx = ending_query_idx
+        qi = (jnp.arange(0, nq, dtype=jnp.int32) + starting_query_idx)[:, None]
+        ki = (jnp.arange(-nk, 0, dtype=jnp.int32) + ending_key_idx)[None, :]
+
+        mask = (qi >= ki) & (qi < ki + self.window_size) & (ki >= 0)
+        return mask
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the outer loop and the configs}]
+\code{train_on_sequence} in \repofile{ttt/model/loop.py} vmaps \code{loss_for_sequence} over
+the batch, takes \code{eqx.filter_value_and_grad} of the mean loss with respect to the whole
+\code{MetaModel} (this differentiates through the inner loop), averages across devices with
+\code{jax.lax.pmean}, and applies AdamW (\code{optimizer_outer}) to the trainable parameters.
+Evaluation (\code{eval_step_fn}) calls the same \code{loss_for_sequence}, so the inner loop
+runs at evaluation exactly as in training: this \emph{is} the test-time training. The inner
+copy of the model is cast to \code{state_dtype} (fp32 by default) while activations use bf16.
+For the full-attention baseline (\texttt{train\_mode: pretrain}) the same function processes
+chunks without inner updates.
+
+The released configs under \repofile{configs/experiment/} share \texttt{mini\_batch\_size: 1024},
+\texttt{sliding\_window\_size: 8192}, \texttt{rope\_theta: 500000} and inner SGD with \texttt{lr: 1} and
+\texttt{clip\_gradient: 1.0}. Pre-training runs at 8K tokens with the inner learning rate warmed
+up from \texttt{ilr\_init: 0.1} (e.g.\ over 480 outer steps for 125M); the long-context extension
+runs at 32K (and 128K for 3B) with \texttt{ilr\_init: 1}. Note that at 8K the window covers the
+whole training sequence, so the inner loop's role as a memory beyond the window is exercised in
+the extension stage. The suffix length grows with model size:
+\end{implnote}
+
+\begin{center}\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+config & layers $L$ & width $d$ & suffix $L_s$ & $d_{\text{ff}}$ (E2E) & $d_{\text{ff}}$ (base model) \\
+\midrule
+125M & 12 & 768 & 3 & 1664 & 2048 \\
+350M & 24 & 1024 & 6 & 2304 & 2816 \\
+760M & 24 & 1536 & 6 & 3328 & 4096 \\
+1B & 24 & 2048 & 6 & 4352 & 5376 \\
+3B & 32 & 2560 & 8 & 5632 & 6912 \\
+\bottomrule
+\end{tabular}
+\end{center}
+The E2E configs override \code{intermediate_size}, presumably so that, with the extra prime
+MLPs, the total parameter count stays close to the baseline's (for 125M:
+$12\cdot 3\cdot 768\cdot 2048 \approx 56.6$M MLP parameters in the baseline versus
+$15\cdot 3\cdot 768\cdot 1664 \approx 57.5$M with the three prime MLPs).
+
+\subsection{From-scratch reference implementation}
+
+\Cref{lst:c09-e2e} is a toy version of \cref{alg:c09-e2e} in PyTorch. The model is any module
+that maps a chunk of tokens to logits; it ignores the SWA cache across chunks to stay short.
+The key line is \code{create_graph=True}: it keeps the inner gradient in the autograd graph, so
+that \code{loss.backward()} on the returned outer loss differentiates through every inner step.
+
+\begin{lstlisting}[caption={Reference implementation (ours): a toy TTT-E2E inner loop with a differentiable outer loss.},label={lst:c09-e2e}]
+import torch
+import torch.nn.functional as F
+from torch.func import functional_call
+
+def e2e_sequence_loss(model, params, inner_names, tokens, C, eta, clip=1.0):
+    """model: maps a chunk of token ids [C] to logits [C, V].
+    params: dict of all weights (slow), including the initial fast weights.
+    inner_names: the parameter names trained at test time (e.g. suffix MLPs).
+    Returns the outer loss: mean next-token loss of chunk i under W_{i-1}."""
+    inner = {n: params[n] for n in inner_names}
+    outer = {n: p for n, p in params.items() if n not in inner_names}
+    losses = []
+    for i in range(0, tokens.shape[0] - 1, C):
+        x, y = tokens[i:i+C], tokens[i+1:i+C+1]
+        logits = functional_call(model, {**outer, **inner}, (x,))
+        loss = F.cross_entropy(logits[:len(y)], y)
+        losses.append(loss)                      # predict first ...
+        g = torch.autograd.grad(loss, list(inner.values()), create_graph=True)
+        gnorm = torch.sqrt(sum((gi ** 2).sum() for gi in g))
+        scale = torch.clamp(clip / (gnorm + 1e-6), max=1.0)
+        inner = {n: p - eta * scale * gi        # ... then learn (one SGD step)
+                 for (n, p), gi in zip(inner.items(), g)}
+    return torch.stack(losses).mean()
+
+# Outer step: loss = e2e_sequence_loss(...); loss.backward(); outer_opt.step()
+# At test time the same function runs; only the backward call is skipped.
+\end{lstlisting}
+
+The second-order part can be checked by hand for a linear memory: our finite-difference test
+of \eqref{eq:c09-metagrad} through four inner steps, and of the derivative with respect to the
+last inner learning rate, agree with the analytic formulas to about $10^{-9}$.
+
+\begin{results}
+\textbf{Source file:} \repofile{repos/test-time-training__e2e/README.md}. The README contains
+no benchmark table. It lists released checkpoints: TTT-E2E models of 125M and 1B parameters
+(1$\times$ Chinchilla) and 3B parameters (3$\times$ Chinchilla), pre-trained on DCLM at 8K
+context and fine-tuned on Books at 8K, plus a 3B model fine-tuned on Books at 128K context.
+Qualitatively, the paper reports that TTT-E2E's loss keeps improving with context length in
+the same way as a full-attention Transformer (unlike Mamba~2 and Gated DeltaNet in its
+comparison), while its inference latency per token is constant in the context length, like
+an RNN. See the paper for the numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} TTT-E2E removes the mismatch between the memory's objective and the
+model's: what gets written is exactly what reduces next-token loss. It needs no new layer type,
+only a standard SWA Transformer with a few extra MLPs, and the meta-learned initialization
+means the model is trained to be adapted. Its constant per-token state makes very long
+contexts affordable at inference.
+
+\textbf{Limitations.} Training is costly: second-order gradients through a scan over all chunks,
+with rematerialization. The write granularity is coarse ($C = 1024$ tokens per step), so
+information inside the current chunk that falls out of the window before the chunk ends is
+reachable only through attention. Memory is not addressable: there is no query that retrieves a
+specific fact, and how much an old chunk influences the weights depends on how strongly it
+moved the loss, a ``drift'' risk the survey attributes to optimization-based writing. Exact
+recall of a long, arbitrary string from far outside the window is the hardest case for any
+compressive memory.
+
+\textbf{Relations.} TTT-E2E is the far end of \cref{tab:c09-family}: the inner model is a slice
+of the language model and the inner loss is the task loss. In-Place TTT (next section) keeps
+the ``slice of the model'' idea but replaces the full next-token gradient by a cheap,
+closed-form update. As a hybrid of exact local attention and compressive long-range memory it
+is a relative of the hybrid architectures of \cref{ch:hybrid}, with the recurrent layer
+replaced by gradient descent on the MLPs.
+
+% ===========================================================================
+\section{In-Place TTT: the MLP down-projection as fast weights}\label{sec:c09-inplace}
+
+\subsection{Motivation}
+
+The systems so far need a model built for test-time training: Titans adds a memory module,
+TTT-E2E adds prime MLPs and is pre-trained with its inner loop. Neither can be bolted onto an
+existing 8B-parameter LLM. \citet{feng2026inplacettt} ask how to give an \emph{existing}
+Transformer test-time training ability with as little change as possible. The paper's abstract
+names three obstacles of earlier TTT designs (architectural incompatibility, computational
+inefficiency, and fast-weight objectives that are not aligned with language modeling), and the
+repository's README lists one idea for each:
+\begin{enumerate}
+  \item \textbf{Architectural compatibility.} Use a matrix the model already has as the fast
+        weights: the down-projection $\mW_{\text{down}}$ of the MLP block. No new memory module
+        and no new attention heads.
+  \item \textbf{LM-aligned objective.} Instead of reconstructing the token's own value, the
+        update binds the MLP's hidden activation to a target built from the
+        \emph{neighbouring, upcoming} tokens.
+  \item \textbf{Chunk-wise update.} Update once per large chunk, which makes the update a
+        matrix product and lets training compute all chunks in parallel.
+\end{enumerate}
+
+\begin{taxonomy}
+\textbf{Representation:} explicit in the functional sense; the survey (\S IV-A(c),
+``fast-weight reuse and selective writing'') notes that ``a designated parameter subset is
+operated as writable memory under a specialized test-time objective, even though it is
+implemented inside a standard MLP block'', so explicit memory need not be a separate bank.
+\textbf{Update dynamics:} online. \textbf{Persistence:} long-term (Table I).
+\textbf{Update rule:} optimization-based writing (Table II) \citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation}
+
+\paragraph{The MLP and its fast weight.} A SwiGLU MLP block (as in Qwen3 and Llama-3) computes
+\begin{equation}
+  \vh = \SiLU(\mW_{\text{gate}}\vx) \had (\mW_{\text{up}}\vx) \in \R^{d_{\text{ff}}}, \qquad
+  \vy = \mW_{\text{down}}\vh \in \R^{d},
+\end{equation}
+where $\vx$ is the block's (normalized) input. In a TTT layer, $\mW_{\text{down}}$ becomes a
+fast weight. Its pre-trained value $\mW_{\text{down}}^{(0)}$ is the starting point for every
+sequence, and the chunk-wise inner loop changes it.
+
+\paragraph{The target.} For each token, the code takes a \emph{target state} $\bm{t}_c \in \R^d$:
+by default the MLP's own input (the post-attention hidden state, \texttt{ttt\_target: hidden\_states},
+recommended for continual training), or the token embedding (\code{input_embed}, recommended for
+pre-training from scratch). Inside chunk $[i]$, a depthwise 1-D convolution with kernel size 5
+mixes each target with its neighbours,
+\begin{equation}
+  \tilde{\bm{t}}_c = \sum_{j=-2}^{2} \vw_j \had \bm{t}_{c+j} \qquad (\text{zero padding at the chunk edges}),
+\end{equation}
+and a learned square matrix projects the result into a value,
+$\hat\vv_c = \mW_{\mathrm{p}}\T\tilde{\bm{t}}_c$ (here $\mW_{\mathrm{p}}$ denotes the stored weight
+of the module \code{ttt_proj}). Because the kernel reaches two positions ahead, $\hat\vv_c$ can
+contain information about tokens $c+1$ and $c+2$, the tokens the model is about to predict.
+This is how the target is ``aligned with next-token prediction'': the memory learns to associate
+the current activation with what comes \emph{next}, not with a reconstruction of the present.
+(The paper derives this objective from a theoretical argument about next-token prediction;
+here we describe it as the code implements it.)
+
+\paragraph{The update.} For chunk $[i]$ the change of the fast weight is
+\begin{equation}\label{eq:c09-inplace-update}
+  \Delta\mW_{[i]} = \eta \sum_{c\in[i]} \hat\vv_c\,\vh_c\T \in \R^{d\times d_{\text{ff}}},
+\end{equation}
+and chunk $[i]$ is processed with the weight accumulated from all \emph{earlier} chunks,
+\begin{equation}\label{eq:c09-inplace-weight}
+  \mW^{(i)} = \mW_{\text{down}}^{(0)} + \sum_{j<i}\Delta\mW_{[j]}, \qquad
+  \vy_c = \mW^{(i)}\vh_c \quad (c \in [i]).
+\end{equation}
+Equation \eqref{eq:c09-inplace-update} is one gradient-descent step with rate $\eta$ on the
+dot-product loss $\ell_{[i]}(\mW) = -\sum_{c\in[i]}\inner{\hat\vv_c}{\mW\vh_c}$
+(\cref{prop:c09-family}, item 1, with key $\vh_c$ and value $\hat\vv_c$). Two consequences
+follow from the loss being \emph{linear} in $\mW$:
+\begin{itemize}
+  \item The gradient does not depend on the current weights, so all chunk updates can be
+        computed independently, and \eqref{eq:c09-inplace-weight} is an exclusive prefix sum
+        (a \code{cumsum} over chunks). Training needs no sequential loop.
+  \item Substituting \eqref{eq:c09-inplace-update} into \eqref{eq:c09-inplace-weight},
+\begin{equation}\label{eq:c09-inplace-la}
+  \vy_c = \mW_{\text{down}}^{(0)}\vh_c \;+\; \eta\!\!\sum_{c' \in \text{chunks before } [i]}\!\!
+          \hat\vv_{c'}\,\big(\vh_{c'}\T\vh_c\big).
+\end{equation}
+        The In-Place TTT MLP is the original MLP plus a \emph{block-causal linear attention}
+        whose queries and keys are the MLP's hidden activations $\vh$ (dimension
+        $d_{\text{ff}}$) and whose values are the projected look-ahead targets $\hat\vv$.
+\end{itemize}
+Equation \eqref{eq:c09-inplace-la} anticipates the general result of \cref{sec:c09-tttla}. It
+also explains the state size: the ``KV state'' of this linear attention is a
+$d\times d_{\text{ff}}$ matrix, exactly the size of the down-projection being updated.
+
+\paragraph{Starting from a pre-trained model.} The convolution is initialized to zero, so at the
+start of continual training $\tilde{\bm{t}}_c = \bm{0}$, every $\Delta\mW_{[i]} = \bm{0}$, and the
+model computes exactly what the pre-trained model computed. Test-time training is then switched
+on gradually as the outer loop learns the convolution and the projection.
+
+\paragraph{Causality.} Within a chunk the convolution looks two tokens ahead, which would leak
+the future if a token could read its own chunk's update. It cannot: by
+\eqref{eq:c09-inplace-weight}, chunk $[i]$'s update only affects chunks after $[i]$. Our NumPy
+check perturbs one token in chunk 2 and confirms that no earlier position of chunk 2 changes.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{In-Place TTT MLP: training and prefill (parallel form).}
+\label{alg:c09-inplace}
+\begin{algorithmic}[1]
+\Require MLP inputs $\mX\in\R^{T\times d}$; targets $\mT\in\R^{T\times d}$; chunk size $C$; rate $\eta$
+\State $\mH \gets \SiLU(\mX\mW_{\text{gate}}\T)\had(\mX\mW_{\text{up}}\T)$; pad $T$ to a multiple of $C$ and split into $n$ chunks
+\State $\tilde\mT_{[i]} \gets \operatorname{DWConv}_5(\mT_{[i]})$ for every chunk \Comment{zero padding inside each chunk}
+\State $\hat\mV_{[i]} \gets \tilde\mT_{[i]}\mW_{\mathrm{p}}$; $\ \Delta\mW_{[i]} \gets \eta\,\hat\mV_{[i]}\T\mH_{[i]}$ for all $i$ \Comment{in parallel}
+\State $\mW^{(i)} \gets \mW_{\text{down}} + \sum_{j<i}\Delta\mW_{[j]}$ \Comment{exclusive prefix sum}
+\State $\mY_{[i]} \gets \mH_{[i]}\mW^{(i)\top}$ for all $i$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{In-Place TTT MLP: decoding one token.}
+\label{alg:c09-inplace-decode}
+\begin{algorithmic}[1]
+\Require cache $(\mH_{\text{buf}}, \mT_{\text{buf}}, \mW)$ of the current incomplete chunk and the current fast weight; new token's $\vh$, $\bm{t}$
+\State append $\vh, \bm{t}$ to the buffers
+\If{the buffer holds fewer than $C$ tokens}
+  \State \Return $\vy = \mW\vh$ \Comment{no update yet}
+\Else
+  \State $\vy \gets \mW\vh$; $\ \mW \gets \mW + \eta\,\hat\mV_{\text{buf}}\T\mH_{\text{buf}}$; clear the buffers \Comment{\eqref{eq:c09-inplace-update}}
+  \State \Return $\vy$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Per TTT layer and chunk, the update \eqref{eq:c09-inplace-update} costs
+$\bigO(C\, d\, d_{\text{ff}})$ (plus $\bigO(C d^2)$ for the projection), the same order as the
+MLP's own down-projection on the chunk, so the overhead is a small constant factor on the TTT
+layers only. The training form materializes one $d\times d_{\text{ff}}$ weight per chunk,
+$\bigO(n\, d\, d_{\text{ff}})$ memory per TTT layer for $n$ chunks (manageable because chunks are
+large, 4096 tokens in the recommended configs). At decoding time the extra state is one weight
+matrix per TTT layer plus a buffer of at most $C$ tokens; the per-token cost is unchanged
+except at chunk boundaries, when one rank-$C$ update is applied. Attention is untouched, so the
+KV cache still grows with the context; In-Place TTT adds memory, it does not replace attention.
+
+\subsection{Implementation walkthrough: \texttt{ByteDance-Seed/In-Place-TTT} (official)}
+
+The repository \repo{ByteDance-Seed__In-Place-TTT} modifies the Hugging Face Qwen3 and Llama
+model files in two versions: \repofile{hf_models/} for training (with VeOmni and FSDP2) and
+\repofile{inference_model/} for TTT-aware generation and RULER evaluation. Every TTT change is
+marked with a \texttt{\# TTT:} comment.
+
+\begin{implnote}[title={In the code: the TTT MLP (training version)}]
+In \repofile{hf_models/hf_qwen3/modeling_qwen3.py}, \code{Qwen3MLP} receives the layer index,
+and for layers listed in \code{config.ttt_layers} creates \code{ttt_proj}
+(\texttt{nn.Linear(hidden\_size, hidden\_size, bias=False)}, if \code{ttt_proj} is set),
+\code{ttt_conv} (\texttt{nn.Conv1d(hidden\_size, hidden\_size, kernel\_size=5, padding=2,
+groups=hidden\_size, bias=False)}, i.e.\ depthwise) and reads \code{ttt_lr} and \code{ttt_chunk}.
+\code{padding} pads the sequence to a multiple of \code{ttt_chunk} and reshapes
+\texttt{"b (t c) d -> b t c d"}. The forward pass is shown below. Shapes: \code{h} is
+\texttt{[b, T, d\_ff]}, \code{t} is \texttt{[b, T, d]}, \code{d_down_proj} is
+\texttt{[b, n, d, d\_ff]}. The \code{contract} (opt\_einsum) with pattern
+\texttt{"b t c h, b t c d, d e -> b t e h"} is \eqref{eq:c09-inplace-update} with the projection
+folded in; \texttt{h\_padded[:, :-1]} drops the last chunk, whose update would never be used;
+the initial weight is concatenated in front and \code{cumsum(dim=1)} produces all
+$\mW^{(i)}$ of \eqref{eq:c09-inplace-weight} at once.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}ByteDance-Seed\_\_In-Place-TTT/\allowbreak{}hf\_models/\allowbreak{}hf\_qwen3/\allowbreak{}modeling\_qwen3.py} (\texttt{Qwen3MLP.forward})},label={lst:c09-inplace-code}]
+    def forward(self, x, t: Optional[torch.Tensor] = None):  # TTT: added t param
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        # TTT: branch on whether this is a TTT layer with target states
+        if t is None or not hasattr(self, "ttt_conv"):
+            return self.down_proj(h)
+        # TTT path
+        t = self.padding(t)
+        h_padded = self.padding(h)
+        bs, chunk_num, chunk_size, _ = t.shape
+        t = (
+            self.ttt_conv(t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+            .transpose(-1, -2)
+            .reshape(bs, chunk_num, chunk_size, -1)
+        )
+        if self.ttt_proj is not None:
+            d_down_proj = contract(
+                "b t c h, b t c d, d e -> b t e h",
+                h_padded[:, :-1], t[:, :-1], self.ttt_proj.weight,
+            )
+        else:
+            d_down_proj = contract(
+                "b t c h, b t c d -> b t d h",
+                h_padded[:, :-1], t[:, :-1],
+            )
+        d_down_proj = torch.cat(
+            [repeat(self.down_proj.weight, "d h -> b 1 d h", b=bs), d_down_proj * self.ttt_lr],
+            dim=1,
+        )
+        d_down_proj_sum = d_down_proj.cumsum(dim=1)
+        down_proj = contract("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
+        return rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: targets, initialization, decoding, configs}]
+\textbf{Targets.} \code{Qwen3DecoderLayer.forward} sets \texttt{target\_states = hidden\_states}
+(the post-attention, normalized MLP input) for TTT layers unless the model passes token
+embeddings because \texttt{ttt\_target == "input\_embed"} (\code{_resolve_ttt_target_states}).
+
+\textbf{Initialization.} \code{_init_weights} zero-initializes every \code{nn.Conv1d} (the
+comment says ``TTT conv: zero init'') and gives every square \code{nn.Linear}, i.e.\
+\code{ttt_proj}, a random diagonal with standard deviation \code{initializer_range}; all other
+weights come from the pre-trained checkpoint.
+
+\textbf{Decoding.} \repofile{inference_model/hf_qwen3/modeling_qwen3.py} adds
+\code{TTTDynamicCache}, a Hugging Face \code{DynamicCache} with one extra tuple
+\texttt{(past\_h, past\_t, past\_w)} per layer: the activations and targets of the current
+incomplete chunk and the current fast weight. The inference \code{Qwen3MLP.forward} loops over
+chunks, first computing \texttt{contract("d h, c h -> c d", current\_w, current\_h)} and then adding
+the chunk's update, which is \cref{alg:c09-inplace-decode}; when fewer than \code{ttt_chunk}
+tokens are buffered it only applies the current weight. The loop indexes batch element 0, so
+it assumes batch size 1 (the evaluation config in \repofile{eval_config/models.py} uses
+\code{batch_size=1}).
+
+\textbf{Configs.} The recommended configs \repofile{configs/pretrain/qwen3_longct.yaml} and
+\repofile{configs/pretrain/llama3_longct.yaml} differ only in one training flag (\code{dyn_bsz}). Both use
+\texttt{ttt\_layers: [0, 6, 12, 18, 24, 30, 36]}, \texttt{ttt\_proj: true}, \texttt{ttt\_lr: 3},
+\texttt{ttt\_chunk: 4096}, and continual pre-training on sequences of up to \code{65536} tokens
+with AdamW, learning rate \code{5.0e-6} (cosine schedule, 2\% warm-up), weight decay 0.1,
+global batch 64, for 5000 steps. (Qwen3-8B has 36 decoder layers and Llama-3.1-8B has 32, so
+index 36 matches no layer; in effect every sixth layer from 0 to 30 is a TTT layer.) The
+defaults in \repofile{hf_models/hf_qwen3/configuration_qwen3.py} are more conservative,
+\code{ttt_lr=0.3} and \code{ttt_chunk=8192}. The training script builds the optimizer over the
+whole model, so all weights, not only the new TTT modules, are fine-tuned during continual
+training. Evaluation is RULER through OpenCompass, with configs from 4K to 128K plus 256K
+(\repofile{eval_config/ruler_*.py}).
+\end{implnote}
+
+\subsection{From-scratch reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): In-Place TTT MLP, parallel form.},label={lst:c09-inplace}]
+import torch
+import torch.nn.functional as F
+
+def inplace_ttt_mlp(x, t, Wg, Wu, Wd, Wp, conv_w, eta, C):
+    """x: [T, d] MLP input; t: [T, d] target states; Wg, Wu: [dff, d];
+    Wd: [d, dff] pre-trained down_proj (initial fast weight); Wp: [d, d]
+    (stored weight of ttt_proj); conv_w: [d, 1, 5] depthwise kernel."""
+    T, d = x.shape
+    h = F.silu(x @ Wg.T) * (x @ Wu.T)                   # [T, dff]
+    n = -(-T // C); pad = n * C - T
+    h = F.pad(h, (0, 0, 0, pad)).view(n, C, -1)          # [n, C, dff]
+    t = F.pad(t, (0, 0, 0, pad)).view(n, C, d)
+    # depthwise conv inside each chunk: mixes t_{c-2} .. t_{c+2} (looks ahead)
+    tc = F.conv1d(t.transpose(1, 2), conv_w, padding=2, groups=d).transpose(1, 2)
+    vhat = tc @ Wp                                       # [n, C, d] value targets
+    dW = eta * torch.einsum("ncd,nch->ndh", vhat, h)     # sum_c vhat_c h_c^T per chunk
+    W = Wd + torch.cumsum(dW, 0) - dW                    # exclusive prefix sum: W^(i)
+    y = torch.einsum("ndh,nch->ncd", W, h)               # chunk i reads W^(i)
+    return y.reshape(n * C, d)[:T]
+\end{lstlisting}
+
+Our NumPy check (a transcription of \cref{lst:c09-inplace} and an independent re-implementation
+of the repository's formula, with $T$ not a multiple of $C$) finds three computations equal to
+$10^{-15}$--$10^{-12}$: the prefix-sum form, the decoding-style loop of
+\cref{alg:c09-inplace-decode}, and the linear-attention form \eqref{eq:c09-inplace-la}. It also
+confirms that a zero convolution gives back the plain MLP and that the update equals minus the
+gradient of the dot-product loss (finite differences, $10^{-12}$).
+
+\begin{results}
+\textbf{Source file:} \repofile{repos/ByteDance-Seed__In-Place-TTT/README.md}. The README gives
+no benchmark numbers. It states that the method is a drop-in TTT method for Transformer LLMs,
+provides recommended configs for Qwen3-8B and Llama-3.1-8B, and an evaluation pipeline for
+RULER from 4K to 128K plus a 256K config; it reports the paper's acceptance at ICLR 2026 as an
+oral. The survey (\S IV-A) describes the method qualitatively. See the paper for results.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} In-Place TTT is the cheapest way in this chapter to add a test-time memory
+to an existing LLM: a few TTT layers, two small new modules, zero-initialized so nothing breaks
+at the start of continual training, and a closed-form, parallel update. It shows the survey's
+point that explicit memory can be a \emph{role} assigned to an existing matrix rather than a new
+component.
+
+\textbf{Limitations.} The update has no forgetting and no error correction: like linear
+attention it only adds, so with very long inputs $\mW^{(i)}$ keeps drifting away from the
+pre-trained weights, and interference accumulates (\cref{ex:c09-delta}). The memory changes
+only every 4096 tokens, so information within the current chunk is available only through
+attention. And because the loss is linear in $\mW$, the analysis of \cref{sec:c09-tttla} applies
+in full: In-Place TTT is exactly a linear attention with keys and queries in the MLP's hidden
+space \eqref{eq:c09-inplace-la}.
+
+\textbf{Relations.} Compared with TTT-E2E, both update MLP weights of an otherwise ordinary
+Transformer, but TTT-E2E pays for a true next-token gradient through several blocks, while
+In-Place TTT replaces it with a one-matrix, closed-form step aligned to next-token prediction
+by the look-ahead convolution. The view of MLPs as key--value memories, used here at test time,
+appears in offline form in \cref{ch:lookup} (MemoryLLM, PlugLM).
+
+% ===========================================================================
+\section{GDWM: deciding where to spend test-time gradient steps}\label{sec:c09-gdwm}
+
+\subsection{Motivation}
+
+Every system so far writes \emph{uniformly}: each chunk gets the same number of inner steps
+(usually one), however much it matters. \citet{mei2026gdwm} point out that this wastes
+computation. In a long document most tokens are predictable from their local neighbourhood;
+only some regions carry information whose use depends on long-range context. Their method,
+\emph{Gated Differentiable Working Memory} (GDWM), treats test-time adaptation as a
+\emph{budget-constrained memory consolidation} problem: given a fixed budget of gradient steps,
+which parts of the context should be consolidated into the fast weights? The survey describes
+it as adding ``another layer of control by gating test-time updates according to contextual
+utility, so that memory writes are concentrated on chunks that are likely to improve
+long-context prediction'', and stresses why such write controllers matter: the main difficulty
+of online explicit memory is ``not only how to store information, but also how to decide which
+observations are worth committing'' (\S IV-A(c)).
+
+No code has been released for GDWM (the mirror has none, see \cref{app:code}). This section
+therefore explains the method from the survey and from the paper's public abstract, and then
+gives \emph{our own} formalization, clearly marked, so that the idea can be implemented and
+reasoned about. The paper's exact parameterization may differ.
+
+\begin{taxonomy}
+\textbf{Representation:} explicit (test-time-updated parameters acting as working memory).
+\textbf{Update dynamics:} online. \textbf{Persistence:} long-term in Table I.
+\textbf{Update rule:} signal-gated writing in Table II, together with Titans, AMOR and HAM:
+``a surprise, uncertainty, prediction-error, or utility signal controls whether a memory
+write \dots\ is activated'', with the listed risks ``calibration, threshold sensitivity, and
+delayed relevance''. The survey also describes GDWM as signal-gated control on top of
+optimization-based writing (\S IV-A(e)) \citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{What the authors describe}
+
+According to the paper's abstract, GDWM introduces a \emph{write controller} that gates the
+consolidation process. The controller estimates \emph{contextual utility}, an
+information-theoretic measure of how much each region of the context depends on long-range
+context, and allocates gradient steps accordingly, subject to a \emph{coverage constraint} that
+keeps the representation global. The abstract motivates this by two problems of uniform write
+policies: they waste computation on low-value regions, and they suffer from high gradient
+variance across semantically heterogeneous contexts. Secondary descriptions of the paper (which
+we could not check against the full text) add that utility is grounded in surprisal, comparing
+a token's log-probability given the full context with its log-probability given only a local
+window; that gradient updates are taken on chunks, which reduces variance; and that the coverage
+constraint keeps the writes from collapsing onto a single high-utility region. We use these as
+the basis of the formalization below.
+
+\subsection{Formulation (ours)}
+
+\emph{One way to formalize this is the following; the paper's exact parameterization may
+differ.}
+
+\paragraph{Working memory.} Let $\mW$ be the fast weights: any parameter subset of the language
+model chosen for test-time updates (for example low-rank adapters on some projections, or the
+prime MLPs of TTT-E2E). The context $x_{1:T}$ is split into chunks $[1],\dots,[N]$. A write to
+chunk $j$ is one gradient step on that chunk's next-token loss,
+\begin{equation}
+  \mW \gets \mW - \eta\,\nabla_{\mW}\loss_{[j]}(\mW), \qquad
+  \loss_{[j]}(\mW) = -\frac{1}{\abs{[j]}}\sum_{t\in[j]}\log p_{\mW}(x_t \mid x_{<t}).
+\end{equation}
+
+\paragraph{Contextual utility.} Let $\log p(x_t\mid x_{<t})$ be the model's log-probability with
+the full context and $\log p(x_t\mid x_{t-n:t-1})$ the same model restricted to a local window
+of $n$ tokens. Define
+\begin{equation}\label{eq:c09-utility}
+  u_t = \abs{\log p(x_t\mid x_{<t}) - \log p(x_t\mid x_{t-n:t-1})}, \qquad
+  U_j = \frac{1}{\abs{[j]}}\sum_{t\in[j]}u_t .
+\end{equation}
+If a token is equally predictable with or without the distant past, $u_t \approx 0$: writing it
+to memory adds nothing that local attention cannot recover. If it is unpredictable locally but
+predictable globally (or the reverse), the token sits on a long-range dependency, and its chunk
+is a good candidate for consolidation. This is a cousin of Titans' surprise, but it measures
+\emph{dependence on distant context}, not merely unpredictability, so random noise (unpredictable
+with or without context) gets low utility.
+
+\paragraph{Allocation under a budget and a coverage constraint.} With a budget of $B$ gradient
+steps, choose integers $n_j$ (steps for chunk $j$) by
+\begin{equation}\label{eq:c09-alloc}
+  n_j \approx n_{\min} + (B - N n_{\min})\,\frac{e^{U_j/\tau}}{\sum_{j'}e^{U_{j'}/\tau}}, \qquad
+  \sum_j n_j = B, \qquad n_{\min} \le n_j \le n_{\max}.
+\end{equation}
+The temperature $\tau$ sets how greedy the controller is. The floor $n_{\min}$ and the cap
+$n_{\max}$ implement coverage: no region is ignored entirely (if $n_{\min} \ge 1$) and no single
+region can absorb the whole budget. Rounding to integers is done by largest remainder, and the
+cap by water-filling: give capped chunks $n_{\max}$ and redistribute the rest.
+
+\paragraph{Order of writes.} The chunks are then written in their natural order with $n_j$ steps
+each (a chunk with $n_j = 0$ is skipped). Writing in order keeps the memory causal if it is used
+while generating the continuation, and it matches the sequential nature of consolidation.
+
+\subsection{Algorithm and complexity (ours)}
+
+\begin{algorithm}[t]
+\caption{A GDWM-style write controller (our formalization).}
+\label{alg:c09-gdwm}
+\begin{algorithmic}[1]
+\Require context $x_{1:T}$ split into chunks $[1..N]$; fast weights $\mW$; budget $B$; window $n$; $\tau$, $n_{\min}$, $n_{\max}$, $\eta$
+\State $\log p(x_t\mid x_{<t})$ for all $t$ \Comment{one full-context forward pass}
+\State $\log p(x_t\mid x_{t-n:t-1})$ for all $t$ \Comment{one forward pass with a local attention mask}
+\State $U_j \gets$ mean of $\abs{\text{difference}}$ over chunk $j$ \Comment{\eqref{eq:c09-utility}}
+\State $(n_1,\dots,n_N) \gets \Call{Allocate}{U, B, n_{\min}, n_{\max}, \tau}$ \Comment{\eqref{eq:c09-alloc}}
+\For{$j = 1,\dots,N$}
+  \For{$r = 1,\dots,n_j$}
+    \State $\mW \gets \mW - \eta\nabla_{\mW}\loss_{[j]}(\mW)$ \Comment{forward + backward over the context needed by chunk $j$}
+  \EndFor
+\EndFor
+\State answer the query with the adapted weights $\mW$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Estimating utility costs two forward passes over the context. Each
+write costs a forward and a backward pass over the tokens of one chunk (plus whatever context
+its attention needs), so the total adaptation cost is about $B$ chunk-level training steps,
+compared with $N\cdot s$ for a uniform policy with $s$ steps per chunk. The controller pays off
+when $B$ can be much smaller than $N s$ at equal quality, which is what the paper claims for
+information-sparse tasks. The fast-weight state is whatever parameter subset is adapted; it does
+not grow with $T$.
+
+\subsection{From-scratch reference implementation (ours)}
+
+\begin{lstlisting}[caption={Reference implementation (ours): a GDWM-style write controller. Not the authors' code.},label={lst:c09-gdwm}]
+import torch
+
+def contextual_utility(lp_full, lp_local, C):
+    """lp_full[t] = log p(x_t | x_<t); lp_local[t] = log p(x_t | last n tokens).
+    Returns U_j, the mean |difference| over each chunk of C tokens."""
+    return (lp_full - lp_local).abs().view(-1, C).mean(dim=1)
+
+def allocate_steps(U, B, n_min, n_max, tau=1.0):
+    """Integer steps per chunk: sum = B, n_min <= n_j <= n_max, more for high U."""
+    N = U.numel()
+    assert N * n_min <= B <= N * n_max
+    n = torch.full((N,), float(n_min))
+    w = torch.softmax(U / tau, dim=0)
+    rem, free = B - n.sum(), torch.ones(N, dtype=torch.bool)
+    while rem > 1e-9:                                   # water-filling with a cap
+        share = rem * w * free / (w * free).sum()
+        take = torch.minimum(share, n_max - n)
+        n, rem = n + take, rem - take.sum()
+        free &= (n_max - n) > 1e-9
+    base = n.floor().long()
+    short = B - int(base.sum())                         # largest-remainder rounding
+    base[torch.argsort(n - base, descending=True)[:short]] += 1
+    return base
+
+def gdwm_write(chunk_loss, fast_params, steps, eta):
+    """chunk_loss(j) -> next-token loss of chunk j (uses fast_params).
+    Writes the chunks in order, spending steps[j] gradient steps on chunk j."""
+    for j, n_j in enumerate(steps.tolist()):
+        for _ in range(n_j):
+            g = torch.autograd.grad(chunk_loss(j), fast_params)
+            with torch.no_grad():
+                for p, gp in zip(fast_params, g):
+                    p -= eta * gp
+\end{lstlisting}
+
+A NumPy transcription of \code{allocate_steps} passes 1000 random trials (random numbers of
+chunks, floors, caps, budgets and temperatures): the steps always sum to $B$ and respect the
+floor and the cap. On a toy utility profile in which one chunk of eight has tokens that are
+very unlikely under the local window only, the chunk utilities are
+$(0.78, 0.77, 0.77, 0.67, 0.53, 3.91, 0.68, 0.87)$ and the allocation with $B = 16$,
+$n_{\min} = 1$, $n_{\max} = 5$, $\tau = 0.5$ is $(2,2,2,1,1,5,1,2)$: the dependent chunk gets
+the cap, and every chunk still gets at least one step.
+
+\begin{results}
+\textbf{Source files:} no repository exists; survey PDF in \repofile{papers/} (\S IV-A, Tables
+I--II). The survey gives no numbers for GDWM. Qualitatively, the paper's abstract reports that
+GDWM matches or exceeds uniform write policies while using several times fewer gradient steps,
+with the clearest gains on tasks where the relevant information is sparse in a long document,
+and it notes trade-offs on tasks that need dense coverage. See the paper for the numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} GDWM separates two questions every online memory must answer: \emph{how} to
+write (here, gradient steps) and \emph{whether and how much} to write (the controller). The
+utility signal targets long-range dependence specifically, which is exactly what a memory
+beyond the attention window is for.
+
+\textbf{Limitations.} Utility estimation needs extra forward passes, and the full-context pass
+presupposes that the model can already attend to the whole context once, so the method is a way
+to make adaptation cheaper and better targeted, not a way to read contexts longer than the
+model can process. Like every signal-gated rule, it depends on calibration: a region whose
+importance only becomes clear later (the survey's ``delayed relevance'') can be under-written.
+Unlike Titans, TTT-E2E and In-Place TTT, the controller as we formalized it is not trained
+through the inner loop; whether the paper meta-learns any part of it is not stated in the
+material we could access.
+
+\textbf{Relations.} The same ``spend high-resolution memory only where it is needed'' principle
+appears in AMOR and HAM (\cref{ch:routing}), which gate attention or KV-cache admission with
+entropy or prediction error instead of gating gradient steps. Titans' surprise
+(\cref{sec:c09-titans}) is a per-token, built-in version of a write gate.
+
+% ===========================================================================
+\section{TTT with KV binding is secretly linear attention}\label{sec:c09-tttla}
+
+\subsection{Motivation}
+
+Test-time training layers are usually explained as \emph{memorization}: the inner loop fits a
+key-to-value map, and the query retrieves from it. \citet{liu2026tttla} test this explanation
+and find, according to their README, ``multiple phenomena that contradict this
+memorization-based interpretation''. They then show that ``a broad class of TTT architectures
+can be expressed as a form of learned linear attention operator'', which explains the
+phenomena, allows architectural simplifications and fully parallel implementations, and
+reduces diverse TTT variants to a standard linear-attention form. This is an analysis paper,
+not a new memory system; we include it because it changes how the rest of the chapter should
+be read, and because the survey uses it to draw the boundary of explicit memory.
+
+\begin{taxonomy}
+The survey does not place this paper in Table I (it is an analysis). It uses it in \S IV-A(c):
+the analysis ``does not invalidate the memory interpretation of TTT-style modules, but it
+suggests that only variants with a clearly designated, autonomously updated storage substrate
+should be treated as explicit memory in the main taxonomy''. In our reading of the taxonomy, a
+TTT layer that reduces exactly to linear attention behaves like the \emph{implicit},
+online, long-term recurrent memories of \S III-C, and its update rule, nominally
+optimization-based writing, is in fact a state-transition update \citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation: unrolling the inner loop}
+
+\paragraph{Setting.} Consider a TTT layer whose inner model ends with a linear, bias-free layer,
+\begin{equation}
+  f(\vx; \mW, \Theta) = \mW\,\phi(\vx;\Theta), \qquad \mW\in\R^{d_v\times d_h},
+\end{equation}
+where $\phi(\cdot;\Theta)\in\R^{d_h}$ is everything before the last layer (for LaCT, the SwiGLU
+features $\phi(\vx) = \SiLU(\mW_0\vx)\had(\mW_2\vx)$). The inner loss of token $s$ is any
+differentiable $L(f(\vk_s), \vv_s)$, weighted by a learning rate $\eta_s$, and the updates are
+chunked with ``apply, then update'': chunk $[i]$ is read with the weights produced by chunks
+$[1],\dots,[i-1]$, and then contributes its own gradient step, computed at those weights.
+
+\paragraph{The key fact.} By the chain rule, the gradient with respect to a linear layer is an
+outer product of the error signal at its output and its input:
+\begin{equation}
+  \nabla_{\mW}L(f(\vk_s),\vv_s) = \vg_s\,\phi(\vk_s;\Theta)\T, \qquad
+  \vg_s = \frac{\partial L}{\partial\hat\vv}\Big|_{\hat\vv = f(\vk_s)} \in \R^{d_v}.
+\end{equation}
+(We used this for the delta rule in \eqref{eq:c09-lin-grad} and for the MLP memory in
+\eqref{eq:c09-mlp-grad}.) Let $\mW_{[j]}, \Theta_{[j]}$ be the inner parameters at the start of
+chunk $j$, $\phi_{[j]} = \phi(\cdot;\Theta_{[j]})$, and $j(s)$ the chunk of token $s$.
+
+\begin{proposition}[Unrolled TTT is a linear-attention-like operator]\label{prop:c09-tttla}
+Under plain gradient descent on the inner loss, the output for a query $\vq_t$ in chunk $[i]$ is
+\begin{equation}\label{eq:c09-tttla}
+  \vo_t = \mW_{[1]}\,\phi_{[i]}(\vq_t) \;+\; \sum_{s:\ j(s) < i}
+     \underbrace{(-\eta_s\vg_s)}_{\text{value}}\;
+     \underbrace{\phi_{[j(s)]}(\vk_s)\T}_{\text{key feature}}\;
+     \underbrace{\phi_{[i]}(\vq_t)}_{\text{query feature}} .
+\end{equation}
+\end{proposition}
+\begin{proof}
+The last-layer weights evolve as $\mW_{[j+1]} = \mW_{[j]} - \sum_{s\in[j]}\eta_s\vg_s\phi_{[j]}(\vk_s)\T$,
+because every gradient of chunk $j$ is taken at the chunk-start parameters. Unrolling,
+$\mW_{[i]} = \mW_{[1]} - \sum_{s: j(s)<i}\eta_s\vg_s\phi_{[j(s)]}(\vk_s)\T$. The output is
+$\vo_t = \mW_{[i]}\phi_{[i]}(\vq_t)$; substitute and distribute.
+\end{proof}
+
+Equation \eqref{eq:c09-tttla} has the shape of linear attention with a feature map: a sum over
+past tokens of a value times the inner product of a key feature and a query feature. The fact
+that a linear layer trained by gradient descent is, in its ``dual form'', an attention over its
+training inputs is older \citep{c09-irie2022dual}; the paper's contribution is to apply it
+systematically to TTT layers and to draw the consequences. Its Theorem~5.1 (``linearization of
+inner-loop updates'') states the general result for inner models with a linear, bias-free final
+layer, including multi-layer inner models; we give the elementary version above, and the paper
+should be consulted for the exact statement. How close \eqref{eq:c09-tttla} is to \emph{standard}
+linear attention depends on two things:
+\begin{itemize}
+  \item \textbf{Are the values state-independent?} With the dot-product loss
+        $L = -\inner{\hat\vv}{\vv}$ we have $\vg_s = -\vv_s$, so the value is $\eta_s\vv_s$,
+        a function of the token only. With the squared loss, $\vg_s = \mW_{[j(s)]}\phi(\vk_s) -
+        \vv_s$ depends on the state: the layer is a (block) delta rule, as in
+        \cref{sec:c09-linear-case}.
+  \item \textbf{Is the feature map fixed?} If only the last layer is trained at test time,
+        $\phi_{[j]} = \phi$ for all $j$, and keys and queries use the same learned feature map.
+        If the earlier layers are also trained, keys are featurized with the map of their own
+        chunk and queries with the current one: a \emph{history-dependent} feature map.
+\end{itemize}
+
+\begin{corollary}[Exact linear attention]\label{cor:c09-exact}
+If only the last layer is updated, the inner loss is the dot product, and the optimizer is
+plain SGD, then
+\begin{equation}\label{eq:c09-tttla-exact}
+  \vo_t = \mW_{[1]}\phi(\vq_t) + \sum_{s:\ j(s)<i}\eta_s\,\vv_s\,\phi(\vk_s)\T\phi(\vq_t),
+\end{equation}
+which is block-causal linear attention with feature map $\phi$, plus a learned ``bias'' term
+$\mW_{[1]}\phi(\vq_t)$. In particular every chunk's update can be computed independently, and
+the whole layer is computed in parallel with a prefix sum over chunks.
+\end{corollary}
+
+\paragraph{Momentum, learning rates, normalization, orthogonalization.} The other parts of
+practical TTT inner loops fall on either side of the exact identity.
+\begin{itemize}
+  \item \emph{Per-token learning rates} are scalars that multiply the values (or the keys).
+  \item \emph{Momentum} with per-chunk coefficients $m_i$,
+        $\mathbf{D}_i = m_i\mathbf{D}_{i-1} + \mathbf{G}_i$ and $\mW_{[i+1]} = \mW_{[i]} + \mathbf{D}_i$,
+        gives $\mW_{[i]} = \mW_{[1]} + \sum_{j<i}c_{ij}\mathbf{G}_j$ with
+        $c_{ij} = \sum_{l=j}^{i-1}\prod_{r=j+1}^{l}m_r$: still linear attention, with a
+        chunk-pair weighting like the decay masks of \cref{ch:linear}. In closed form,
+        $\mathbf{D}_i = P_i\sum_{j\le i}\mathbf{G}_j/P_j$ with $P_i = \prod_{l\le i}m_l$, which is
+        how the parallel code computes it.
+  \item \emph{Weight normalization} (LaCT rescales each row of $\mW$ back to its initial norm
+        after every update) and \emph{Muon-style orthogonalization} (each update replaced by
+        the orthogonal factor of its polar decomposition, approximated by Newton--Schulz
+        iterations) are nonlinear in the accumulated updates. They break the exact identity;
+        the paper's progressive reduction removes them one at a time.
+\end{itemize}
+
+\paragraph{The phenomena, explained.} Three observations that are puzzling for a memorization
+story become natural in the linear-attention reading.
+\begin{enumerate}
+  \item \emph{Gradient ascent works.} Public descriptions of the paper report that replacing
+        inner gradient descent by gradient \emph{ascent}, which makes the key--value fit worse,
+        preserves and sometimes improves task performance. In \eqref{eq:c09-tttla-exact},
+        ascent replaces $\vv_s$ by $-\vv_s$, and the slow value projection $\mW_V$ can learn
+        $-\mW_V$: the two models are the same function class. (For the full model, whose inner
+        layers are also updated, the equivalence is not exact, but the same absorption argument
+        applies to the dominant last-layer term.)
+  \item \emph{The query need not look like a key.} Retrieval from a memory requires queries to
+        come from the same distribution as the keys; a feature mixer does not. The repositories
+        test a ``no query'' variant that reuses the key in place of the query.
+  \item \emph{A better inner fit is not a better model.} The inner loss is a means of producing
+        $\vv_s\phi(\vk_s)\T$ terms, not an end; public summaries of the paper report that
+        improving the inner loop does not guarantee better downstream performance.
+\end{enumerate}
+
+\subsection{Algorithm and complexity}
+
+\begin{algorithm}[t]
+\caption{TTT layer with a linear last layer and dot-product loss, computed in parallel.}
+\label{alg:c09-tttla}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK\in\R^{T\times d_k}$, $\mV\in\R^{T\times d_v}$, rates $\bm{\eta}$; feature map $\phi$; initial last layer $\mW_{[1]}$; chunk size $C$
+\State $\mathbf{F}_q \gets \phi(\mQ)$, $\mathbf{F}_k \gets \diag(\bm{\eta})\,\phi(\mK)$ \Comment{in parallel over tokens}
+\State $\Delta_j \gets \mV_{[j]}\T\mathbf{F}_{k,[j]}$ for all chunks $j$ \Comment{independent: no state dependence}
+\State $\mW_{[i]} \gets \mW_{[1]} + \sum_{j<i}\Delta_j$ for all $i$ \Comment{exclusive prefix sum (or a scan with momentum)}
+\State $\mO_{[i]} \gets \mathbf{F}_{q,[i]}\mW_{[i]}\T$ for all $i$
+\end{algorithmic}
+\end{algorithm}
+
+Compared with the sequential inner loop, which alternates ``apply'' and ``update'' chunk by
+chunk, \cref{alg:c09-tttla} has no loop-carried dependency other than a prefix sum of
+$d_v\times d_h$ matrices, so all chunks run concurrently. The cost is $\bigO(T d_h d_v)$ for the
+updates and outputs plus the feature map; the state is one $d_v\times d_h$ matrix per head, as
+in any linear attention. The quadratic form \eqref{eq:c09-tttla-exact} (an attention matrix with
+a block-causal mask) costs $\bigO(T^2 d_h)$ and is useful only for checking.
+
+\subsection{Implementation walkthrough: \texttt{tttla}, \texttt{LaCT}, \texttt{ViTTT} (official)}
+
+\begin{implnote}[title={In the code: where the experiments live}]
+\repo{nv-tlabs__tttla} contains only a README with the abstract and links to the experiment
+code in two forks: \repo{JunchenLiu77__LaCT} (language models in \repofile{lact_llm/}, novel
+view synthesis in \repofile{lact_nvs/}), built on LaCT \citep{c09-zhang2025lact}, and
+\repo{JunchenLiu77__ViTTT} (image classification), built on ViT$^3$ \citep{c09-han2025vit3}.
+(The README links a \code{tttla} branch that no longer exists; the mirrored \code{main} branches
+hold the code, see \repofile{repos/MANIFEST.md}.)
+\end{implnote}
+
+\begin{implnote}[title={In the code: the LaCT language-model layer}]
+\repofile{lact_llm/lact_model/layer_lact_swiglu.py} defines a hybrid layer: one shared QKV
+projection feeds both sliding-window attention (FlashAttention with \code{window_size}, 2048 in
+the configs) and a TTT branch (whose queries and keys get a learned per-channel scale and
+offset, \code{_rescale_qk}), and the two outputs are summed before \code{o_proj}. The TTT
+branch has \code{num_lact_heads} (4) heads of size $d/4$; the fast weights are \code{w0},
+\code{w2} (\texttt{[heads, d\_h, d\_in]}, parameterized in the configs as a rank-32 product plus $0.5\,\mI$,
+\code{LowRankFastWeight}) and \code{w1}
+(\texttt{[heads, d\_out, d\_h]}), with $f(\vx) = \mW_1(\SiLU(\mW_0\vx)\had(\mW_2\vx))$. Fast queries
+and keys go through SiLU, per-head $\ell_2$ normalization and RoPE. Per-token learning rates are
+\texttt{softplus(lr\_proj(x) + inv\_softplus(0.001))}, three per head (one per fast matrix);
+momentum, if used, is \code{sigmoid(momentum_proj(x))}. The TTT output is RMS-normalized per head
+and scaled by a learned gate. The chunk size is \texttt{lact\_chunk\_size = 2048}.
+
+The inner loop is selected by \code{ttt_loss_type} in \repofile{lact_llm/lact_model/_ttt_operation_impl/__init__.py}
+(the substrings \code{_no_wn} and \code{_no_lr1} switch off weight normalization and learned
+learning rates). The base loop in \code{original.py} is ``apply, then update'': for each chunk it
+computes the output with the current $\mW_0,\mW_1,\mW_2$, then hand-written backward formulas
+for the dot-product loss (\texttt{dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i)...)} and
+similar for \code{dw0}, \code{dw2} through \code{silu_backprop}), optional momentum, optional
+Muon (\code{zeropower_via_newtonschulz5}), the step \texttt{w1 = w1 + dw1} (descent on the
+negative dot product), and row-norm restoration. The last chunk is only read, never written.
+\end{implnote}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.6cm} >{\raggedright\arraybackslash}p{5.0cm} >{\raggedright\arraybackslash}X@{}}
+\toprule
+Variant & \texttt{ttt\_\allowbreak{}loss\_\allowbreak{}type} (LLM) & Change (from \repofile{lact_llm/README.md}) \\
+\midrule
+Base (LaCT) & \texttt{dot\_\allowbreak{}product} & SwiGLU inner model, Muon, updates \texttt{w0}, \texttt{w1}, \texttt{w2} \\
+GA & \texttt{ga\_\allowbreak{}dot\_\allowbreak{}product} & gradient ascent instead of descent \\
+No query & \texttt{no\_\allowbreak{}query\_\allowbreak{}dot\_\allowbreak{}product} & query replaced by key in the output \\
+1 & \texttt{only\_\allowbreak{}w1} & update only the final layer \texttt{w1} \\
+2 & \texttt{only\_\allowbreak{}w1\_\allowbreak{}no\_\allowbreak{}wn} & also remove weight normalization \\
+2 parallel & \texttt{only\_\allowbreak{}w1\_\allowbreak{}no\_\allowbreak{}wn\_\allowbreak{}parallel} & parallel (prefix-sum) form of variant 2 \\
+3 & \texttt{only\_\allowbreak{}w1\_\allowbreak{}straight\_\allowbreak{}qk\_\allowbreak{}no\_\allowbreak{}wn} & single linear layer instead of the MLP \\
+4 & \texttt{only\_\allowbreak{}w1\_\allowbreak{}straight\_\allowbreak{}qk\_\allowbreak{}no\_\allowbreak{}lr1\_\allowbreak{}no\_\allowbreak{}wn} & remove per-token learning rates \\
+5 & as 4, \texttt{use\_\allowbreak{}momentum=false} & remove momentum \\
+6 & as 4, also \texttt{use\_\allowbreak{}muon=false} & remove orthogonalization: standard linear attention \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The parallel variant is the code version of \cref{cor:c09-exact} and \cref{alg:c09-tttla}. The
+excerpt below starts after the per-chunk updates \code{dw1} (\texttt{[b, n\_blocks, dv, dh]}) have
+been computed for all chunks with one batched matrix product; it applies momentum by the
+cumulative-product trick, optional Muon per chunk, and the exclusive prefix sum
+\texttt{cumsum(dw1) - dw1}.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}JunchenLiu77\_\_LaCT/\allowbreak{}lact\_llm/\allowbreak{}lact\_model/\allowbreak{}\_ttt\_operation\_impl/\allowbreak{}only\_w1\_no\_wn\_parallel.py}},label={lst:c09-lact-parallel}]
+    # 5. Momentum Recurrence
+    if momentum is not None:
+        m_pad = F.pad(momentum, (0, 0, 0, pad)) if pad > 0 else momentum
+        m_blk = m_pad.view(b, n_blocks, chunk_size).mean(dim=2, keepdim=True)
+        # Parallel scan via cumprod/cumsum
+        m_prod = m_blk.cumprod(dim=1).unsqueeze(-1)
+        dw1 = m_prod * torch.cumsum(dw1 / (m_prod + 1e-8), dim=1)
+
+    if use_muon:
+        # Use single flattened call for Muon
+        dw1 = zeropower_via_newtonschulz5(dw1.reshape(-1, dv, dh)).reshape_as(dw1)
+
+    # 6. Prefix-sum for w1
+    prefix_exclusive = torch.cumsum(dw1, dim=1) - dw1
+    w1_before = prefix_exclusive + w1.unsqueeze(1)
+
+    # 7. Final Output Projection
+    z_q = torch.bmm(w02_exp, q_flat.transpose(1, 2))
+    gate_q, hidden_q = z_q.chunk(2, dim=1)
+    gated_q = F.silu(gate_q) * hidden_q
+
+    # [b*n, dv, dh] @ [b*n, dh, c] -> [b*n, dv, c]
+    # Cast w1_before to input dtype before bmm to keep output in bf16
+    out = torch.bmm(w1_before.view(b * n_blocks, dv, dh).type_as(gated_q), gated_q)
+\end{lstlisting}
+
+\begin{pitfall}[title={Pitfall: the cumulative-product trick}]
+\texttt{m\_prod * torch.cumsum(dw1 / (m\_prod + 1e-8), dim=1)} divides by $P_i = \prod_{l\le i}m_l$,
+which decays geometrically when the momentum coefficients are below 1. Over many chunks $P_i$
+can underflow and the division amplifies rounding error. With the 2048-token chunks used here
+the number of chunks is small, which is presumably why the simple form suffices; for long
+sequences, compute the scan in log space or with a numerically stable parallel scan.
+\end{pitfall}
+
+\begin{implnote}[title={In the code: the vision version (ViTTT)}]
+\repofile{vittt/models/ttt_block.py} is non-causal: one inner gradient step over all $N$ image
+tokens, then the updated inner model is applied to all queries. Two inner modules run in
+parallel: a ``simplified SwiGLU'' $\vx \mapsto (\vx\mW_1)\had\SiLU(\vx\mW_2)$ and a $3\times3$
+depthwise convolution. Because the inner loss is per head and per sample, the code writes the
+backward pass by hand. In the excerpt, \code{e} is the derivative of the dot-product loss with
+respect to the inner output, the gradients are outer products as in \eqref{eq:c09-mlp-grad}, and
+for the GA variant the sign of the gradient is simply flipped. Each gradient is then normalized,
+\texttt{g1 / (g1.norm(dim=-2, keepdim=True) + 1.0)}, unless \code{no_muon} is in the loss type
+(variant 6), and the step is \texttt{w1 - lr * g1}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}JunchenLiu77\_\_ViTTT/\allowbreak{}vittt/\allowbreak{}models/\allowbreak{}ttt\_block.py} (\texttt{TTT.inner\_train\_simplified\_swiglu})},label={lst:c09-vittt}]
+        if self.loss_type in ["dot_product", "no_query_dot_product", "ga_dot_product"]:
+            # --- Forward ---
+            z1 = k @ w1
+            z2 = k @ w2
+            sig = F.sigmoid(z2)
+            a = z2 * sig
+            # v_hat = a
+            # l = (v_hat * v).sum(dim=3).mean(dim=2) * self.scale
+            # Notably, v_hat and l are not computed here because
+            # they are unnecessary for deriving the gradient expression below.
+            # We directly compute e = dl/dv_hat for the backward pass.
+
+            # --- Backward ---
+            e = - v / float(v.shape[2]) * self.scale
+            g1 = k.transpose(-2, -1) @ (e * a)
+            g2 = k.transpose(-2, -1) @ (e * z1 * (sig * (1.0 + z2 * (1.0 - sig))))
+            if "ga" in self.loss_type:
+                g1 = -g1
+                g2 = -g2
+\end{lstlisting}
+
+\subsection{From-scratch reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): a TTT layer that updates only its last linear layer with the dot-product loss, computed as linear attention.},label={lst:c09-tttla}]
+import torch
+import torch.nn.functional as F
+
+def phi(x, W0, W2):                        # SwiGLU feature map of the inner MLP
+    return F.silu(x @ W0.T) * (x @ W2.T)
+
+def ttt_as_linear_attention(q, k, v, lr, W0, W1, W2, C):
+    """Quadratic form: o_t = W1 phi(q_t) + sum_{s in earlier chunks} lr_s v_s phi(k_s).phi(q_t)."""
+    fq, fk = phi(q, W0, W2), phi(k, W0, W2) * lr[:, None]
+    chunk = torch.arange(q.shape[0]) // C
+    A = (fq @ fk.T) * (chunk[:, None] > chunk[None, :])   # block-causal mask
+    return fq @ W1.T + A @ v
+
+def ttt_as_prefix_sum(q, k, v, lr, W0, W1, W2, C):
+    """Same outputs in O(T): per-chunk updates + exclusive prefix sum (T % C == 0)."""
+    n = q.shape[0] // C
+    fq = phi(q, W0, W2).view(n, C, -1)
+    fk = (phi(k, W0, W2) * lr[:, None]).view(n, C, -1)
+    dW = torch.einsum("ncv,nch->nvh", v.view(n, C, -1), fk)  # GD on -lr <W1 phi(k), v>
+    W = W1 + torch.cumsum(dW, 0) - dW                         # W1 before chunk i
+    return torch.einsum("nvh,nch->ncv", W, fq).reshape(n * C, -1)
+\end{lstlisting}
+
+We checked the equivalence numerically. A NumPy model of the LaCT inner loop with a SwiGLU
+feature map, chunk size 8, per-token learning rates and per-chunk momentum, run sequentially as
+in \code{only_w1.py} (no weight norm, no Muon), agrees with the parallel prefix-sum form of
+\code{only_w1_no_wn_parallel.py} to $7\times10^{-15}$ and with the explicit linear-attention form
+(including the momentum coefficients $c_{ij}$) to $10^{-14}$. Gradient ascent with values $\vv$
+gives exactly the same outputs as gradient descent with values $-\vv$. With the squared loss and
+$\phi = $ identity, the inner loop equals the block delta rule
+$\mS \gets \mS(\mI - \sum_s\eta_s\vk_s\vk_s\T) + \sum_s\eta_s\vv_s\vk_s\T$ (difference
+$5\times10^{-16}$). Transcriptions of both functions in \cref{lst:c09-tttla} match a sequential
+inner loop to $2\times10^{-14}$.
+
+\begin{results}
+\textbf{Source files:} \repofile{repos/nv-tlabs__tttla/README.md},
+\repofile{repos/JunchenLiu77__LaCT/lact_llm/README.md},
+\repofile{repos/JunchenLiu77__ViTTT/vittt/README.md}.
+\begin{itemize}
+  \item The LaCT LLM README describes the parallel form of variant 2 as a ``prefix-sum'' form
+        with ``up to 4x throughput'' (its Sec.~6.2).
+  \item The ViTTT README lists the accuracies of the ViT$^3$ \emph{baseline} models that the
+        image-classification experiments build on (ImageNet top-1 at $224^2$): ViT$^3$-T 76.5
+        (6M parameters), ViT$^3$-S 81.6 (24M), ViT$^3$-B 82.6 (90M). These are ViT$^3$'s numbers,
+        not results of the TTTLA variants.
+  \item Qualitatively, the TTTLA abstract (in the README) states that the linear-attention view
+        explains previously puzzling behaviors, enables principled simplifications, and admits
+        fully parallel formulations that preserve performance while improving efficiency. See the
+        paper for the per-variant numbers.
+\end{itemize}
+\end{results}
+
+\subsection{Discussion: which TTT layers are explicit memory?}
+
+The analysis does not say that TTT layers are useless or that they are ``only'' linear
+attention: a learned feature map, a history-dependent feature map, momentum and normalizations
+are real extensions. What it says is that the \emph{mechanism} by which a KV-binding TTT layer
+carries information forward is the same as that of linear attention: a sum of value-times-key
+outer products queried by an inner product. Applying \cref{prop:c09-tttla} to the systems of this
+chapter:
+\begin{itemize}
+  \item \textbf{In-Place TTT} satisfies \cref{cor:c09-exact} exactly, with $\phi(\vx) = \vh$ (the
+        MLP's hidden activation) and look-ahead values \eqref{eq:c09-inplace-la}.
+  \item \textbf{Titans} uses the squared loss (state-dependent values: a delta rule), momentum
+        and decay (chunk-pair weights), and a deep memory whose earlier layers are also trained
+        (a history-dependent feature map). It is a delta-rule-type layer with a learned,
+        evolving feature map.
+  \item \textbf{TTT-E2E}'s fast weights are SwiGLU MLPs whose last layer is linear, so the same
+        identity holds for that layer, but its ``values'' are next-token-loss gradients
+        backpropagated through the rest of the network, which depend on the whole state. It is
+        the farthest from a fixed key--value binding, and it is not a KV-binding TTT layer.
+\end{itemize}
+The survey's conclusion follows naturally. What makes a TTT module an explicit memory is not
+that its write is phrased as a gradient step (a linear-attention update can always be phrased
+that way) but that it has a \emph{designated storage substrate with autonomous write semantics}:
+a module or parameter subset whose role is to store, with its own update policy (surprise,
+forgetting, utility gating). By that criterion Titans, TTT-E2E, In-Place TTT and GDWM remain in
+\S IV-A, while a minimal TTT-Linear layer with a dot-product loss is, functionally, one of the
+recurrent memories of \cref{ch:linear,ch:delta}.
+
+% ===========================================================================
+\section{Comparison and discussion}\label{sec:c09-comparison}
+
+\Cref{tab:c09-compare} compares the chapter's systems along the dimensions that matter for an
+implementation: what is written, by which objective, how often, into which parameters, and how
+the computation is parallelized.
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Test-time training systems compared. ``Fast weights'' are the parameters that change
+during inference; $C$ is the update chunk.}
+\label{tab:c09-compare}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{1.55cm} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}p{1.9cm} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+System & What is written & Inner objective & Update granularity & Parameters touched & Parallelism \\
+\midrule
+TTT-Linear / MLP (background) & key$\to$value map of the context & $\frac12\norm{\mathcal{M}(\vk)-\vv}^2$ & mini-batch, small $C$ (16 in \fla) & dedicated linear or MLP inner model per head & dual form inside a chunk; sequential across chunks \\
+Titans & key$\to$value map, surprise-weighted, with forgetting & $\frac12\norm{\mathcal{M}(\vk)-\vv}^2$ with momentum and weight decay & per token (paper), gradients at chunk start & dedicated deep MLP memory (plus momentum buffer) & per-sample gradients in parallel; two linear scans; dual form for linear layers \\
+TTT-E2E & whatever reduces next-token loss on the context & next-token cross-entropy (the task loss) & one SGD step per chunk of 1024 tokens & prime SwiGLU MLPs in the last $L_s$ blocks & prefix in parallel; suffix chunks sequential; second-order outer gradient \\
+In-Place TTT & hidden activation $\to$ look-ahead target & $-\sum\inner{\hat\vv_c}{\mW\vh_c}$ (linear in $\mW$) & one closed-form step per chunk of 4096 & existing MLP down-projection of selected layers & fully parallel: prefix sum over chunks \\
+GDWM & long-range-dependent chunks of the context & next-token loss on selected chunks & $n_j$ steps for chunk $j$, chosen by utility under a budget & a fast-weight subset of the LM (exact choice: see the paper) & sequential steps; utility estimation in parallel \\
+TTT as linear attention (LaCT variants) & value $\times$ key-feature outer products & dot product (or squared) & per chunk of 2048 & last layer of a SwiGLU fast-weight MLP & fully parallel when only the last layer is updated without normalization \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three lessons stand out.
+
+\emph{The objective decides the parallelism.} A loss that is linear in the fast weights (dot
+product: In-Place TTT, LaCT variant 2) gives state-independent updates and a prefix sum. A
+squared loss (TTT layers, Titans) makes the update depend on the state, which forces chunking
+with stale gradients and a dual form. The task loss (TTT-E2E) needs a genuine backward pass
+through several blocks per chunk and a second-order outer gradient.
+
+\emph{The chunk size is a memory-resolution knob.} All systems update at chunk granularity, from
+16 tokens to 4096. Within a chunk, attention (or nothing) must do the remembering. Larger chunks
+are faster and give the update more data, but coarsen the memory; this is why every large-chunk
+system here is paired with sliding-window or full attention.
+
+\emph{Explicit memory is a role, not a structure.} The memory may be a separate module (Titans),
+a slice of the network (TTT-E2E), an existing matrix (In-Place TTT) or a budgeted adaptation
+process (GDWM). What the survey's taxonomy asks of it is a designated substrate and its own
+write policy; \cref{sec:c09-tttla} shows that without the latter, a TTT layer is mathematically
+a linear-attention state.
+
+\begin{summarybox}
+\begin{itemize}
+  \item Test-time training stores context in \emph{fast weights} that are trained by an inner
+        loop during inference; an outer loop trains everything else, including the fast weights'
+        initialization, by differentiating through the inner loop (meta-learning).
+  \item With a linear memory, one SGD step on $-\inner{\mS\vk}{\vv}$ is linear attention, on
+        $\frac12\norm{\mS\vk-\vv}^2$ the delta rule, and with weight decay the gated delta rule.
+        TTT generalizes these with deeper inner models, richer optimizers and other objectives.
+  \item Mini-batch TTT takes all gradients of a chunk at the chunk-start weights; for linear
+        layers the chunk then has an exact matrix (dual) form, and momentum and forgetting only
+        reweight it by a product of decay matrices.
+  \item \textbf{Titans}: deep MLP memory, written by surprise with momentum and forgetting;
+        persistent tokens; MAC, MAG and MAL ways to combine it with attention (code: unofficial).
+  \item \textbf{TTT-E2E}: an SWA Transformer whose last blocks' extra MLPs keep training on
+        next-token loss, chunk by chunk, with a meta-learned initialization (official JAX code).
+  \item \textbf{In-Place TTT}: the MLP down-projection of an existing LLM updated chunk-wise with a
+        closed-form, look-ahead dot-product objective; a prefix sum in training (official code
+        with Qwen3-8B and Llama-3.1-8B configs).
+  \item \textbf{GDWM}: a write controller that spends a budget of gradient steps on chunks with
+        high contextual utility, under a coverage constraint (no public code; our formalization).
+  \item \textbf{TTTLA}: KV-binding TTT with a linear last layer unrolls to linear attention with a
+        learned (possibly history-dependent) feature map; with a dot-product loss and only the
+        last layer updated, exactly, which yields fully parallel forms and explains why gradient
+        ascent works. Only TTT modules with a designated, autonomously updated substrate count as
+        explicit memory.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Forgetting orders]
+Let $\mathcal{M}(\vk;\mS) = \mS\vk$. (a) Show that one SGD step on
+$\frac12\norm{\mS\vk_t-\vv_t}^2 + \frac{\lambda}{2}\norm{\mS}_F^2$ gives
+$\mS_t = \mS_{t-1}(\alpha\mI - \eta\vk_t\vk_t\T) + \eta\vv_t\vk_t\T$ with $\alpha = 1-\eta\lambda$.
+(b) Show that ``decay, then step'' gives $\alpha\mS_{t-1}(\mI - \eta\vk_t\vk_t\T) +
+\eta\vv_t\vk_t\T$. (c) For $\norm{\vk_t}=1$, compare the two updates' effect on the recalled value
+$\mS_t\vk_t$. Which one guarantees $\mS_t\vk_t = \vv_t$ when $\eta = 1$?
+\end{exercise}
+
+\begin{exercise}[The dual form]
+Prove \eqref{eq:c09-dual}: show that with gradients taken at $\mS_{[i]}$, the outputs of chunk $i$
+are $\mQ\mS_{[i]}\T - \operatorname{tril}(\mQ\mK\T)\diag(\bm{\eta})\mathbf{E}$, and derive the
+chunk-end state. Then extend it to a linear memory with per-token forgetting
+$\mS_t = \alpha_t\mS_{t-1} - \eta_t\mathbf{G}_t$ (no momentum) by replacing
+$\operatorname{tril}(\mQ\mK\T)$ with a decay-weighted mask. Check your answer in NumPy against a
+token loop.
+\end{exercise}
+
+\begin{exercise}[Titans' closed form]
+Starting from \eqref{eq:c09-titans-mom}--\eqref{eq:c09-titans-forget} with gradients at the
+chunk start, derive \eqref{eq:c09-titans-closed} and show that $\bm{\Gamma} = \mathbf{A}\mathbf{M}$
+is lower triangular with $\Gamma_{tt} = 1$. Interpret $\Gamma_{ts}$ when all $\alpha_j = 1$: how
+much of the gradient of token $s$ has reached the memory by time $t$? What is the limit for a
+constant $\mu < 1$ and $t - s\to\infty$?
+\end{exercise}
+
+\begin{exercise}[Meta-gradients]
+For $n$ inner SGD steps on a linear memory followed by the outer loss
+$\frac12\norm{\mS_n\vq-\vy}^2$, show that $\partial\loss/\partial\mS_0 =
+\vr\vq\T\mP_n\cdots\mP_1$ with $\mP_s = \mI - \eta_s\vk_s\vk_s\T$. If all keys are orthonormal and
+$\eta_s = 1$, what is the meta-gradient's component along each key, and why does it make sense that
+the initialization receives no gradient in those directions?
+\end{exercise}
+
+\begin{exercise}[In-Place TTT as linear attention]
+(a) Derive \eqref{eq:c09-inplace-la} from \eqref{eq:c09-inplace-update}--\eqref{eq:c09-inplace-weight}.
+(b) For Qwen3-8B-like sizes ($d = 4096$, $d_{\text{ff}} = 12288$, $C = 4096$), compare the FLOPs of
+the update of one chunk with those of the down-projection on the same chunk. (c) Implement
+\cref{alg:c09-inplace-decode} and check that it reproduces \cref{lst:c09-inplace} token by token.
+\end{exercise}
+
+\begin{exercise}[Gradient ascent and the value projection]
+In \cref{cor:c09-exact}, show that replacing descent by ascent is equivalent to replacing $\mW_V$
+by $-\mW_V$. Now let the feature map's parameters $\Theta$ also be trained by the inner loop. Show
+with a one-step example that ascent and descent are no longer equivalent up to a reparameterization
+of $\mW_V$, and identify which terms differ.
+\end{exercise}

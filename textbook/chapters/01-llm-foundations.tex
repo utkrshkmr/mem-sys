@@ -1,3 +1,2122 @@
 \chapter{From Tokens to Next-Token Prediction: The Standard LLM}\label{ch:foundations}
 
-(Chapter in preparation.)
+Every memory architecture in this book is a modification of one baseline: the decoder-only
+Transformer trained to predict the next token \citep{vaswani2017attention}. Before we can
+ask how a model should remember, we need to know precisely what the standard model already
+stores, where it stores it, and what that storage costs. The answer is less obvious than it
+looks. A standard large language model (LLM) has three quite different stores of
+information: its \emph{weights}, written once by training and fixed afterwards; its
+\emph{key--value (KV) cache}, written token by token during inference and discarded when
+the conversation ends; and its \emph{activations}, which exist only for the duration of one
+forward pass. The survey that this book follows calls the second kind \emph{implicit}
+memory, ``a byproduct of the model's forward computation'' \citep{zhoubian2026memory}, and
+almost every system in later chapters is an attempt to make it cheaper, larger, longer-lived
+or more controllable.
+
+This chapter builds the standard model from scratch and derives every piece that later
+chapters rely on. \Cref{sec:c01-lm} turns text into integers and sets up next-token
+prediction, the cross-entropy loss and perplexity. \Cref{sec:c01-transformer} derives the
+decoder-only Transformer block, scaled dot-product attention and its multi-head, multi-query,
+grouped-query and latent variants. \Cref{sec:c01-position} explains how position enters the
+model, with a careful derivation of rotary position embeddings (RoPE).
+\Cref{sec:c01-ffn,sec:c01-moe} cover the feed-forward network, its reading as a key--value
+memory, and mixture-of-experts layers. \Cref{sec:c01-training} describes how the model is
+trained, including the Muon optimizer. \Cref{sec:c01-inference,sec:c01-complexity} derive
+the KV cache from the attention equations and show, with arithmetic on a concrete
+configuration, why long context is first of all a \emph{memory} problem.
+\Cref{sec:c01-hardware} explains the hardware reasons (memory bandwidth, the SRAM/HBM
+hierarchy) and derives FlashAttention and PagedAttention. \Cref{sec:c01-reference} gives a
+complete from-scratch reference implementation, and \cref{sec:c01-where-memory} closes by
+locating every kind of memory in the standard model, which is the starting point of the
+taxonomy in \cref{ch:taxonomy}. Throughout, ``In the code'' boxes show how a production
+training library, AI2's OLMo-core (mirrored at \repo{allenai__OLMo-core}), implements each
+piece.
+
+% ===========================================================================
+\section{Language modeling as next-token prediction}\label{sec:c01-lm}
+% ===========================================================================
+
+A language model is a probability distribution over sequences of discrete symbols. To build
+one we must decide what the symbols are (tokenization), how to factor the distribution
+(autoregression), how to map symbols to vectors and back (embeddings and the output head),
+and how to measure and optimize the fit (cross-entropy and perplexity).
+
+\subsection{Tokenization: from text to integers}\label{sec:c01-tokenization}
+
+Neural networks operate on vectors, so text must first be cut into pieces drawn from a
+finite \emph{vocabulary} $\mathcal{V}$, each identified by an integer in
+$\{1,\dots,\abs{\mathcal{V}}\}$. There are two extreme choices, and both are bad.
+\emph{Word-level} vocabularies need an enormous $\abs{\mathcal{V}}$ to cover names,
+numbers, typos and inflections, and still meet unseen words. \emph{Character-level} (or
+byte-level) vocabularies are tiny and can represent anything, but they make sequences long,
+and we will see in \cref{sec:c01-complexity} that the cost of attention grows quadratically
+with sequence length and the size of the KV cache grows linearly with it. Tokenization is
+therefore the first compression of the context the model will have to remember: a larger
+vocabulary buys shorter sequences.
+
+\paragraph{Byte-pair encoding.} The standard compromise is \emph{byte-pair encoding} (BPE),
+originally a data-compression algorithm \citep{c01-gage1994bpe} adapted to subword
+segmentation by \citet{c01-sennrich2016bpe}. BPE starts from a base alphabet and greedily
+adds the most useful new symbols:
+
+\begin{algorithm}[t]
+\caption{Training a byte-pair-encoding vocabulary.}\label{alg:c01-bpe}
+\begin{algorithmic}[1]
+\Require corpus split into words (pre-tokenized), with counts; base alphabet $\mathcal{A}$; number of merges $n_{\mathrm{merge}}$
+\Ensure ordered merge list $\mathcal{R}$; vocabulary $\mathcal{V} = \mathcal{A} \cup \{\text{merged symbols}\}$
+\State write every word as a sequence of base symbols
+\For{$r = 1, \dots, n_{\mathrm{merge}}$}
+  \State count every adjacent symbol pair $(a, b)$, weighting by word count
+  \State $(a^\star, b^\star) \gets$ the most frequent pair
+  \State replace every occurrence of $a^\star b^\star$ by the new symbol $a^\star b^\star$; append $(a^\star, b^\star)$ to $\mathcal{R}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+To \emph{encode} new text, one splits it into base symbols and applies the learned merges in
+the order they were learned (earlier merges have priority). Decoding is concatenation.
+
+\begin{example}[BPE on a toy corpus]\label{ex:c01-bpe}
+Take the corpus \texttt{low} (5 occurrences), \texttt{lower} (2), \texttt{newest} (6) and
+\texttt{widest} (3), with the letters as base alphabet. The pair counts are weighted by word
+frequency: \texttt{e s} occurs in \texttt{newest} and \texttt{widest}, so it has count
+$6 + 3 = 9$; \texttt{s t} also has count 9; \texttt{w e} has $2 + 6 = 8$; \texttt{l o} and
+\texttt{o w} have 7. Breaking ties by first occurrence, the first six merges are
+\[
+\texttt{e s} \to \texttt{es},\;
+\texttt{es t} \to \texttt{est},\;
+\texttt{l o} \to \texttt{lo},\;
+\texttt{lo w} \to \texttt{low},\;
+\texttt{n e} \to \texttt{ne},\;
+\texttt{ne w} \to \texttt{new},
+\]
+after which the corpus reads \texttt{low}, \texttt{low e r}, \texttt{new est},
+\texttt{w i d est}. Six merges have shrunk the four word types from $3+5+6+6 = 20$ symbols
+to $1+3+2+4 = 10$; weighted by frequency, the corpus goes from 79 tokens to 35. The unseen
+word \texttt{lowest} would now be encoded as \texttt{low est}: two tokens, both
+meaningful.
+\end{example}
+
+\paragraph{Byte-level BPE.} If the base alphabet is the 256 possible byte values, every
+string in every language and encoding can be represented, so there is never an
+``unknown'' token. This is byte-level BPE, popularized by GPT-2 \citep{c01-radford2019gpt2}.
+In practice the text is first \emph{pre-tokenized} with a regular expression that splits
+on whitespace, punctuation and digits, so that merges never cross word boundaries, and a
+handful of \emph{special tokens} (for example an end-of-document marker) are added. The
+final vocabulary is
+$\abs{\mathcal{V}} = 256 + n_{\mathrm{merge}} + n_{\mathrm{special}}$. Unigram language-model
+tokenizers such as those in SentencePiece \citep{c01-kudo2018sentencepiece} are a
+common alternative; for this book only the result matters: a text becomes a sequence of
+integers $x_1, \dots, x_T$ with $x_t \in \{1, \dots, \abs{\mathcal{V}}\}$.
+
+\paragraph{Notation.} We write the integer token at position $t$ as $x_t$ (plain) and its
+$d$-dimensional vector representation as $\vx_t$ (bold). Stacking the vectors as rows gives
+$\mX \in \R^{T \times d}$.
+
+\subsection{The autoregressive factorization}\label{sec:c01-factorization}
+
+By the chain rule of probability, \emph{any} joint distribution over a sequence factorizes
+into a product of conditionals:
+\begin{equation}\label{eq:c01-chain-rule}
+  p(x_1, x_2, \dots, x_T)
+  = p(x_1)\, p(x_2 \mid x_1)\, p(x_3 \mid x_1, x_2) \cdots
+  = \prod_{t=1}^{T} p(x_t \mid x_{<t}),
+\end{equation}
+where $x_{<t} = (x_1, \dots, x_{t-1})$ and $x_{<1}$ is empty (in practice a
+beginning-of-sequence token). No approximation is involved: \eqref{eq:c01-chain-rule} is an
+identity. The modeling decision is to represent every conditional with one neural network
+$p_{\vtheta}(x_t \mid x_{<t})$ that reads a prefix of any length and outputs a distribution
+over $\mathcal{V}$. This is \emph{next-token prediction}. It has two consequences that shape
+the whole book.
+\begin{enumerate}
+  \item \textbf{Generation is sequential.} To sample a text we draw $x_1$, then $x_2$
+  given $x_1$, and so on (\cref{sec:c01-inference}). At step $t$ the model must have access
+  to everything relevant in $x_{<t}$. Whatever it keeps about the prefix is, by definition,
+  its memory of the context.
+  \item \textbf{Training is parallel.} With a \emph{causal} architecture, in which the
+  representation at position $t$ depends only on positions $\le t$, one forward pass over
+  $x_1, \dots, x_T$ yields all $T$ conditionals at once. This is what makes Transformers
+  efficient to train, and it is the property that recurrent alternatives must work hard to
+  recover (\cref{ch:linear}).
+\end{enumerate}
+
+\subsection{Embeddings and the output head}\label{sec:c01-embeddings}
+
+\paragraph{Input embedding.} Let $\ve_i \in \R^{\abs{\mathcal{V}}}$ be the $i$-th standard
+basis (one-hot) vector and $\mW_E \in \R^{\abs{\mathcal{V}} \times d}$ a learned
+\emph{embedding matrix}. The input vector of token $x_t$ is row $x_t$ of $\mW_E$:
+\begin{equation}\label{eq:c01-embedding}
+  \vx_t = \mW_E\T \ve_{x_t} \in \R^{d}.
+\end{equation}
+The matrix product is never formed; it is a table lookup. Its gradient is sparse: only
+the rows of tokens that occur in the batch receive a gradient. We will meet the same
+``lookup instead of multiply'' pattern again when we study hashed $n$-gram tables in
+\cref{ch:lookup}.
+
+\paragraph{Output head and softmax.} After the network has processed the prefix, it
+produces a final hidden vector $\vh_t \in \R^{d}$. A linear \emph{output head} (also called
+the language-modeling head or unembedding) $\mW_U \in \R^{d \times \abs{\mathcal{V}}}$
+maps it to one real score per vocabulary item, the \emph{logits}
+\begin{equation}\label{eq:c01-logits}
+  \vz_t = \mW_U\T \vh_t \in \R^{\abs{\mathcal{V}}},
+\end{equation}
+and the softmax turns logits into probabilities:
+\begin{equation}\label{eq:c01-softmax}
+  p_{\vtheta}(x_{t+1} = i \mid x_{\le t})
+  = \softmax(\vz_t)_i
+  = \frac{\exp(z_{t,i})}{\sum_{j=1}^{\abs{\mathcal{V}}} \exp(z_{t,j})}.
+\end{equation}
+Note the index shift: the hidden state at position $t$ predicts token $t+1$.
+
+\paragraph{Weight tying.} The logit $z_{t,i}$ is an inner product between $\vh_t$ and the
+$i$-th column of $\mW_U$, so the columns of $\mW_U$ are ``output embeddings''. A natural
+choice is to reuse the input embeddings, $\mW_U = \mW_E\T$, so that
+$z_{t,i} = \inner{\vh_t}{\mW_E\T\ve_i}$ measures the similarity of the hidden state to the
+embedding of token $i$. This \emph{tied} head \citep{c01-press2017tying} saves
+$\abs{\mathcal{V}}\,d$ parameters, which is a large fraction of a small model. Its gradient
+receives two contributions, one through the input lookup and one through the output head
+(\cref{ex:c01-ce-gradient}).
+
+\begin{implnote}[title={In the code: embeddings and the tied head in OLMo-core}]
+\code{Transformer} in \repofile{repos/allenai__OLMo-core/src/olmo_core/nn/transformer/model.py}
+holds \texttt{self.embeddings = nn.Embedding(vocab\_size, d\_model)} and an \code{LMHead}
+(\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/lm_head.py}) whose
+\texttt{w\_out = nn.Linear(d\_model, vocab\_size)} is preceded by an optional final norm. Tying
+is a constructor flag, \code{tie_word_embeddings} (default \code{False}); when set, the
+head simply aliases the embedding tensor:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak transformer/\allowbreak model.py}},label={lst:c01-olmo-tie}]
+    def _tie_weights(self) -> None:
+        if self.embeddings is None or self.lm_head is None:
+            raise OLMoConfigurationError(
+                "Cannot tie word embeddings without both embeddings and an LM head"
+            )
+        if self.lm_head.w_out.bias is not None:
+            raise OLMoConfigurationError("Cannot tie word embeddings when the LM head uses a bias")
+        self.lm_head.w_out.weight = self.embeddings.weight
+\end{lstlisting}
+\code{nn.Linear} stores its weight as \texttt{(out\_features, in\_features)}
+$= (\abs{\mathcal{V}}, d)$, the same shape as the embedding table, which is why the
+assignment needs no transpose. \code{LMHead.forward} also accepts
+\code{logits_to_keep}: during generation only the last position's logits are needed, and
+computing $\abs{\mathcal{V}}$ logits for every prompt position would waste time and memory.
+\end{implnote}
+
+\subsection{Cross-entropy loss and perplexity}\label{sec:c01-loss}
+
+\paragraph{Maximum likelihood.} Training maximizes the log-likelihood of the data under
+\eqref{eq:c01-chain-rule}, or equivalently minimizes the average negative log-likelihood per
+token,
+\begin{equation}\label{eq:c01-ce}
+  \loss(\vtheta)
+  = -\frac{1}{T}\sum_{t=1}^{T} \log p_{\vtheta}(x_t \mid x_{<t})
+  = \frac{1}{T}\sum_{t=1}^{T}\Bigl( -z_{t-1,x_t} + \log \sum_{j} \exp(z_{t-1,j}) \Bigr).
+\end{equation}
+Each term is the \emph{cross-entropy} between the one-hot target $\ve_{x_t}$ and the model's
+predicted distribution. In code this is a ``shift by one'': logits at positions
+$1, \dots, T-1$ are compared with tokens at positions $2, \dots, T$. Taking expectations over
+the data distribution $p^\star$ shows what is being optimized:
+\[
+  \E_{x \sim p^\star}\bigl[-\log p_{\vtheta}(x)\bigr]
+  = \underbrace{\E_{x\sim p^\star}\bigl[-\log p^\star(x)\bigr]}_{\text{entropy } H(p^\star)}
+  + \underbrace{\E_{x\sim p^\star}\Bigl[\log \tfrac{p^\star(x)}{p_{\vtheta}(x)}\Bigr]}_{\mathrm{KL}(p^\star \,\|\, p_{\vtheta}) \,\ge\, 0},
+\]
+so minimizing cross-entropy minimizes the Kullback--Leibler divergence to the data, and the
+loss can never go below the entropy of the data.
+
+\paragraph{The gradient with respect to the logits.} Write one term of \eqref{eq:c01-ce} as
+$\ell(\vz) = -z_y + \log\sum_j \exp(z_j)$ for target $y$. Differentiating,
+\begin{equation}\label{eq:c01-ce-grad}
+  \frac{\partial \ell}{\partial z_i}
+  = -\mathbf{1}[i = y] + \frac{\exp(z_i)}{\sum_j \exp(z_j)}
+  = p_i - \mathbf{1}[i = y],
+  \qquad\text{i.e.}\qquad
+  \nabla_{\vz}\ell = \bm{p} - \ve_y .
+\end{equation}
+The gradient is ``prediction minus target''. It is bounded (every entry lies in $[-1, 1]$)
+and vanishes only when the model puts all its mass on the correct token. We checked
+\eqref{eq:c01-ce-grad} against finite differences in NumPy.
+
+\paragraph{Perplexity.} The \emph{perplexity} is the exponential of the average
+negative log-likelihood,
+\begin{equation}\label{eq:c01-ppl}
+  \mathrm{PPL} = \exp\bigl(\loss\bigr)
+  = \Bigl(\prod_{t=1}^{T} p_{\vtheta}(x_t \mid x_{<t})\Bigr)^{-1/T}.
+\end{equation}
+It is the inverse geometric mean of the probabilities assigned to the correct tokens. Its
+interpretation is an effective branching factor: a model that is uniform over $k$ equally
+likely candidates at every step has $\loss = \log k$ and $\mathrm{PPL} = k$. A uniform model
+over the whole vocabulary has $\mathrm{PPL} = \abs{\mathcal{V}}$. Because perplexity is per
+token, it depends on the tokenizer; comparisons across tokenizers use a per-byte or per-word
+normalization instead, for example bits per byte
+$= \loss \cdot T_{\text{tokens}} / (T_{\text{bytes}} \ln 2)$. Perplexity measures how well a
+model uses its context on average; the long-context benchmarks discussed in
+\cref{ch:taxonomy} were designed because a low average perplexity can hide a failure to use
+a specific distant fact.
+
+\begin{implnote}[title={In the code: cross-entropy with z-loss}]
+\code{cross_entropy_loss} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/functional/cross_entropy_loss.py}
+upcasts the logits to float32 (\texttt{logits = logits.float()}) before calling
+\code{F.cross_entropy}, and optionally adds a \emph{z-loss}
+$\lambda_z (\log\sum_j \exp z_j)^2$ (default multiplier \code{1e-4} in the function
+signature). The z-loss pushes the softmax normalizer towards $1$, which keeps logits in a
+numerically safe range in low precision. A fused variant,
+\code{fused_linear_cross_entropy_loss}, combines the output projection and the loss so that
+the $(N, \abs{\mathcal{V}})$ logits tensor is never materialized; for a large vocabulary
+that tensor is one of the largest activations in the whole model.
+\end{implnote}
+
+% ===========================================================================
+\section{The decoder-only Transformer}\label{sec:c01-transformer}
+% ===========================================================================
+
+The network that computes $p_{\vtheta}(x_{t+1}\mid x_{\le t})$ in every modern LLM is a stack
+of $L$ identical \emph{blocks}, each made of two sublayers: a \emph{sequence mixer} that
+moves information between positions (causal self-attention in the standard model) and a
+\emph{channel mixer} that transforms each position independently (the feed-forward network,
+or a mixture of experts). \Cref{fig:c01-block} shows the layout.
+
+\subsection{The residual stream view}\label{sec:c01-residual}
+
+Let $\vh_t^{(\ell)} \in \R^{d}$ be the vector at position $t$ after block $\ell$, with
+$\vh_t^{(0)} = \vx_t$. A \emph{pre-norm} block computes
+\begin{align}
+  \vu_t^{(\ell)} &= \vh_t^{(\ell-1)}
+     + \mathrm{Attn}^{(\ell)}\bigl(\RMSNorm(\vh_1^{(\ell-1)}), \dots, \RMSNorm(\vh_t^{(\ell-1)})\bigr),
+     \label{eq:c01-block-attn}\\
+  \vh_t^{(\ell)} &= \vu_t^{(\ell)} + \mathrm{FFN}^{(\ell)}\bigl(\RMSNorm(\vu_t^{(\ell)})\bigr),
+     \label{eq:c01-block-ffn}
+\end{align}
+and the logits are $\vz_t = \mW_U\T \RMSNorm(\vh_t^{(L)})$. Two features are essential.
+
+\paragraph{The residual stream.} Every sublayer \emph{adds} its output to its input. Unrolling
+the recursion gives
+\begin{equation}\label{eq:c01-residual-sum}
+  \vh_t^{(L)} = \vx_t + \sum_{\ell=1}^{L}\bigl(\va_t^{(\ell)} + \vm_t^{(\ell)}\bigr),
+\end{equation}
+where $\va_t^{(\ell)}$ and $\vm_t^{(\ell)}$ are the attention and feed-forward outputs of
+block $\ell$. The vectors $\vh_t^{(\ell)}$ therefore form a shared $d$-dimensional
+communication channel, the \emph{residual stream} \citep{c01-elhage2021circuits}: each
+sublayer reads from the stream through a normalization and an input projection and writes
+back through an output projection. Within one forward pass, the residual stream at position
+$t$ is the model's working memory for token $t$; attention is the only operation that lets
+position $t$ read the residual streams of earlier positions. The additive form also helps
+optimization \citep{c01-he2016resnet}: the Jacobian
+$\partial \vh_t^{(L)}/\partial \vh_t^{(\ell)}$ equals the identity plus terms that involve
+sublayer Jacobians, so the gradient of the loss reaches every layer through an
+identity path, whatever the depth. Many memory modules in later chapters (lookup tables in
+\cref{ch:lookup}, memory read-outs in \cref{ch:ttt}) are attached in exactly this way: they
+compute a vector and add it to the residual stream.
+
+\paragraph{Causality.} The FFN and the norms act on one position at a time, and attention at
+position $t$ reads only positions $\le t$. By induction over layers, $\vh_t^{(\ell)}$ depends
+only on $x_1, \dots, x_t$ for every $\ell$. This is the property that makes parallel training
+(\cref{sec:c01-factorization}) and the KV cache (\cref{sec:c01-kv-cache}) possible.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small,
+  box/.style={draw, rounded corners=2pt, minimum height=0.62cm, inner sep=3pt, align=center, fill=white},
+  add/.style={draw, circle, inner sep=0pt, minimum size=4.2mm, fill=white}]
+  \node (in) at (0,-1.1) {token ids $x_1, \dots, x_t$};
+  \node[box] (emb) at (0,0) {embedding lookup $\vx_t = \mW_E\T\ve_{x_t}$};
+  \node[add] (a1) at (0,2.0) {$+$};
+  \node[add] (a2) at (0,4.0) {$+$};
+  \node[box] (n1) at (2.6,1.0) {RMSNorm};
+  \node[box] (att) at (5.3,1.0) {causal multi-head\\self-attention};
+  \node[box] (n2) at (2.6,3.0) {RMSNorm};
+  \node[box] (ffn) at (5.3,3.0) {FFN (SwiGLU)\\or MoE};
+  \node[box] (fn) at (0,5.2) {final RMSNorm};
+  \node[box] (head) at (0,6.3) {output head $\mW_U$ (tied: $\mW_U = \mW_E\T$), softmax};
+  \node (out) at (0,7.4) {$p_{\vtheta}(x_{t+1} \mid x_{\le t})$};
+  \draw[->] (in) -- (emb);
+  \draw[->, very thick, gray!70!black] (emb) -- (a1);
+  \draw[->, very thick, gray!70!black] (a1) -- (a2);
+  \draw[->, very thick, gray!70!black] (a2) -- (fn);
+  \fill (0,1.0) circle (1.5pt);
+  \fill (0,3.0) circle (1.5pt);
+  \draw[->] (0,1.0) -- (n1);
+  \draw[->] (n1) -- (att);
+  \draw[->] (att.north) |- (a1);
+  \draw[->] (0,3.0) -- (n2);
+  \draw[->] (n2) -- (ffn);
+  \draw[->] (ffn.north) |- (a2);
+  \draw[->] (fn) -- (head);
+  \draw[->] (head) -- (out);
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}] (-2.3,4.35) -- (-2.3,0.65)
+     node[midway, left=7pt, align=center] {block\\$\times L$};
+  \node[gray!60!black, font=\scriptsize, rotate=90] at (-0.45,3.0) {residual stream};
+  \node[font=\scriptsize, align=left, anchor=west] at ([xshift=2pt]att.east) {reads $\vk_j, \vv_j$ for $j \le t$\\(the KV cache, \S\ref{sec:c01-kv-cache})};
+\end{tikzpicture}
+\caption{A pre-norm decoder-only Transformer. The thick vertical line is the residual stream
+of one position; each block reads from it through a normalization and adds its output back.
+Only attention mixes information across positions.}
+\label{fig:c01-block}
+\end{figure}
+
+\subsection{Normalization: LayerNorm and RMSNorm}\label{sec:c01-norm}
+
+Without normalization the scale of $\vh^{(\ell)}$ drifts as sublayer outputs accumulate in
+\eqref{eq:c01-residual-sum}, and each sublayer would see inputs of unpredictable magnitude.
+\emph{Layer normalization} \citep{c01-ba2016layernorm} standardizes each vector across its
+$d$ features:
+\begin{equation}\label{eq:c01-layernorm}
+  \LayerNorm(\vh) = \vg \had \frac{\vh - \mu \bm{1}}{\sqrt{\sigma^2 + \epsilon}} + \vb,
+  \qquad
+  \mu = \frac{1}{d}\sum_{i=1}^{d} h_i,\quad
+  \sigma^2 = \frac{1}{d}\sum_{i=1}^{d}(h_i - \mu)^2,
+\end{equation}
+with learned gain $\vg$ and bias $\vb$, and a small $\epsilon$ for numerical safety.
+\emph{RMSNorm} \citep{c01-zhang2019rmsnorm} drops the centring and the bias:
+\begin{equation}\label{eq:c01-rmsnorm}
+  \RMSNorm(\vh) = \vg \had \frac{\vh}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} h_i^2 + \epsilon}} .
+\end{equation}
+RMSNorm is invariant to rescaling ($\RMSNorm(c\vh) = \RMSNorm(\vh)$ for $c > 0$, up to
+$\epsilon$), needs one reduction instead of two, and works as well in practice, so it is the
+default in current LLMs.
+
+\paragraph{Where to put the norm.} The original Transformer normalized \emph{after} the
+residual addition (\emph{post-norm}), computing
+$\vh^{(\ell)} = \LayerNorm\bigl(\vh^{(\ell-1)} + F(\vh^{(\ell-1)})\bigr)$. This places a
+normalization \emph{on} the residual path; the gradient to early layers then passes through
+$L$ normalization Jacobians. \citet{c01-xiong2020prenorm} analyze this and argue that it is
+why post-norm Transformers need a careful learning-rate warmup. \emph{Pre-norm}
+\eqref{eq:c01-block-attn}--\eqref{eq:c01-block-ffn} normalizes only the \emph{input} of each
+sublayer and keeps the identity path clean. A third variant normalizes the sublayer
+\emph{output} instead, $\vh^{(\ell)} = \vh^{(\ell-1)} + \RMSNorm(F(\vh^{(\ell-1)}))$. It
+also keeps the identity path and is the layout used by OLMo~2 \citep{c01-olmo2024olmo2}.
+
+\begin{implnote}[title={In the code: the block and RMSNorm in OLMo-core}]
+\code{TransformerBlock} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/transformer/block.py} (``a typical
+Llama-style transformer block'') is the pre-norm block
+\eqref{eq:c01-block-attn}--\eqref{eq:c01-block-ffn}; \code{ResidualStream} adds the
+(optionally dropped-out) sublayer output to its input:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak transformer/\allowbreak block.py}},label={lst:c01-olmo-block}]
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del loss_div_factor
+        h = self.attention_residual_stream(x, self.attention(self.attention_norm(x), **kwargs))
+        return self.feed_forward_residual_stream(h, self.feed_forward(self.feed_forward_norm(h)))
+\end{lstlisting}
+The attribute is called \code{self.attention} for checkpoint compatibility, but a comment
+notes that it ``could contain any \code{SequenceMixer} implementation, such as a
+\code{GatedDeltaNet}'': the hybrid models of \cref{ch:hybrid} swap this one module. The
+output-norm layout is \code{ReorderedNormTransformerBlock}, whose forward is
+\texttt{h = self.attention\_residual\_stream(x, self.attention\_norm(self.attention(x, **kwargs)))}; the
+\code{olmo2_*} factory methods in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/transformer/config.py} select it.
+RMSNorm (\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/layer_norm.py}) computes in
+float32 regardless of the input type:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak layer\_norm.py}},label={lst:c01-olmo-rmsnorm}]
+        with torch.autocast(enabled=False, device_type=x.device.type):
+            og_dtype = x.dtype
+
+            if self.full_precision:
+                x = x.float()
+
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+
+            if self.weight is not None:
+                if self.bias is not None:
+                    x = self.weight.type_as(x) * x + self.bias.type_as(x)
+                else:
+                    x = self.weight.type_as(x) * x
+
+            return x.to(og_dtype)
+\end{lstlisting}
+\end{implnote}
+
+\subsection{Scaled dot-product attention}\label{sec:c01-attention}
+
+\paragraph{Attention as a soft dictionary lookup.} A Python dictionary stores pairs
+(key, value) and, given a query, returns the value whose key \emph{equals} the query.
+Attention relaxes ``equals'' to ``is similar to'' and returns a weighted average of
+\emph{all} values. For one head, each position $j$ of the (normalized) layer input produces a
+query, a key and a value by learned linear maps,
+\begin{equation}\label{eq:c01-qkv}
+  \vq_j = \mW_Q\T\vx_j \in \R^{d_k},\qquad
+  \vk_j = \mW_K\T\vx_j \in \R^{d_k},\qquad
+  \vv_j = \mW_V\T\vx_j \in \R^{d_v},
+\end{equation}
+with $\mW_Q, \mW_K \in \R^{d \times d_k}$ and $\mW_V \in \R^{d \times d_v}$. (Stacked over
+positions, $\mQ = \mX\mW_Q$, $\mK = \mX\mW_K$, $\mV = \mX\mW_V$.) Position $t$ scores every
+key it is allowed to see, normalizes the scores with a softmax, and averages the values:
+\begin{equation}\label{eq:c01-attn-token}
+  s_{tj} = \frac{\vq_t\T\vk_j}{\sqrt{d_k}},\qquad
+  a_{tj} = \frac{\exp(s_{tj})}{\sum_{j'=1}^{t}\exp(s_{tj'})}\;\;(j \le t),\qquad
+  \vo_t = \sum_{j=1}^{t} a_{tj}\,\vv_j .
+\end{equation}
+The weights $a_{tj}$ are positive and sum to one, so $\vo_t$ is a convex combination of the
+visible values. In matrix form, with the causal mask $\mM \in \R^{T\times T}$,
+$M_{tj} = 0$ for $j \le t$ and $M_{tj} = -\infty$ for $j > t$,
+\begin{equation}\label{eq:c01-attn-matrix}
+  \mO = \softmax\!\Bigl(\frac{\mQ\mK\T}{\sqrt{d_k}} + \mM\Bigr)\mV \in \R^{T \times d_v},
+\end{equation}
+where the softmax acts on each row. Since $\exp(-\infty) = 0$, the mask removes future
+positions exactly, and a single matrix computation produces all $T$ outputs, each of which
+has seen only its prefix. This is how one forward pass gives all $T$ training signals in
+\eqref{eq:c01-ce}. The survey describes this mechanism as ``a differentiable,
+content-addressable transient working memory'' \citep{zhoubian2026memory}: the pairs
+$(\vk_j, \vv_j)$ are what is stored, and the query addresses them by content.
+
+\paragraph{Why divide by $\sqrt{d_k}$.} Suppose, as at initialization, that the entries of
+$\vq$ and $\vk$ are independent with mean $0$ and variance $\sigma^2$. Then
+\[
+  \E[\vq\T\vk] = \sum_{i=1}^{d_k}\E[q_i]\,\E[k_i] = 0,\qquad
+  \mathrm{Var}[\vq\T\vk] = \sum_{i=1}^{d_k}\E[q_i^2]\,\E[k_i^2] = d_k\,\sigma^4,
+\]
+because the $d_k$ products $q_i k_i$ are independent with mean zero. The raw score therefore
+has standard deviation $\sigma^2\sqrt{d_k}$, which grows with the head dimension; dividing
+by $\sqrt{d_k}$ makes the variance $\sigma^4$ whatever $d_k$ is. (A NumPy simulation with
+unit-variance entries gives empirical variances of the unscaled scores within a fraction of
+a percent of $d_k$.) Why does a large spread hurt? The Jacobian of the softmax
+$\va = \softmax(\vs)$ is
+\begin{equation}\label{eq:c01-softmax-jacobian}
+  \frac{\partial \va}{\partial \vs} = \diag(\va) - \va\va\T .
+\end{equation}
+When the scores are spread widely, $\va$ is nearly one-hot, $\va \approx \ve_j$, and then
+$\diag(\ve_j) - \ve_j\ve_j\T = \bm{0}$: the gradient through the attention weights
+vanishes and the head can no longer learn \emph{which} positions to read. The factor
+$1/\sqrt{d_k}$ is a temperature that keeps the softmax in its responsive regime at the start
+of training.
+
+\begin{example}[Attention with $d_k = 2$, $T = 3$]\label{ex:c01-attention}
+Let the keys, values and queries be
+\[
+\mK = \begin{pmatrix} 1 & 0\\ 0 & 1\\ 1 & 1\end{pmatrix},\quad
+\mV = \begin{pmatrix} 1 & 0\\ 0 & 2\\ 3 & 1\end{pmatrix},\quad
+\mQ = \begin{pmatrix} 1 & 0\\ 0 & 2\\ 2 & 0\end{pmatrix},\qquad
+\frac{\mQ\mK\T}{\sqrt{2}} \approx
+\begin{pmatrix} 0.707 & 0 & 0.707\\ 0 & 1.414 & 1.414\\ 1.414 & 0 & 1.414\end{pmatrix}.
+\]
+After masking, row 1 keeps only its first entry, so $\va_1 = (1, 0, 0)$ and $\vo_1 = \vv_1 =
+(1, 0)$. Row 2 compares $0$ with $1.414$: $\va_2 = (1, e^{1.414}, 0)/(1 + e^{1.414}) \approx
+(0.196, 0.804, 0)$ and $\vo_2 \approx (0.196, 1.609)$. Row 3 sees all three keys; $\vq_3 =
+(2, 0)$ matches $\vk_1$ and $\vk_3$ equally, so $\va_3 \approx (0.446, 0.108, 0.446)$ and
+$\vo_3 \approx 0.446\,\vv_1 + 0.108\,\vv_2 + 0.446\,\vv_3 \approx (1.783, 0.663)$. Note that
+the upper-triangular scores ($0$ and $0.707$ in row 1, $1.414$ in row 2) were computed but
+discarded; efficient kernels skip them (\cref{sec:c01-flash}).
+\end{example}
+
+\begin{pitfall}
+The mask must be added \emph{before} the softmax. Multiplying the attention weights by a
+$0/1$ mask after the softmax leaves rows that no longer sum to one and, worse, lets the
+future leak into the normalizer. Masked entries should be $-\infty$ (or the most negative
+finite number of the data type) so that $\exp$ maps them to exactly zero.
+\end{pitfall}
+
+\subsection{Multi-head attention}\label{sec:c01-mha}
+
+A single softmax produces one convex combination per position, but a token often needs
+information from several places at once (say, the subject of a sentence and the most recent
+noun). \emph{Multi-head attention} runs $H$ attention functions in parallel, each with its own
+projections $\mW_Q^{(h)}, \mW_K^{(h)} \in \R^{d \times d_k}$ and $\mW_V^{(h)} \in \R^{d\times
+d_v}$, and combines their outputs with an output projection
+$\mW_O \in \R^{H d_v \times d}$:
+\begin{equation}\label{eq:c01-mha}
+  \mathrm{MHA}(\mX) = \bigl[\mO^{(1)}, \dots, \mO^{(H)}\bigr]\,\mW_O
+  = \sum_{h=1}^{H} \mO^{(h)}\mW_O^{(h)},
+  \qquad
+  \mO^{(h)} = \softmax\!\Bigl(\frac{\mQ^{(h)}\mK^{(h)\T}}{\sqrt{d_k}} + \mM\Bigr)\mV^{(h)},
+\end{equation}
+where $\mW_O^{(h)} \in \R^{d_v \times d}$ is the $h$-th block of rows of $\mW_O$. The usual
+choice $d_k = d_v = d/H$ makes the cost of $H$ heads equal to that of one head of width $d$
+and gives $4d^2$ parameters per attention layer ($\mW_Q, \mW_K, \mW_V$ and $\mW_O$, each
+$d \times d$ overall). The second form of \eqref{eq:c01-mha} shows that each head writes into
+the residual stream independently through its own slice of $\mW_O$.
+
+\subsection{Multi-query and grouped-query attention}\label{sec:c01-gqa}
+
+During generation every key and value of every head must be kept for every past token
+(\cref{sec:c01-kv-cache}); with $H$ heads that is $2Hd_k$ numbers per token per layer.
+\emph{Multi-query attention} (MQA) \citep{c01-shazeer2019mqa} keeps $H$ query heads but a
+single key head and a single value head shared by all of them. \emph{Grouped-query
+attention} (GQA) \citep{c01-ainslie2023gqa} interpolates: $G$ key--value heads, each shared
+by a group of $H/G$ query heads. With heads numbered from $1$, query head $h$ uses key--value
+head
+\begin{equation}\label{eq:c01-gqa-map}
+  g(h) = \bigl\lceil h G / H \bigr\rceil,\qquad
+  \vo_t^{(h)} = \sum_{j \le t}\softmax_j\Bigl(\frac{\vq_t^{(h)\T}\vk_j^{(g(h))}}{\sqrt{d_k}}\Bigr)\vv_j^{(g(h))}.
+\end{equation}
+$G = H$ recovers multi-head attention and $G = 1$ is MQA (\cref{fig:c01-gqa}). The KV storage
+per token per layer drops from $2Hd_k$ to $2Gd_k$, a factor $H/G$, while the number of
+query heads, and hence the number of distinct read patterns, is unchanged. The price is
+expressivity: heads in a group must read through the same keys and values.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  qb/.style={draw, fill=blue!15, minimum size=3.6mm, inner sep=0pt},
+  kvb/.style={draw, fill=orange!30, minimum size=3.6mm, inner sep=0pt}]
+  \foreach \name/\xo/\G in {{multi-head ($G = H = 8$)}/0/8, {grouped-query ($G = 2$)}/4.3/2, {multi-query ($G = 1$)}/8.6/1} {
+    \node at (\xo+1.4, 1.55) {\name};
+    \foreach \h in {0,...,7} {
+      \node[qb] (q\h) at (\xo+0.4*\h, 1.0) {};
+    }
+    \pgfmathtruncatemacro{\gs}{8/\G}
+    \pgfmathtruncatemacro{\Gm}{\G-1}
+    \foreach \g in {0,...,\Gm} {
+      \pgfmathsetmacro{\xk}{\xo + 0.4*(\g*\gs + (\gs-1)/2)}
+      \node[kvb] (k\g) at (\xk, 0) {};
+    }
+    \foreach \h in {0,...,7} {
+      \pgfmathtruncatemacro{\kvi}{floor(\h/\gs)}
+      \draw (q\h.south) -- (k\kvi.north);
+    }
+  }
+  \node[qb, label={right:query head}] at (2.5,-0.75) {};
+  \node[kvb, label={right:key--value head (cached)}] at (5.0,-0.75) {};
+\end{tikzpicture}
+\caption{Multi-head, grouped-query and multi-query attention with $H = 8$ query heads. Each
+orange key--value head is stored in the KV cache; the cache shrinks by the factor $H/G$.}
+\label{fig:c01-gqa}
+\end{figure}
+
+\begin{implnote}[title={In the code: GQA in OLMo-core's \texttt{Attention}}]
+\code{Attention} in \repofile{repos/allenai__OLMo-core/src/olmo_core/nn/attention/__init__.py}
+(``multi-head self-attention with support for multi-query (MQA) and grouped-query (GQA)
+attention'') builds four bias-optional linear maps: \code{w_q} from $d$ to $Hd_k$,
+\code{w_k} and \code{w_v} from $d$ to $Gd_k$ (\code{n_kv_heads} $= G$), and \code{w_out} from
+$Hd_k$ back to $d$, with \code{head_dim} $= d/H$ unless set explicitly. \code{_prepare_qkv}
+reshapes the projections into heads:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak attention/\allowbreak \_\_init\_\_.py}},label={lst:c01-olmo-qkv}]
+        B, T, _ = x.shape
+
+        # shape: (batch_size, seq_len, n_heads * head_dim),
+        #        (batch_size, seq_len, n_kv_heads * head_dim),
+        #        (batch_size, seq_len, n_kv_heads * head_dim)
+        q, k, v = self.w_q(x), self.w_k(x), self.w_v(x)
+        # ...
+        # shape: (batch_size, seq_len, n_heads (local), head_dim)
+        q = q.view(B, T, -1, self.head_dim)
+        # shape: (batch_size, seq_len, n_kv_heads (local), head_dim)
+        k = k.view(B, T, -1, self.head_dim)
+        # shape: (batch_size, seq_len, n_kv_heads (local), head_dim)
+        v = v.view(B, T, -1, self.head_dim)
+\end{lstlisting}
+The elided lines optionally clip and normalize $\vq, \vk$ (``QK-norm''). The layout is
+\emph{sequence-first}, $(B, T, H, d_k)$, the layout flash-attention kernels expect. The
+plain PyTorch backend (\code{TorchAttentionBackend} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/attention/backend.py}) realizes the
+group map \eqref{eq:c01-gqa-map} by expanding the key--value heads before calling
+\code{F.scaled_dot_product_attention} with \code{is_causal=True}:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak attention/\allowbreak backend.py}},label={lst:c01-olmo-repeat}]
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        torch.unsqueeze(x, dim=3)
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+\end{lstlisting}
+With 0-based indices, query head $h$ reads key--value head $\lfloor h/n_{\mathrm{rep}}\rfloor$,
+which is \eqref{eq:c01-gqa-map}. Flash backends take the un-expanded \code{k}, \code{v} and
+share heads inside the kernel, so the expansion never touches memory.
+\end{implnote}
+
+\subsection{Multi-head latent attention}\label{sec:c01-mla}
+
+GQA shrinks the cache by sharing heads. \emph{Multi-head latent attention} (MLA), introduced
+with DeepSeek-V2 \citep{deepseek2024v2}, shrinks it by \emph{low-rank compression}: every
+token stores one small latent vector from which the keys and values of all heads can be
+reconstructed. The survey notes that MLA ``jointly compresses keys and values into latent
+vectors, changing the granularity and efficiency---but not the implicit semantics---of KV
+memory'' \citep{zhoubian2026memory}. Kimi Linear (\cref{ch:delta}) uses MLA for its
+full-attention layers, so we derive it carefully. The equations below follow the DeepSeek-V2
+description in our notation.
+
+\paragraph{Low-rank keys and values.} A down-projection $\mW_{DKV} \in \R^{d\times d_c}$ with
+$d_c \ll H d_k$ produces a latent vector per token, and per-head up-projections
+$\mW_{UK}^{(h)}, \mW_{UV}^{(h)} \in \R^{d_c \times d_k}$ reconstruct keys and values:
+\begin{equation}\label{eq:c01-mla-kv}
+  \bm{c}_t = \mW_{DKV}\T\vx_t \in \R^{d_c},\qquad
+  \vk_t^{(h)} = \mW_{UK}^{(h)\T}\bm{c}_t,\qquad
+  \vv_t^{(h)} = \mW_{UV}^{(h)\T}\bm{c}_t .
+\end{equation}
+Queries are compressed the same way (to save activation memory in training, not cache):
+$\bm{c}^{Q}_t = \mW_{DQ}\T\vx_t \in \R^{d_c'}$, $\vq_t^{(h)} = \mW_{UQ}^{(h)\T}\bm{c}^Q_t$.
+
+\paragraph{Absorption: attention in the latent space.} The point of the construction is that
+the up-projections need never be applied to the cache. The score of head $h$ is
+\begin{equation}\label{eq:c01-mla-absorb}
+  \vq_t^{(h)\T}\vk_j^{(h)}
+  = \bm{c}^{Q\T}_t\,\mW_{UQ}^{(h)}\mW_{UK}^{(h)\T}\,\bm{c}_j
+  = \bigl(\mW_{UK}^{(h)}\vq_t^{(h)}\bigr)\T\bm{c}_j ,
+\end{equation}
+so we can map the \emph{query} into the latent space once,
+$\tilde{\vq}_t^{(h)} = \mW_{UK}^{(h)}\vq_t^{(h)} \in \R^{d_c}$, and score it directly against
+the cached latents $\bm{c}_j$. Likewise the output of head $h$ is
+$\vo_t^{(h)} = \mW_{UV}^{(h)\T}\sum_j a^{(h)}_{tj}\bm{c}_j$, and $\mW_{UV}^{(h)}$ can be
+folded into the output projection: $\mW_{UV}^{(h)}\mW_O^{(h)} \in \R^{d_c \times d}$. At
+decode time, MLA is therefore multi-query attention in a $d_c$-dimensional latent space:
+all $H$ heads share one ``key'' and one ``value'' per token, namely $\bm{c}_j$, and only the
+queries and output maps are head-specific.
+
+\paragraph{Why RoPE needs a decoupled part.} \Cref{sec:c01-rope} will show that RoPE
+multiplies queries and keys by position-dependent rotations $\bm{R}_t$. Inserting them into
+\eqref{eq:c01-mla-absorb} gives
+\[
+  \bm{c}^{Q\T}_t\mW_{UQ}^{(h)}\,\bm{R}_t\T\bm{R}_j\,\mW_{UK}^{(h)\T}\bm{c}_j
+  = \bm{c}^{Q\T}_t\bigl(\mW_{UQ}^{(h)}\bm{R}_{j-t}\mW_{UK}^{(h)\T}\bigr)\bm{c}_j ,
+\]
+and the middle matrix now depends on the distance $j - t$, so no single matrix can be
+absorbed. (A NumPy check confirms that the absorbed
+matrix changes with position once a rotation is inserted.) DeepSeek-V2's solution is to
+keep the compressed part position-free and add a small \emph{decoupled} RoPE part of
+dimension $d_R$: a per-head rotary query from the query latent and a single rotary key
+shared by all heads,
+\begin{equation}\label{eq:c01-mla-rope}
+  \vq_t^{R,(h)} = \bm{R}_t\,\mW_{QR}^{(h)\T}\bm{c}^Q_t,\qquad
+  \vk_t^{R} = \bm{R}_t\,\mW_{KR}\T\vx_t,\qquad
+  s^{(h)}_{tj} = \frac{\vq_t^{(h)\T}\vk_j^{(h)} + \vq_t^{R,(h)\T}\vk_j^{R}}{\sqrt{d_k + d_R}} .
+\end{equation}
+The cache stores $\bm{c}_j$ and $\vk_j^{R}$: $d_c + d_R$ numbers per token per layer,
+independent of $H$. \Cref{tab:c01-attn-variants} compares the four designs.
+
+\begin{table}[t]
+\centering
+\caption{KV-cache size and decode-time sharing for the attention variants of this section,
+per token and per layer ($H$ query heads of dimension $d_k$; MLA latent dimension $d_c$,
+decoupled RoPE dimension $d_R$). The last column is the number of query heads that read
+each cached number, which sets the arithmetic intensity of decoding
+(\cref{sec:c01-roofline}).}
+\label{tab:c01-attn-variants}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Variant & cached numbers per token & example & heads sharing each number\\
+\midrule
+MHA & $2Hd_k$ & $4096$ & $1$\\
+GQA ($G$ groups) & $2Gd_k$ & $1024$ ($G = 4$) & $H/G$\\
+MQA & $2d_k$ & $256$ & $H$\\
+MLA & $d_c + d_R$ & $576$ & $H$\\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\small Example column: $H = 16$, $d_k = 128$; for MLA, $d_c = 512$ and $d_R = 64$, the
+defaults of \code{MultiheadLatentAttention} in \fla{} (see the box below).}
+\end{table}
+
+\begin{implnote}[title={In the code: MLA in \textsf{fla}}]
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/mla.py} implements MLA as
+\code{MultiheadLatentAttention}, with defaults \code{kv_lora_rank=512} ($d_c$),
+\code{qk_rope_head_dim=64} ($d_R$), \code{qk_nope_head_dim=128}, \code{v_head_dim=128} and
+\code{q_lora_rank=1536} ($d_c'$), annotated ``following the original Deepseek paper''. The
+low-rank projections are two linear maps with an RMSNorm on the latent in between:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak layers/\allowbreak mla.py}},label={lst:c01-fla-mla}]
+        if q_lora_rank is not None:
+            self.q_proj = nn.Sequential(
+                nn.Linear(hidden_size, q_lora_rank, bias=False),
+                RMSNorm(q_lora_rank, dtype=torch.float32),
+                nn.Linear(q_lora_rank, self.num_heads * self.qk_head_dim, bias=False),
+            )
+        else:
+            self.q_proj = nn.Linear(hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+
+        self.k_rope = nn.Linear(hidden_size, self.qk_rope_head_dim, bias=False)
+        self.kv_proj = nn.Sequential(
+            nn.Linear(hidden_size, self.kv_lora_rank, bias=False),
+            RMSNorm(self.kv_lora_rank, dtype=torch.float32),
+            nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False),
+        )
+\end{lstlisting}
+\code{k_rope} is the shared rotary key $\mW_{KR}$ of \eqref{eq:c01-mla-rope}: it has a
+single head that the forward pass broadcasts to all heads. This implementation computes
+attention on the \emph{decompressed} keys and values with a flash-attention kernel, and a
+comment in the forward pass says so explicitly: ``TODO: instead of caching the full k, v, we
+can actually only cache the compressed\_kv and k\_rot''. It is a reminder that the memory
+saving of MLA is realized only by an inference engine that caches $\bm{c}_j$ and uses the
+absorbed form \eqref{eq:c01-mla-absorb}.
+\end{implnote}
+
+% ===========================================================================
+\section{Positional information}\label{sec:c01-position}
+% ===========================================================================
+
+\subsection{Why attention needs positions}\label{sec:c01-permutation}
+
+Without a mask, attention is blind to order. Let $\mP$ be a $T\times T$ permutation matrix and
+consider the unmasked map $f(\mX) = \softmax(\mX\mW_Q\mW_K\T\mX\T/\sqrt{d_k})\mX\mW_V$. Then
+$(\mP\mX)\mW_Q\mW_K\T(\mP\mX)\T = \mP(\mX\mW_Q\mW_K\T\mX\T)\mP\T$, and a row-wise softmax
+commutes with permuting rows and columns, so
+\[
+  f(\mP\mX) = \mP\,\softmax\!\bigl(\mX\mW_Q\mW_K\T\mX\T/\sqrt{d_k}\bigr)\mP\T\mP\mX\mW_V
+  = \mP f(\mX),
+\]
+using $\mP\T\mP = \mI$. Shuffling the tokens just shuffles the outputs: ``dog bites man'' and
+``man bites dog'' produce the same set of vectors. The causal mask already breaks this
+symmetry (position $t$ sees exactly $t$ tokens), but the standard practice is to inject
+position explicitly. There are two families: \emph{absolute} encodings that are added to
+the input, and \emph{relative} encodings that act inside the attention score.
+
+\subsection{Absolute encodings: sinusoidal and learned}\label{sec:c01-absolute}
+
+The original Transformer \citep{vaswani2017attention} adds to $\vx_t$ a fixed vector
+$\vr_t$ with components
+\begin{equation}\label{eq:c01-sinusoidal}
+  r_{t,2i} = \sin(t\,\omega_i),\qquad r_{t,2i+1} = \cos(t\,\omega_i),\qquad
+  \omega_i = b^{-2i/d},\quad i = 0,\dots,d/2-1,
+\end{equation}
+with base $b = 10^4$. The frequencies $\omega_i$ form a geometric sequence, so the
+encoding contains clocks running at many speeds, from one revolution every $2\pi$ positions
+to one every $2\pi b^{(d-2)/d}$ positions. The design has a useful property: by the angle
+addition formulas,
+\[
+\begin{pmatrix} \sin((t+k)\omega_i)\\ \cos((t+k)\omega_i)\end{pmatrix}
+= \begin{pmatrix} \cos(k\omega_i) & \sin(k\omega_i)\\ -\sin(k\omega_i) & \cos(k\omega_i)\end{pmatrix}
+  \begin{pmatrix} \sin(t\omega_i)\\ \cos(t\omega_i)\end{pmatrix},
+\]
+so $\vr_{t+k}$ is a fixed linear function (a block of rotations) of $\vr_t$ that depends only
+on the offset $k$. Relative position is \emph{available} to the network, but only
+indirectly: once $\vr_t$ is added to $\vx_t$, the score
+$(\vx_t + \vr_t)\T\mW_Q\mW_K\T(\vx_j + \vr_j)$ contains cross terms such as
+$\vx_t\T\mW_Q\mW_K\T\vr_j$ that depend on the absolute position $j$. \emph{Learned}
+absolute embeddings, a trainable table of $T_{\max}$ vectors (as in GPT-2
+\citep{c01-radford2019gpt2}), are even simpler but cannot represent positions beyond
+$T_{\max}$ at all.
+
+\subsection{Rotary position embeddings}\label{sec:c01-rope}
+
+RoPE \citep{c01-su2024roformer} moves position from the input into the score and makes the
+score depend \emph{only} on relative position. It is the default in current open LLMs, and
+three later topics depend on its algebra: KV-cache quantization with a RoPE-commuting
+codebook (CommVQ, \cref{ch:routing}), the rotary (complex-valued) state transitions of
+Mamba-3 (\cref{ch:structured}), and the decoupled-RoPE trick of MLA
+(\cref{sec:c01-mla}). We derive it from a single requirement.
+
+\paragraph{The requirement.} We look for position-dependent maps applied to queries and keys,
+$\vq \mapsto \bm{R}_m\vq$ at position $m$ and $\vk \mapsto \bm{R}_n\vk$ at position $n$, with
+$\bm{R}_m \in \R^{d_k\times d_k}$ and $\bm{R}_0 = \mI$, such that the score depends on the
+positions only through their difference:
+\begin{equation}\label{eq:c01-rope-requirement}
+  (\bm{R}_m\vq)\T(\bm{R}_n\vk) = \vq\T\bm{G}_{n-m}\vk
+  \quad\text{for all } \vq, \vk \in \R^{d_k} \text{ and all } m, n,
+\end{equation}
+for some family of matrices $\bm{G}_r$. Since \eqref{eq:c01-rope-requirement} holds for all
+$\vq, \vk$, it is equivalent to the matrix identity $\bm{R}_m\T\bm{R}_n = \bm{G}_{n-m}$.
+
+\paragraph{Solving it.} Three substitutions determine $\bm{R}_m$ completely.
+\begin{enumerate}
+  \item $n = m$: $\bm{R}_m\T\bm{R}_m = \bm{G}_0 = \bm{R}_0\T\bm{R}_0 = \mI$. Every
+  $\bm{R}_m$ is \emph{orthogonal}, so it preserves norms: $\norm{\bm{R}_m\vq} =
+  \norm{\vq}$.
+  \item $m = 0$: $\bm{G}_n = \bm{R}_n$.
+  \item $n = m + 1$: $\bm{R}_m\T\bm{R}_{m+1} = \bm{R}_1$, hence (multiplying by
+  $\bm{R}_m$ and using orthogonality) $\bm{R}_{m+1} = \bm{R}_m\bm{R}_1$, and by induction
+  $\bm{R}_m = \bm{A}^m$ with $\bm{A} \defeq \bm{R}_1$.
+\end{enumerate}
+Conversely, any orthogonal $\bm{A}$ works:
+$(\bm{A}^m)\T\bm{A}^n = \bm{A}^{-m}\bm{A}^n = \bm{A}^{n-m}$. So the solutions are exactly the
+powers of one orthogonal matrix. A real orthogonal matrix is orthogonally similar to a
+block-diagonal matrix $\bm{B}$ whose blocks are $2\times 2$ rotations and $1\times 1$ entries
+$\pm 1$: $\bm{A} = \bm{U}\bm{B}\bm{U}\T$. The change of basis $\bm{U}$ can be absorbed
+into $\mW_Q$ and $\mW_K$, which are learned anyway, and a $\pm 1$ entry only gives a
+coordinate that ignores position or flips sign at every step. Taking all blocks to be
+rotations gives
+\begin{equation}\label{eq:c01-rope-matrix}
+  \bm{R}_m = \diag\bigl(\bm{\rho}(m\theta_1), \bm{\rho}(m\theta_2), \dots, \bm{\rho}(m\theta_{d_k/2})\bigr),
+  \qquad
+  \bm{\rho}(\phi) = \begin{pmatrix}\cos\phi & -\sin\phi\\ \sin\phi & \cos\phi\end{pmatrix},
+\end{equation}
+which rotates the $i$-th pair of coordinates by the angle $m\theta_i$. This is RoPE. The only
+remaining choice is the frequencies; RoPE uses the sinusoidal ones,
+$\theta_i = b^{-2(i-1)/d_k}$ for $i = 1, \dots, d_k/2$.
+
+\paragraph{Checking the relative property directly.} The $2\times 2$ rotations satisfy
+$\bm{\rho}(\alpha)\T = \bm{\rho}(-\alpha)$ and $\bm{\rho}(\alpha)\bm{\rho}(\beta) =
+\bm{\rho}(\alpha+\beta)$, so for each pair
+$(\bm{\rho}(m\theta)\vq)\T(\bm{\rho}(n\theta)\vk) = \vq\T\bm{\rho}((n-m)\theta)\vk$, and summing
+over pairs,
+\begin{equation}\label{eq:c01-rope-relative}
+  (\bm{R}_m\vq)\T(\bm{R}_n\vk) = \vq\T\bm{R}_{n-m}\vk .
+\end{equation}
+The complex-number view is often the most transparent. Identify the $i$-th pair of $\vq$
+with $\tilde{q}_i = q_{i,1} + \mathrm{i}\,q_{i,2} \in \C$; a rotation by $\phi$ is
+multiplication by $e^{\mathrm{i}\phi}$, and the real inner product of two pairs is
+$\mathrm{Re}(\overline{\tilde{q}}_i\tilde{k}_i)$. Then
+\begin{equation}\label{eq:c01-rope-complex}
+  (\bm{R}_m\vq)\T(\bm{R}_n\vk)
+  = \mathrm{Re}\sum_{i=1}^{d_k/2}\overline{\tilde{q}_i e^{\mathrm{i}m\theta_i}}\,\tilde{k}_i e^{\mathrm{i}n\theta_i}
+  = \mathrm{Re}\sum_{i=1}^{d_k/2}\overline{\tilde{q}_i}\,\tilde{k}_i\,e^{\mathrm{i}(n-m)\theta_i}.
+\end{equation}
+The score is a sum of $d_k/2$ oscillations in the relative distance $n - m$, one per
+frequency, with amplitudes and phases set by the content of $\vq$ and $\vk$. High-frequency
+pairs distinguish neighbouring positions; low-frequency pairs vary slowly and can carry
+content matching that is nearly position-independent over long ranges. We verified
+\eqref{eq:c01-rope-relative} and \eqref{eq:c01-rope-complex} numerically in NumPy for random
+$\vq, \vk$ and several pairs $(m, n)$ with the same difference.
+
+\begin{example}[RoPE with $d_k = 2$]\label{ex:c01-rope}
+Take $\theta = \pi/2$, $\vq = (1, 0)$ and $\vk = (1, 1)$. At $(m, n) = (1, 0)$:
+$\bm{R}_1\vq = (0, 1)$, $\bm{R}_0\vk = (1, 1)$, score $1$. At $(m, n) = (3, 2)$:
+$\bm{R}_3\vq = (0, -1)$, $\bm{R}_2\vk = (-1, -1)$, score $1$ again: both vectors moved,
+but their relative angle did not. At $(m, n) = (2, 0)$ the offset is different and the score
+is $(-1, 0)\cdot(1, 1) = -1$.
+\end{example}
+
+\paragraph{Properties that later chapters use.}
+\begin{itemize}
+  \item \textbf{Only $\vq$ and $\vk$ are rotated, never $\vv$.} Position affects \emph{where}
+  a head reads, not \emph{what} it reads.
+  \item \textbf{The cache stores rotated keys.} Because $\bm{R}_n$ depends only on the key's
+  own position, $\bm{R}_n\vk_n$ can be computed once and cached; a new query at position $m$
+  is rotated by $\bm{R}_m$. Anything that transforms cached keys (quantization, merging,
+  compression) must respect these rotations, which is the problem CommVQ solves
+  (\cref{ch:routing}).
+  \item \textbf{Rotations compose by adding angles.} A product of rotations is a rotation by
+  the summed angle, $\bm{\rho}(\alpha)\bm{\rho}(\beta) = \bm{\rho}(\alpha+\beta)$; a
+  recurrent state multiplied at every step by a data-dependent rotation therefore accumulates
+  a ``position'' that depends on the content seen so far. This is the algebra behind the
+  complex-valued transitions of Mamba-3 (\cref{ch:structured}).
+  \item \textbf{Wavelengths and the base.} Pair $i$ completes a revolution every
+  $\lambda_i = 2\pi/\theta_i$ positions. With $d_k = 128$ the longest wavelength is
+  $2\pi b^{126/128}$: about $5.4\times 10^4$ positions for $b = 10^4$ and about
+  $2.6\times 10^6$ for $b = 5\times 10^5$ (simple arithmetic). Distances beyond the longest
+  wavelength make even the slowest pair wrap around, which is one reason long-context
+  models raise $b$ or rescale the frequencies.
+\end{itemize}
+
+\paragraph{Extending the context.} A model trained on sequences of length $T_0$ has never
+seen angles $m\theta_i$ beyond $T_0\theta_i$. \emph{Position interpolation}
+\citep{c01-chen2023pi} divides all positions by a factor $s$ (equivalently, divides every
+$\theta_i$ by $s$), so that a context of length $sT_0$ maps onto angles already seen in
+training. YaRN \citep{c01-peng2023yarn} interpolates only the low frequencies, keeps the high
+frequencies (which encode local order), blends linearly in between, and rescales the
+attention logits. Both are a few lines of code, because they only change $\theta_i$.
+
+\begin{implnote}[title={In the code: RoPE in OLMo-core}]
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/rope.py} computes the frequencies
+$\theta_i$ and the angles $m\theta_i$ as follows (excerpted from \code{compute_inv_freqs}
+and \code{RotaryEmbedding._get_rotary_embedding}):
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak rope.py}},label={lst:c01-olmo-rope-freq}]
+def compute_inv_freqs(theta: int, dim: int, device: torch.device) -> "torch.Tensor":
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim))
+    return inv_freq
+# ...
+            seq = torch.arange(seq_len, device=device, dtype=torch.float)
+            freqs = torch.einsum("i , j -> i j", seq, inv_freq)
+            positions = torch.cat((freqs, freqs), dim=-1)
+            pos_sin, pos_cos = positions.sin(), positions.cos()
+\end{lstlisting}
+Here \code{theta} is the base $b$ (default \code{500_000} in \code{RoPEConfig}; the
+\code{llama2_*} factories pass \code{10_000}). The rotation itself pairs coordinate $i$ with
+coordinate $i + d_k/2$ (the ``rotate-half'' layout), not $2i$ with $2i+1$ as in
+\eqref{eq:c01-rope-matrix}:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak rope.py}},label={lst:c01-olmo-rope-apply}]
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        B, nh, T, hs = x.size()
+        x = x.view(B, nh, T, 2, hs // 2)
+        x1, x2 = x.unbind(dim=-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rotary_pos_emb(
+        self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        rotary_dim = pos_sin.shape[-1]
+        if rotary_dim == t.shape[-1]:
+            return ((t * pos_cos) + (self._rotate_half(t) * pos_sin)).to(t.dtype)
+        t_rot, t_pass = t[..., :rotary_dim], t[..., rotary_dim:]
+        t_rot = ((t_rot * pos_cos) + (self._rotate_half(t_rot) * pos_sin)).to(t.dtype)
+        return torch.cat([t_rot, t_pass], dim=-1)
+\end{lstlisting}
+For the first half, $x_i\cos(m\theta_i) - x_{i+d_k/2}\sin(m\theta_i)$; for the second,
+$x_{i+d_k/2}\cos(m\theta_i) + x_i\sin(m\theta_i)$: exactly the rotation
+$\bm{\rho}(m\theta_i)$ applied to the pair $(x_i, x_{i+d_k/2})$. The two layouts differ by a
+fixed permutation of coordinates (checked in NumPy), which the learned $\mW_Q, \mW_K$ can
+absorb; they are equally expressive, but checkpoints are not interchangeable without
+permuting the projection weights. The \code{t_pass} branch implements partial RoPE
+(\code{partial_rotary_factor}), which rotates only the leading dimensions of each head.
+\code{forward} takes a \code{start_pos} argument: during decoding the single new query sits
+at absolute position \code{start_pos}, supplied by the KV-cache manager
+(\cref{sec:c01-kv-cache}). The same file implements the context-extension rules as
+\code{PIRoPEScalingConfig}, \code{StepwiseRoPEScalingConfig} and
+\code{YaRNRoPEScalingConfig}; they only change the inverse frequencies and an attention
+rescaling factor (for YaRN, \texttt{0.1 * math.log(self.factor) + 1.0}).
+\end{implnote}
+
+% ===========================================================================
+\section{The feed-forward network}\label{sec:c01-ffn}
+% ===========================================================================
+
+\subsection{Activations and gated units}\label{sec:c01-glu}
+
+The channel mixer is a two-layer network applied to each position independently. For a
+row-stack $\mX \in \R^{T\times d}$,
+\begin{equation}\label{eq:c01-ffn}
+  \mathrm{FFN}(\mX) = f(\mX\mW_1)\,\mW_2,\qquad \mW_1 \in \R^{d\times d_{\mathrm{ff}}},\;
+  \mW_2 \in \R^{d_{\mathrm{ff}}\times d},
+\end{equation}
+with an element-wise nonlinearity $f$ and, classically, $d_{\mathrm{ff}} = 4d$. Smooth
+nonlinearities have replaced $\ReLU(x) = \max(0, x)$: the Gaussian error linear unit
+$\mathrm{GELU}(x) = x\,\Phi(x)$, with $\Phi$ the standard normal CDF
+\citep{c01-hendrycks2016gelu}, and the sigmoid-weighted linear unit
+$\SiLU(x) = x\,\sigmoid(x)$ (also called Swish \citep{c01-ramachandran2017swish}). Both
+behave like the identity for large positive inputs and decay to $0$ for large negative
+ones, but have nonzero gradient everywhere.
+
+\emph{Gated linear units} \citep{c01-dauphin2017glu} multiply the activation by a second
+linear ``gate''. The SwiGLU variant \citep{c01-shazeer2020glu} used by most current models is
+\begin{equation}\label{eq:c01-swiglu}
+  \mathrm{FFN}_{\mathrm{SwiGLU}}(\mX) = \bigl(\SiLU(\mX\mW_1) \had \mX\mW_3\bigr)\mW_2,
+  \qquad \mW_1, \mW_3 \in \R^{d\times d_{\mathrm{ff}}},\; \mW_2 \in \R^{d_{\mathrm{ff}}\times d}.
+\end{equation}
+It has three matrices instead of two. To keep the parameter count of the classic FFN,
+$2 \cdot d \cdot 4d = 8d^2$, one solves $3\,d\,d_{\mathrm{ff}} = 8d^2$, giving
+$d_{\mathrm{ff}} = 8d/3$, usually rounded up to a hardware-friendly multiple.
+
+\begin{implnote}[title={In the code: SwiGLU in OLMo-core}]
+\code{FeedForward} in \repofile{repos/allenai__OLMo-core/src/olmo_core/nn/feed_forward.py}
+is \eqref{eq:c01-swiglu} in one line, \texttt{return self.w2(self.activation\_fn(self.w1(x)) *
+self.w3(x))}, with \code{silu} as the default activation (\code{gelu_tanh}, a tanh
+approximation of GELU, gives GeGLU). The hidden size rule appears in
+\code{TransformerConfig.llama_like}
+(\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/transformer/config.py}):
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak transformer/\allowbreak config.py}},label={lst:c01-olmo-hidden}]
+        # Resolve hidden size of FFN in blocks.
+        hidden_size = int(8 * d_model / 3)
+        if hidden_size_multiplier is not None:
+            hidden_size = int(hidden_size_multiplier * hidden_size)
+        hidden_size = ensure_multiple_of(hidden_size, hidden_size_multiple_of)
+\end{lstlisting}
+where \code{ensure_multiple_of} rounds up. For example, \code{llama3_8B} passes
+\code{d_model=4096}, \code{hidden_size_multiplier=1.3} and \code{hidden_size_multiple_of=1024},
+which gives $\lfloor 1.3\cdot 10922\rfloor = 14198$, rounded up to $d_{\mathrm{ff}} = 14336$.
+\end{implnote}
+
+\subsection{The FFN as a key--value memory}\label{sec:c01-ffn-memory}
+
+Write \eqref{eq:c01-ffn} for a single position $\vx \in \R^{d}$. Let $\vk_i$ be the $i$-th
+column of $\mW_1$ and $\vv_i\T$ the $i$-th row of $\mW_2$. Then
+\begin{equation}\label{eq:c01-ffn-kv}
+  \mathrm{FFN}(\vx) = \mW_2\T f(\mW_1\T\vx) = \sum_{i=1}^{d_{\mathrm{ff}}} f(\vk_i\T\vx)\,\vv_i .
+\end{equation}
+Compare with attention \eqref{eq:c01-attn-token}, $\vo_t = \sum_j
+\softmax_j(\vq_t\T\vk_j/\sqrt{d_k})\,\vv_j$. Both compute similarities between a query and a
+set of keys, turn them into weights, and return a weighted sum of values. The differences
+are instructive:
+\begin{itemize}
+  \item In attention, the keys and values are \emph{computed from the context} and change
+  with every input; in the FFN they are \emph{parameters}, written by training and fixed at
+  inference. The FFN is a context-independent memory with $d_{\mathrm{ff}}$ slots.
+  \item Attention normalizes its weights with a softmax; the FFN uses an unnormalized
+  activation, so many slots can fire at once and their values add up.
+\end{itemize}
+\citet{c01-geva2021ffn} analyzed trained models in these terms and reported that FFN keys
+respond to recognizable input patterns while the associated values promote plausible next
+tokens. The survey builds on this observation: PlugLM and MemoryLLM replace or retrain FFNs
+as explicit lookup memories, and In-Place TTT treats the FFN down-projection $\mW_2$ as fast
+weights updated at test time \citep{zhoubian2026memory}. We return to these in
+\cref{ch:lookup,ch:ttt}.
+
+% ===========================================================================
+\section{Mixture-of-experts layers}\label{sec:c01-moe}
+% ===========================================================================
+
+A dense FFN uses all of its parameters for every token. A \emph{mixture-of-experts} (MoE)
+layer \citep{c01-shazeer2017moe} replaces it with $E$ FFNs (the \emph{experts}) and a
+\emph{router} that sends each token to only $k \ll E$ of them, so parameters grow with $E$
+while compute per token grows only with $k$.
+
+\subsection{Routing and \texorpdfstring{top-$k$}{top-k} gating}\label{sec:c01-router}
+
+For a token with hidden vector $\vx$, a linear router $\mW_r \in \R^{d\times E}$ produces
+logits and scores
+\begin{equation}\label{eq:c01-router}
+  \vr = \mW_r\T\vx \in \R^{E},\qquad \vs = \softmax(\vr),
+\end{equation}
+the token is sent to the experts with the $k$ largest scores, $\mathcal{S}(\vx) =
+\TopK(\vs, k)$, and the output is the gated sum
+\begin{equation}\label{eq:c01-moe}
+  \vy = \sum_{i \in \mathcal{S}(\vx)} g_i(\vx)\,\mathrm{FFN}_i(\vx),
+\end{equation}
+which is the form given by the survey \citep{zhoubian2026memory}. Two choices of gate are
+common: $g_i = s_i$ (the softmax over all experts, then top-$k$) and $g_i = \exp(r_i) /
+\sum_{j\in\mathcal{S}}\exp(r_j)$ (top-$k$ first, then a softmax over the selected logits,
+so the gates sum to one). The selection is discrete, so gradients reach the router only
+through the gate values $g_i$ of the experts that were chosen. Switch Transformers
+\citep{fedus2022switch} use $k = 1$; GLaM \citep{du2022glam} and Mixtral
+\citep{jiang2024mixtral} use $k = 2$ (Mixtral routes ``over eight experts per layer'', in
+the survey's words).
+
+\paragraph{Parameters versus compute.} With experts of hidden size $d_e$ (SwiGLU), a layer
+stores $3Edd_e$ expert parameters but applies only $3kdd_e$ per token. For example, the
+\code{olmoe_1B_7B} configuration in OLMo-core
+(\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/transformer/config.py}) sets
+$d = 2048$, $L = 16$, $E = 64$, $k = 8$ and $d_e = 1024$. Its experts hold
+$16\cdot 64\cdot 3\cdot 2048\cdot 1024 \approx 6.44\times 10^9$ parameters, of which
+$16\cdot 8\cdot 3\cdot 2048\cdot 1024 \approx 0.81\times 10^9$ are active per token; adding
+the $16\cdot 4\cdot 2048^2 \approx 0.27\times 10^9$ attention parameters gives roughly
+$6.7\times 10^9$ total and $1.1\times 10^9$ active (excluding embeddings), hence the name.
+
+\subsection{Load balancing}\label{sec:c01-load-balance}
+
+Left alone, routers collapse: a few experts receive most tokens, get trained more, become
+better, and attract even more tokens. Collapse wastes parameters and, when experts live on
+different devices, creates stragglers. The standard remedy is an auxiliary
+\emph{load-balancing loss} \citep{c01-lepikhin2021gshard,fedus2022switch}. For a batch of
+$N$ tokens, let $c_i$ be the number of tokens routed to expert $i$ (so $\sum_i c_i = Nk$),
+\begin{equation}\label{eq:c01-lb-loss}
+  f_i = \frac{c_i}{Nk},\qquad
+  \bar{P}_i = \frac{1}{N}\sum_{n=1}^{N} s_{n,i},\qquad
+  \loss_{\mathrm{LB}} = E\sum_{i=1}^{E} f_i\,\bar{P}_i ,
+\end{equation}
+where $f_i$ is the fraction of routing slots taken by expert $i$ and $\bar{P}_i$ the mean
+router probability of expert $i$. Three observations explain the design.
+\begin{enumerate}
+  \item \emph{Scale.} Under perfectly uniform routing, $f_i = \bar{P}_i = 1/E$ and
+  $\loss_{\mathrm{LB}} = E \cdot E \cdot E^{-2} = 1$. If every token goes to the same $k$
+  experts, $f_i = 1/k$ for those experts and
+  $\loss_{\mathrm{LB}} = (E/k)\sum_{i\in\mathcal{S}}\bar{P}_i$, which approaches $E/k$ when
+  the router is confident. (A NumPy check gives $1.000$ for near-uniform routing and exactly
+  $E/k$ for a collapsed router.)
+  \item \emph{Differentiability.} The counts $f_i$ come from an $\argmax$ and have no
+  useful gradient; they are treated as constants. The gradient flows through $\bar{P}_i$:
+  $\partial\loss_{\mathrm{LB}}/\partial\bar{P}_i = E f_i$, so the loss lowers the router
+  probability of each expert in proportion to how overloaded it already is.
+  \item \emph{Weight.} The loss is added to the language-modeling loss with a small
+  coefficient, so balance is encouraged without dominating the objective.
+\end{enumerate}
+A second auxiliary term, the \emph{router z-loss}
+$\frac{1}{N}\sum_n(\log\sum_i e^{r_{n,i}})^2$ \citep{c01-zoph2022stmoe}, keeps router logits
+small for numerical stability. DeepSeek-V3 \citep{c01-deepseek2024v3} replaces the
+auxiliary loss by a per-expert bias $b_i$ that is added to the scores \emph{only for
+selecting} experts and is nudged up for underloaded and down for overloaded experts after
+every batch.
+
+\subsection{Shared and fine-grained experts}\label{sec:c01-shared-experts}
+
+DeepSeekMoE \citep{dai2024deepseekmoe} makes two changes. \emph{Fine-grained} experts split
+each expert into several smaller ones and route to proportionally more of them, which gives
+the router many more combinations to choose from at equal compute. \emph{Shared} experts are
+always active for every token and absorb common knowledge, so the routed experts can
+specialize. With $E_s$ shared experts the layer computes
+$\vy = \sum_{i=1}^{E_s}\mathrm{FFN}^{\mathrm{sh}}_i(\vx) + \sum_{i\in\mathcal{S}(\vx)}
+g_i(\vx)\,\mathrm{FFN}_i(\vx)$.
+
+\begin{taxonomy}
+The survey places MoE in explicit memory (\S IV-C): ``each expert constitutes a persistent
+parameterized memory block'' and ``the routing network performs context-dependent
+addressing over this repository'' \citep{zhoubian2026memory}.
+\textbf{Representation:} explicit (addressable parameter blocks).
+\textbf{Update dynamics:} offline (experts change only during training).
+\textbf{Persistence:} long-term.
+\textbf{Update rule} (Table II): objective-induced or structural updates (MoE models are
+listed there, with the risk of rigidity). Lookup memories such as Engram (\cref{ch:lookup})
+add a second, complementary sparsity axis.
+\end{taxonomy}
+
+\begin{implnote}[title={In the code: routing, balancing and shared experts in OLMo-core}]
+\code{MoERouter.forward} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/moe/router.py} computes
+\eqref{eq:c01-router} in float32 (\texttt{scores = logits.softmax(dim=-1)}; a sigmoid gate is
+an option), selects with \texttt{torch.topk(scores, self.top\_k, dim=-1)}, and returns expert
+weights and indices of shape \texttt{(B, S, top\_k)} together with the per-expert token counts
+$c_i$, computed under \code{torch.no_grad()} with a histogram. The load-balancing loss in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/moe/loss.py} ends with
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak moe/\allowbreak loss.py}},label={lst:c01-olmo-lb}]
+        # shape: (B, S, num_experts) -> (B * S, num_experts)
+        expert_scores = expert_scores.view(-1, num_experts)
+        # shape: (B * S, num_experts) -> (num_experts,)
+        expert_scores = expert_scores.mean(dim=0)
+        # shape: scalar
+        loss = torch.dot(batch_size_per_expert, expert_scores) / loss_div_factor
+        # ...
+    scale = num_experts / top_k
+
+    return scale * loss
+\end{lstlisting}
+With \code{loss_div_factor} $= N$ this is
+$(E/k)\sum_i (c_i/N)\bar{P}_i = E\sum_i f_i\bar{P}_i$, which is \eqref{eq:c01-lb-loss}.
+\code{MoEBase} divides the loss weights by the number of layers
+(\code{scale_loss_by_num_layers}); \code{olmoe_1B_7B} sets \code{lb_loss_weight=0.01} and
+\code{z_loss_weight=0.001}. The DeepSeek-V3-style bias is the router's \code{bias_gamma}
+option: in \code{post_batch}, \code{score_bias} moves by
+\texttt{bias\_gamma * (ideal - batch\_size\_per\_expert).sign()}. Shared experts are a dense
+\code{shared_mlp}, mixed with the routed output with fixed weights:
+\texttt{shared\_out / (top\_k + 1)} plus the routed output times \texttt{top\_k / (top\_k + 1)}.
+Two expert back-ends exist: \code{MoE}, whose experts have a fixed \emph{capacity}
+(\code{capacity_factor=1.2} times the ideal $kN/E$ tokens per expert; excess tokens are
+dropped and pass through the residual stream only), and \code{DroplessMoE}, which uses
+grouped matrix multiplications so that no token is dropped.
+\end{implnote}
+
+\begin{results}[title={Reported results (source: survey PDF in \texttt{papers/})}]
+The survey reports qualitatively that Switch Transformer and GLaM showed that ``sparse
+expert activation can scale model capacity to trillions of parameters while keeping
+per-token FLOPs nearly constant'', and that empirical analyses find experts ``tend to
+cluster around linguistic, reasoning, or domain-specific subfunctions''
+\citep{zhoubian2026memory}. See the cited papers for numbers.
+\end{results}
+
+% ===========================================================================
+\section{Training}\label{sec:c01-training}
+% ===========================================================================
+
+Training minimizes \eqref{eq:c01-ce} (plus any auxiliary losses) by stochastic gradient
+steps on batches of sequences. Documents are typically concatenated and cut into fixed-length
+sequences (``packing''), so every position carries a training signal. To make the costs in
+this and later sections concrete, we fix one configuration.
+
+\begin{definition}[Running example: model $\mathcal{M}$]\label{def:c01-model-m}
+$\mathcal{M}$ has width $d = 4096$, $L = 32$ blocks, $H = 32$ query heads of dimension
+$d_k = 128$, $G = 8$ key--value heads (GQA), a SwiGLU FFN with $d_{\mathrm{ff}} = 14336$,
+no biases, and a tied vocabulary of $\abs{\mathcal{V}} = 100{,}000$ tokens. The shape (but
+not the vocabulary size, which is our choice) matches the defaults of
+\code{TransformerConfig.llama3_8B} in OLMo-core. Per block: attention has
+$d\cdot Hd_k + 2\cdot d\cdot Gd_k + Hd_k\cdot d \approx 41.9\times 10^6$ parameters, the FFN
+$3\,d\,d_{\mathrm{ff}} \approx 176.2\times 10^6$, so the $L$ blocks hold
+$N \approx 6.98\times 10^9$ parameters; the embedding adds
+$\abs{\mathcal{V}}\,d \approx 0.41\times 10^9$. All numbers about $\mathcal{M}$ in this
+chapter are arithmetic, not measurements.
+\end{definition}
+
+\subsection{AdamW}\label{sec:c01-adamw}
+
+Adam \citep{c01-kingma2015adam} keeps two exponential moving averages per parameter, of the
+gradient $g_t$ and of its square:
+\begin{equation}\label{eq:c01-adam-moments}
+  m_t = \beta_1 m_{t-1} + (1-\beta_1)\,g_t,\qquad
+  v_t = \beta_2 v_{t-1} + (1-\beta_2)\,g_t^2,\qquad m_0 = v_0 = 0 .
+\end{equation}
+\paragraph{Bias correction.} Unrolling the recursion,
+$m_t = (1-\beta_1)\sum_{i=1}^{t}\beta_1^{t-i}g_i$. If the gradients have a constant mean
+$\bar{g}$, then $\E[m_t] = (1-\beta_1)\bar{g}\sum_{i=0}^{t-1}\beta_1^{i} = (1-\beta_1^t)\,\bar{g}$:
+the average is biased towards its zero initialization early on. Dividing fixes it,
+$\hat{m}_t = m_t/(1-\beta_1^t)$, and likewise $\hat{v}_t = v_t/(1-\beta_2^t)$.
+
+\paragraph{Decoupled weight decay.} AdamW \citep{c01-loshchilov2019adamw} updates
+\begin{equation}\label{eq:c01-adamw}
+  \theta_t = \theta_{t-1} - \eta_t\Bigl(\frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda\,\theta_{t-1}\Bigr).
+\end{equation}
+The ratio $\hat{m}_t/\sqrt{\hat{v}_t}$ is roughly the sign of a consistent gradient, so every
+coordinate moves by at most about $\eta_t$ per step whatever the scale of its gradient.
+The decay term $\lambda\theta$ is applied \emph{outside} that normalization. Had we instead
+added an $L_2$ penalty to the loss, $\lambda\theta$ would enter $g_t$ and be divided by
+$\sqrt{\hat{v}_t}$, so parameters with large gradients would be regularized less; decoupling
+removes this interaction. Adam stores $m$ and $v$: two extra numbers per parameter, which in
+float32 is $8$ bytes per parameter.
+
+\subsection{Learning-rate schedule and gradient clipping}\label{sec:c01-schedule}
+
+The learning rate first rises linearly for $w$ \emph{warmup} steps, because early in
+training the moment estimates are noisy and large steps can push the model into unstable
+regions. It then decays, most commonly along a cosine \citep{c01-loshchilov2017sgdr}
+from $\eta_{\max}$ to $\eta_{\min}$ at step $t_{\max}$:
+\begin{equation}\label{eq:c01-cosine}
+  \eta_t =
+  \begin{cases}
+    \eta_{\max}\, t/w, & t < w,\\[2pt]
+    \eta_{\min} + \tfrac{1}{2}(\eta_{\max} - \eta_{\min})
+      \Bigl(1 + \cos\bigl(\pi\,\tfrac{t - w}{t_{\max} - w}\bigr)\Bigr), & w \le t \le t_{\max}.
+  \end{cases}
+\end{equation}
+\emph{Gradient clipping} \citep{c01-pascanu2013difficulty} rescales the full gradient vector
+when its global norm exceeds a threshold $c$,
+$\bm{g} \gets \bm{g}\cdot\min\bigl(1, c/\norm{\bm{g}}\bigr)$, which preserves the
+direction and bounds the step after a rare outlier batch.
+
+\begin{algorithm}[t]
+\caption{One training step with AdamW, warmup--cosine schedule and gradient clipping.}\label{alg:c01-train-step}
+\begin{algorithmic}[1]
+\Require parameters $\vtheta$, moments $\bm{m}, \bm{v}$, step $t$, batch of token sequences
+\State $\loss \gets$ mean cross-entropy \eqref{eq:c01-ce} over the batch (+ auxiliary losses)
+\State $\bm{g} \gets \nabla_{\vtheta}\loss$ \Comment{backpropagation}
+\State $\bm{g} \gets \bm{g}\cdot\min(1, c/\norm{\bm{g}})$ \Comment{global-norm clipping}
+\State $\eta_t \gets$ schedule \eqref{eq:c01-cosine}; $t \gets t + 1$
+\State $\vtheta \gets (1 - \eta_t\lambda)\,\vtheta$ \Comment{decoupled weight decay}
+\State $\bm{m} \gets \beta_1\bm{m} + (1-\beta_1)\bm{g}$; \quad $\bm{v} \gets \beta_2\bm{v} + (1-\beta_2)\bm{g}\had\bm{g}$
+\State $\vtheta \gets \vtheta - \eta_t\,\dfrac{\bm{m}/(1-\beta_1^t)}{\sqrt{\bm{v}/(1-\beta_2^t)} + \epsilon}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{implnote}[title={In the code: AdamW and the cosine schedule in OLMo-core}]
+\code{adamw_step} in \repofile{repos/allenai__OLMo-core/src/olmo_core/optim/adamw.py}
+implements lines 5--7 of \cref{alg:c01-train-step} in place:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak optim/\allowbreak adamw.py}},label={lst:c01-olmo-adamw}]
+    beta1, beta2 = betas
+
+    # Perform step weight decay.
+    p.mul_(1 - step_factor * (lr * weight_decay))
+
+    # Decay the first and second moment running average coefficient.
+    exp_avg.lerp_(grad.type_as(exp_avg), (step_factor * (1 - beta1)).type_as(exp_avg))
+    exp_avg_sq.mul_(1 - step_factor * (1 - beta2))
+    exp_avg_sq.add_(step_factor * grad * grad, alpha=1 - beta2)
+
+    bias_correction1 = 1 - beta1 ** (step + 1)
+    bias_correction2 = 1 - beta2 ** (step + 1)
+
+    step_size = lr / bias_correction1
+
+    denom = (exp_avg_sq.sqrt() / bias_correction2.sqrt()).add_(eps)
+
+    update = -step_size * torch.div(exp_avg, denom)
+    update.mul_(step_factor)
+    p.add_(update)
+\end{lstlisting}
+\code{step_factor} is $1$ normally and $0$ when \code{SkipStepAdamW} decides to skip a step
+after a loss spike, which turns the whole update into a no-op without a host--device
+synchronization. \code{lerp_} is the moving average
+$m \gets m + (1-\beta_1)(g - m)$. \code{CosWithWarmup.get_lr} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/optim/scheduler.py} is
+\eqref{eq:c01-cosine} with $\eta_{\min} = $ \code{alpha_f} $\cdot\,\eta_{\max}$ (default
+\texttt{alpha\_f = 0.1}); the same file has warmup--stable--decay (\code{WSD}) and other
+schedules. Clipping is the \code{max_grad_norm} option of the train module.
+\end{implnote}
+
+\subsection{Mixed precision and the memory of training}\label{sec:c01-mixed}
+
+Matrix multiplications run much faster in 16-bit formats. IEEE half precision (fp16) has 5
+exponent and 10 mantissa bits; bfloat16 (bf16) \citep{c01-kalamkar2019bf16} keeps float32's
+8 exponent bits and has 7 mantissa bits. bf16 therefore has the range of float32 (no
+overflow in activations or gradients, so no need for the loss scaling that fp16 requires
+\citep{c01-micikevicius2018mixed}) but coarse resolution: consecutive bf16 numbers near $1$
+are $2^{-7} \approx 0.0078$ apart. An update smaller than about half that, relative to the
+weight, would be rounded away. Mixed-precision training therefore keeps a float32
+\emph{master copy} of the weights and the optimizer moments, and casts to bf16 for the
+forward and backward passes; reductions that are sensitive to rounding (norms, softmax,
+the loss) are computed in float32, as the RMSNorm and cross-entropy code above shows.
+
+The resulting memory is easy to count. Per parameter: bf16 weight (2 bytes), bf16 gradient
+(2), float32 master weight (4) and two float32 Adam moments (8), $16$ bytes in total
+\citep{c01-rajbhandari2020zero}. For model $\mathcal{M}$ with about $7.39\times 10^9$
+parameters including embeddings, that is about $118$\,GB before a single activation is stored,
+so training must shard these states across devices. Activations add a term proportional
+to batch size $\times$ sequence length $\times$ $d$ $\times$ $L$, which \emph{activation
+checkpointing} \citep{c01-chen2016checkpoint} trades for recomputation in the backward pass.
+These are \emph{training-time} memories; none of them exists at inference except the bf16
+weights.
+
+\subsection{The Muon optimizer}\label{sec:c01-muon}
+
+Adam treats every parameter as an independent scalar. Most parameters of a Transformer,
+however, are matrices that act on vectors, and \emph{Muon} (MomentUm Orthogonalized by
+Newton--Schulz) \citep{c01-jordan2024muon} exploits that structure. We need it for
+\cref{ch:multiscale}, where Muon-style updates are projected to protect old knowledge
+(Muon-OGD), so we derive it.
+
+\paragraph{The update.} For a weight matrix $\mW \in \R^{A\times B}$ with gradient $\mG_t$,
+Muon keeps a momentum buffer and replaces it by its \emph{orthogonal factor}:
+\begin{equation}\label{eq:c01-muon}
+\begin{gathered}
+  \mM_t = \mu\,\mM_{t-1} + \mG_t,\qquad
+  \mO_t = \mathrm{orth}(\mM_t) \defeq \mU\mV\T \;\text{ where } \mM_t = \mU\mSigma\mV\T,\\
+  \mW_t = (1-\eta\lambda)\,\mW_{t-1} - \eta\,s\,\mO_t ,
+\end{gathered}
+\end{equation}
+with $\mU\mSigma\mV\T$ the thin singular value decomposition, a shape-dependent scale $s$, and
+optionally Nesterov momentum (using $\mG_t + \mu\mM_t$ in place of $\mM_t$). All singular
+values of the update are set to one: every direction in which the momentum points gets the
+same step size, however small its singular value was.
+
+\paragraph{Why the orthogonal factor: steepest descent in the spectral norm.} A linear layer
+maps $\vx$ to $\mW\vx$, and the largest change a perturbation $\Delta$ can cause is
+$\norm{\Delta\vx} \le \norm{\Delta}_2\norm{\vx}$, where $\norm{\cdot}_2$ is the spectral
+norm (largest singular value). It is therefore natural to ask for the step that decreases
+the linearized loss most, subject to a bound on its spectral norm:
+$\max_{\Delta}\,\inner{\mG}{\Delta} = \tr(\mG\T\Delta)$ subject to $\norm{\Delta}_2 \le \eta$.
+Write $\mG = \sum_i \sigma_i\vu_i\vv_i\T$. Then
+\[
+  \tr(\mG\T\Delta) = \sum_i \sigma_i\,\vu_i\T\Delta\vv_i
+  \le \sum_i\sigma_i\,\norm{\Delta}_2 \le \eta\sum_i\sigma_i ,
+\]
+because $\abs{\vu\T\Delta\vv} \le \norm{\Delta}_2$ for unit vectors. The bound is attained by
+$\Delta = \eta\,\mU\mV\T$: then $\tr(\mG\T\mU\mV\T) = \tr(\mV\mSigma\mU\T\mU\mV\T) =
+\tr(\mSigma) = \sum_i\sigma_i$, and $\norm{\mU\mV\T}_2 = 1$. So $\mathrm{orth}(\mG)$ is the
+steepest-descent direction under the spectral norm, just as $\mathrm{sign}(\vg)$ is the
+steepest-descent direction under the $\ell_\infty$ norm (which is what Adam approximates
+coordinate-wise).
+
+\paragraph{Computing $\mU\mV\T$ without an SVD: Newton--Schulz.} An SVD is slow on
+accelerators; matrix products are fast. The key observation is that odd matrix polynomials
+act on singular values and leave singular vectors alone. If $\mX = \mU\mSigma\mV\T$, then
+$\mX\mX\T\mX = \mU\mSigma\mV\T\mV\mSigma\mU\T\mU\mSigma\mV\T = \mU\mSigma^3\mV\T$, and in
+general
+\begin{equation}\label{eq:c01-ns-poly}
+  p(\mX) \defeq a\mX + b(\mX\mX\T)\mX + c(\mX\mX\T)^2\mX = \mU\,p(\mSigma)\,\mV\T,
+  \qquad p(\sigma) = a\sigma + b\sigma^3 + c\sigma^5 .
+\end{equation}
+Iterating $\mX_{j+1} = p(\mX_j)$ applies the scalar map $\sigma \mapsto p(\sigma)$ to every
+singular value, so we want a $p$ that drives every $\sigma \in (0, 1]$ to $1$. The classic
+choice \citep{c01-bjorck1971orthogonal,c01-higham2008functions} is the cubic
+$p(\sigma) = \tfrac{3}{2}\sigma - \tfrac{1}{2}\sigma^3$. Its fixed points are $0$ and $\pm 1$;
+$p'(1) = 0$, so convergence near $1$ is quadratic; and $p'(0) = 3/2$, so small singular
+values grow by a factor of about $1.5$ per step. Starting from
+$\mX_0 = \mM/\norm{\mM}_F$ guarantees $\sigma_{\max} \le 1$ (the Frobenius norm bounds the
+spectral norm), and the iteration converges to $\mU\mV\T$ for every nonzero singular value
+(we checked this in NumPy against an SVD). The slow part is the small singular values: one
+that starts at $0.01$ is still only about $0.11$ after six cubic steps. Muon therefore uses a
+quintic with a much larger slope at zero, coefficients $(a, b, c) = (3.4445, -4.7750,
+2.0315)$ in the reference code below, and accepts that the iteration no longer converges
+exactly to $1$: after five steps the singular values are spread around $1$ rather than equal
+to it. In our NumPy check on a random $6\times 9$ matrix they ended between about $0.7$ and
+$1.1$.
+
+\paragraph{Scale and scope.} $\mU\mV\T$ for $\mW\in\R^{A\times B}$ has $\min(A,B)$ unit
+singular values, so its Frobenius norm is $\sqrt{\min(A,B)}$ and its root-mean-square entry
+is $\sqrt{\min(A,B)/(AB)} = 1/\sqrt{\max(A,B)}$. Multiplying by $s = 0.2\sqrt{\max(A,B)}$, the
+rule of \citet{c01-liu2025muonscalable} used in the code below, gives updates with RMS $0.2$
+for every shape, so that a learning rate tuned for AdamW can be reused. Muon is applied only
+to the matrices inside the blocks; embeddings, the output head, gains and biases stay on
+AdamW.
+
+\begin{algorithm}[t]
+\caption{One Muon step for a weight matrix $\mW \in \R^{A\times B}$ (quintic Newton--Schulz, $n_{\mathrm{ns}}$ iterations).}\label{alg:c01-muon}
+\begin{algorithmic}[1]
+\Require $\mW$, momentum $\mM$, gradient $\mG$, rate $\eta$, decay $\lambda$, momentum $\mu$, coefficients $(a, b, c)$
+\State $\mM \gets \mu\mM + \mG$; \quad $\mG' \gets \mG + \mu\mM$ \Comment{Nesterov variant; else $\mG' \gets \mM$}
+\State $\mX \gets \mG'/(\norm{\mG'}_F + \epsilon)$; transpose $\mX$ if $A > B$ \Comment{now $\sigma_{\max}(\mX) \le 1$}
+\For{$j = 1, \dots, n_{\mathrm{ns}}$}
+  \State $\mA \gets \mX\mX\T$ \Comment{the smaller Gram matrix}
+  \State $\mX \gets a\mX + (b\mA + c\mA^2)\mX$
+\EndFor
+\State undo the transpose; $\mW \gets (1-\eta\lambda)\mW - \eta\cdot 0.2\sqrt{\max(A,B)}\cdot\mX$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{implnote}[title={In the code: Muon}]
+OLMo-core configures Muon in \repofile{repos/allenai__OLMo-core/src/olmo_core/optim/muon.py}
+(\code{MuonConfig}, defaults \code{lr=0.01}, \code{mu=0.95}, \code{weight_decay=0.1},
+\code{adjust_lr=rms_norm}, the ``Kimi/Moonlight style'' scaling) but imports the optimizer
+itself from the external \code{dion} package. Its \code{default_group_overrides} sends
+matrix parameters to Muon and ``vector, embedding, and lm\_head parameters'' to AdamW. A
+self-contained implementation is mirrored in
+\repofile{repos/awslabs__hybrid-model-factory/training/src/hmf/third_party/muon/muon.py}
+(a copy, per its header, of code from Moonshot AI's Moonlight and Keller Jordan's Muon
+repositories):
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak src/\allowbreak hmf/\allowbreak third\_party/\allowbreak muon/\allowbreak muon.py}},label={lst:c01-muon-ns}]
+def zeropower_via_newtonschulz5(G: "torch.Tensor", steps: int) -> "torch.Tensor":
+    """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    # ...
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+\end{lstlisting}
+The elided docstring explains the coefficients: they are ``selected to maximize the slope
+at zero'', the result is ``something like $US'V^T$ where $S'$ is diagonal with
+$S'_{ii} \sim \mathrm{Uniform}(0.5, 1.5)$'', which according to its authors ``turns out not
+to hurt model performance at all relative to $UV^T$''. The iteration runs in bf16, the
+transpose makes $\mA = \mX\mX\T$ the smaller Gram matrix, and the same file's
+\code{adjust_lr_for_muon} returns \texttt{lr * 0.2 * math.sqrt(max(A, B))}, the scale $s$
+derived above.
+\end{implnote}
+
+% ===========================================================================
+\section{Inference: prefill, decode and the KV cache}\label{sec:c01-inference}
+% ===========================================================================
+
+\subsection{Deriving the KV cache}\label{sec:c01-kv-cache}
+
+Generation calls the model once per new token. Done naively, step $t$ would rerun the whole
+network on $x_1, \dots, x_t$, recomputing everything for the first $t-1$ positions that was
+already computed at step $t-1$. Causality tells us exactly what can be reused.
+
+\begin{proposition}[What a causal Transformer may cache]\label{prop:c01-kv-cache}
+In a causal Transformer, the keys $\vk_j^{(\ell, h)}$ and values $\vv_j^{(\ell, h)}$ of every
+layer $\ell$ and head $h$ at position $j$ are functions of $x_1, \dots, x_j$ only. Hence they
+do not change when tokens are appended after position $j$.
+\end{proposition}
+
+\begin{proof}
+By induction on $\ell$. For $\ell = 0$, $\vh_j^{(0)} = \vx_j$ depends only on $x_j$. Suppose
+$\vh_{j'}^{(\ell-1)}$ depends only on $x_{\le j'}$ for every $j'$. The keys and values of layer
+$\ell$ at position $j$ are linear maps (with RoPE rotations that depend only on $j$) of
+$\RMSNorm(\vh_j^{(\ell-1)})$, so they depend only on $x_{\le j}$. The attention output at $j$
+mixes values at positions $j' \le j$, each depending on $x_{\le j'} \subseteq x_{\le j}$; the
+residual addition, the norm and the FFN act on position $j$ alone. So $\vh_j^{(\ell)}$
+depends only on $x_{\le j}$, which completes the induction.
+\end{proof}
+
+At step $t$, therefore, the only new work in each layer is for the new position: compute
+$\vq_t, \vk_t, \vv_t$, \emph{append} $(\vk_t, \vv_t)$ to the stored lists, and evaluate
+\eqref{eq:c01-attn-token} for the single query $\vq_t$ against all $t$ stored keys and
+values. The stored lists are the \emph{KV cache}. Written as a memory with a state, a write
+rule and a read rule (the format used throughout this book),
+\begin{equation}\label{eq:c01-kv-memory}
+  \mathcal{S}_t = \mathcal{S}_{t-1} \cup \{(\vk_t, \vv_t)\},\qquad
+  \vo_t = \sum_{(\vk_j, \vv_j)\in\mathcal{S}_t}
+     \frac{\exp(\vq_t\T\vk_j/\sqrt{d_k})}{\sum_{(\vk_{j'},\cdot)\in\mathcal{S}_t}\exp(\vq_t\T\vk_{j'}/\sqrt{d_k})}\,\vv_j .
+\end{equation}
+The state \emph{grows by one entry per token}, is never overwritten, and is read with an
+exact softmax over all entries. Contrast this with the linear-attention memory of
+\cref{ch:linear}, a fixed-size matrix $\mS_t = \mS_{t-1} + \vv_t\vk_t\T \in \R^{d_v\times
+d_k}$ read by $\vo_t = \mS_t\vq_t$: constant size, but lossy. Much of this book is about the
+space between these two extremes.
+
+\begin{taxonomy}
+The survey's Table I lists ``Transformer (KV Cache)'' first among implicit memories
+\citep{zhoubian2026memory}.
+\textbf{Representation:} implicit (a by-product of the forward pass, with no separate
+read/write interface). \textbf{Update dynamics:} online (written at every inference step).
+\textbf{Persistence:} short-term (bounded by the context window and discarded with the
+sequence). \textbf{Update rule:} append every token; there is no admission, eviction or
+consolidation, which is exactly what the memory-management methods of \cref{ch:routing} add.
+\end{taxonomy}
+
+\subsection{Prefill and decode}\label{sec:c01-prefill-decode}
+
+Serving a request has two phases with very different profiles.
+\begin{itemize}
+  \item \textbf{Prefill.} The prompt $x_1, \dots, x_{T_p}$ is processed in one parallel forward
+  pass, exactly as in training, writing the KV cache for all $T_p$ positions and producing the
+  distribution of the first new token. Its cost is dominated by large matrix--matrix
+  products and determines the time to the first token.
+  \item \textbf{Decode.} Each subsequent step feeds one token, reads the whole KV cache in
+  every layer and appends one entry. The cost per step is small in FLOPs but, as we show in
+  \cref{sec:c01-roofline}, it is bounded by how fast weights and cache can be read from
+  memory. It determines the time per output token.
+\end{itemize}
+
+\begin{algorithm}[t]
+\caption{Autoregressive generation with a KV cache.}\label{alg:c01-generate}
+\begin{algorithmic}[1]
+\Require prompt $x_1, \dots, x_{T_p}$; number of new tokens $n$; sampling rule
+\State allocate an empty cache $\mathcal{S}^{(\ell)}$ for every layer $\ell$
+\State run the model on $x_{1:T_p}$ at positions $1..T_p$, appending all $(\vk_j, \vv_j)$ to $\mathcal{S}^{(\ell)}$ \Comment{prefill}
+\State $\vz \gets$ logits at position $T_p$
+\For{$s = 1, \dots, n$}
+  \State $x_{T_p+s} \gets \textsc{Sample}(\vz)$
+  \State run the model on the single token $x_{T_p+s}$ at position $T_p+s$: \Comment{decode}
+  \Statex \hspace{\algorithmicindent}\hspace{\algorithmicindent} in each layer compute $\vq, \vk, \vv$, append $(\vk, \vv)$ to $\mathcal{S}^{(\ell)}$, attend over $\mathcal{S}^{(\ell)}$
+  \State $\vz \gets$ logits of the new position
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{How big is the KV cache?}\label{sec:c01-kv-size}
+
+Each layer stores, per token, one key and one value vector for each of its $G$ key--value
+heads. For a batch of $b$ sequences of length $T$ and $n_{\mathrm{byte}}$ bytes per number,
+\begin{equation}\label{eq:c01-kv-bytes}
+  \mathrm{KV\ bytes} = \underbrace{2}_{\text{K and V}} \cdot L \cdot G \cdot d_k \cdot T \cdot b \cdot n_{\mathrm{byte}},
+\end{equation}
+and for MLA the factor $2Gd_k$ becomes $d_c + d_R$ (\cref{tab:c01-attn-variants}).
+
+\begin{example}[KV cache of model $\mathcal{M}$]\label{ex:c01-kv-size}
+For $\mathcal{M}$ (\cref{def:c01-model-m}) in bf16 ($n_{\mathrm{byte}} = 2$), one token
+costs $2\cdot 32\cdot 8\cdot 128\cdot 2 = 131{,}072$ bytes $= 128$\,KiB. A single sequence of
+$T = 32{,}768$ tokens needs $4$\,GiB, and of $T = 131{,}072$ tokens $16$\,GiB. The bf16
+weights, including the tied embedding, occupy $2 \times 7.39\times 10^9$ bytes
+$\approx 14.8$\,GB $\approx 13.8$\,GiB. So a batch of four sequences of $32{,}768$ tokens
+already needs more memory for its cache ($16$\,GiB) than for the whole model. Without GQA ($G = H = 32$) every figure is four times larger ($512$\,KiB per token);
+with MQA ($G = 1$) it is $16$\,KiB per token.
+\end{example}
+
+This is the central fact of long-context inference. Weights are shared by every request; the
+KV cache is private to each sequence and grows linearly with its length. Memory, not
+arithmetic, decides how many requests and how long a context a device can serve.
+
+\begin{implnote}[title={In the code: the KV cache and the generation loop in OLMo-core}]
+\code{KVCacheManager} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/attention/kv_cache.py} preallocates,
+per attention layer, two buffers of shape
+\texttt{(batch\_size, max\_seq\_len, num\_kv\_heads, head\_dim)} in bf16 (\code{k_cache},
+\code{v_cache}) and an integer \code{cache_seqlens} that counts the positions filled so far:
+\eqref{eq:c01-kv-bytes} made concrete. \code{Attention.forward} reads
+\texttt{start\_pos = self.kv\_cache\_manager.current\_position()} so that RoPE rotates new queries
+and keys by their absolute positions, and the flash-attention backend
+(\repofile{repos/allenai__OLMo-core/src/olmo_core/nn/attention/backend.py}) both appends to
+and reads from the cache in one kernel call:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak nn/\allowbreak attention/\allowbreak backend.py}},label={lst:c01-olmo-kvcache}]
+            return dispatch_flash_attn_with_kvcache(
+                q,
+                k=k,
+                v=v,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=self.window_size,
+                k_cache=kv_cache_manager.k_cache,  # updated in-place
+                v_cache=kv_cache_manager.v_cache,  # updated in-place
+                cache_leftpad=kv_cache_manager.cache_leftpad,
+                cache_seqlens=kv_cache_manager.cache_seqlens.expand(
+                    kv_cache_manager.cache_leftpad.shape[0]
+                ).contiguous(),
+            )
+\end{lstlisting}
+\code{cache_leftpad} handles prompts of different lengths in one batch by left-padding
+them. The loop of \cref{alg:c01-generate} is \code{generate_batch} in
+\repofile{repos/allenai__OLMo-core/src/olmo_core/generate/generation_module/transformer/generation_module.py}:
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak allenai\_\_OLMo-core/\allowbreak src/\allowbreak olmo\_core/\allowbreak generate/\allowbreak generation\_module/\allowbreak transformer/\allowbreak generation\_module.py}},label={lst:c01-olmo-generate}]
+            # Determine model inputs based on if we are prefilling or decoding
+            is_first_forward = generated.shape[1] == prompt_len
+            input_ids_for_model = (
+                generated
+                if (is_first_forward or not generation_config.use_cache)
+                else generated[:, -1:]
+            )
+            # ...
+            # Forward pass - handles both prefill and decode phases
+            forward_start_time = time.perf_counter()
+            next_token_logits = self.model(  # (batch_size, seq_len=1, vocab_size)
+                input_ids_for_model,
+                logits_to_keep=1,
+                cache_leftpad=cache_leftpad if generation_config.use_cache else None,
+            )
+\end{lstlisting}
+The first call is the prefill (the whole prompt); later calls feed only
+\texttt{generated[:, -1:]}. \code{logits_to_keep=1} skips the output head for all but the
+last position. The cache is a fixed contiguous allocation sized for \code{max_seq_len}
+up front, the layout that PagedAttention (\cref{sec:c01-paged}) replaces in serving systems.
+\end{implnote}
+
+\subsection{Sampling}\label{sec:c01-sampling}
+
+The model outputs a distribution; a decoding rule turns it into a token.
+\begin{itemize}
+  \item \textbf{Greedy}: $x_{t+1} = \argmax_i z_{t,i}$. Deterministic, but prone to
+  repetitive text.
+  \item \textbf{Temperature}: sample from $\softmax(\vz/\tau)$. For $\tau \to 0$ the ratio
+  of any two probabilities, $\exp((z_i - z_j)/\tau)$, goes to $0$ or $\infty$, so the
+  distribution concentrates on the argmax (greedy); $\tau = 1$ is the model's distribution;
+  $\tau \to \infty$ flattens it towards uniform.
+  \item \textbf{Top-$k$}: keep the $k$ most probable tokens, renormalize, sample.
+  \item \textbf{Top-$p$ (nucleus)} \citep{c01-holtzman2020degeneration}: sort the
+  probabilities in decreasing order and keep the smallest prefix whose total mass reaches
+  $p$, then renormalize and sample. Unlike top-$k$, the size of the kept set adapts: a
+  confident distribution keeps few tokens, a flat one keeps many. For probabilities
+  $(0.5, 0.3, 0.15, 0.05)$ and $p = 0.6$, the kept set is the first two tokens.
+\end{itemize}
+OLMo-core implements these as \code{greedy_selection}, \code{top_k_filtering} and
+\code{top_p_filtering} in \repofile{repos/allenai__OLMo-core/src/olmo_core/generate/sampling.py},
+applied in that order after dividing the logits by the temperature.
+
+% ===========================================================================
+\section{Complexity: why long context is a memory problem}\label{sec:c01-complexity}
+% ===========================================================================
+
+\Cref{tab:c01-costs} collects the cost of one block. Counting a multiply--add as two
+floating-point operations (FLOPs), a $T\times d$ by $d\times d'$ product costs $2Tdd'$.
+The projections and the FFN are linear in $T$ and quadratic in $d$; the score and value
+products $\mQ\mK\T$ and $\mA\mV$ are \emph{quadratic in $T$}.
+
+\begin{table}[t]
+\centering
+\caption{Cost of one Transformer block with $H$ heads of size $d_k$ ($Hd_k = d$), $G$
+key--value heads and a SwiGLU FFN of width $d_{\mathrm{ff}}$, for a sequence of length $T$
+(forward pass, batch 1). Causality halves the attention FLOPs of a full pass.}
+\label{tab:c01-costs}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & full sequence (training, prefill) & one decode step at position $t$\\
+\midrule
+Q, K, V, O projections & $2Td(2d + 2Gd_k)$ & $2d(2d + 2Gd_k)$\\
+scores and weighted sum & $\approx 2T^2 d$ (causal) & $4td$\\
+FFN (SwiGLU) & $6Tdd_{\mathrm{ff}}$ & $6dd_{\mathrm{ff}}$\\
+KV cache written / read & $2TGd_k$ written & $2tGd_k$ read, $2Gd_k$ written\\
+score matrix if materialized & $HT^2$ & $Ht$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three consequences follow, and every later chapter responds to at least one of them.
+\begin{enumerate}
+  \item \textbf{Quadratic compute.} Summed over a sequence, attention costs $\bigO(T^2d)$
+  per layer. For a forward pass, the parameter FLOPs per token are about $2N$ (two per
+  parameter, the estimate also used by \citet{c01-kaplan2020scaling}), while attention adds
+  about $4td$ per layer at position $t$. For model $\mathcal{M}$, per layer,
+  $2\cdot 218\times 10^6 = 4\cdot t\cdot 4096$ at $t \approx 26{,}600$: beyond roughly that many tokens of context,
+  each new token spends more FLOPs in attention than in all weight matrices together.
+  OLMo-core's \code{Attention.num_flops_per_token} counts exactly these two terms (with the
+  factor three for forward plus backward) and, as its comment explains, counts only the
+  causal $(\text{query}, \text{key})$ pairs.
+  \item \textbf{Linear memory per sequence.} The KV cache is $\bigO(T)$ per layer and per
+  sequence (\cref{ex:c01-kv-size}); unlike the weights it cannot be shared across requests.
+  Sparse attention (\cref{ch:sparse}) reads fewer entries; linear attention and SSMs
+  (\cref{ch:linear,ch:delta}) replace the growing cache by a fixed-size state; CommVQ
+  (\cref{ch:routing}) quantizes it.
+  \item \textbf{Linear time per decode step, bound by memory traffic.} Step $t$ must read
+  $2tGd_k$ cached numbers in every layer. The next section shows that this read, not the
+  arithmetic, sets the speed of decoding.
+\end{enumerate}
+
+% ===========================================================================
+\section{Hardware basics: memory hierarchy and IO-aware attention}\label{sec:c01-hardware}
+% ===========================================================================
+
+\subsection{The memory hierarchy of an accelerator}\label{sec:c01-hierarchy}
+
+A GPU consists of many independent processors (streaming multiprocessors), each with its own
+registers and a small, fast on-chip scratchpad memory (\emph{SRAM}, also called shared
+memory). All of them share a large off-chip \emph{high-bandwidth memory} (HBM), which holds
+the weights, the activations and the KV cache. Arithmetic can only happen on data that has
+been moved from HBM into registers, and the bandwidth of that path is far smaller than the
+rate at which the arithmetic units can consume data. Each level up the hierarchy is smaller
+and faster: HBM is large enough for a model and its cache, SRAM holds only small tiles of a
+matrix at a time.
+
+To reason about this without quoting product specifications, we use a hypothetical
+\emph{accelerator $\mathcal{X}$} with round numbers chosen for easy arithmetic: peak bf16
+throughput $\pi = 1000$\,TFLOP/s, HBM bandwidth $\beta = 4$\,TB/s, and $80$\,GB of HBM.
+These are illustrative values, not the specification of any real device.
+
+\subsection{Arithmetic intensity and the roofline}\label{sec:c01-roofline}
+
+The \emph{arithmetic intensity} of a computation is the number of FLOPs it performs per byte
+moved between HBM and the chip, $I = \text{FLOPs}/\text{bytes}$. A kernel can run no faster
+than its compute limit $\pi$ and no faster than its memory limit $\beta I$, so its attainable
+throughput is bounded by the \emph{roofline} \citep{c01-williams2009roofline}
+\begin{equation}\label{eq:c01-roofline}
+  \text{FLOP/s} \le \min(\pi,\; \beta\,I).
+\end{equation}
+Below the \emph{ridge point} $I^\star = \pi/\beta$ a kernel is \emph{memory-bound}; above it,
+\emph{compute-bound}. For accelerator $\mathcal{X}$, $I^\star = 250$\,FLOP/byte.
+
+\paragraph{Matrix products.} Multiplying two $n\times n$ bf16 matrices costs $2n^3$ FLOPs and
+moves at least $3\cdot 2n^2$ bytes (read two, write one), so $I = n/3$: for $n = 4096$,
+$I \approx 1365$, comfortably compute-bound. Prefill and training, which multiply
+$T\times d$ activations by $d\times d'$ weights with large $T$, live here.
+
+\paragraph{Decode is memory-bound.} A decode step multiplies each weight matrix
+$\mW \in \R^{d\times d'}$ by $b$ vectors (one per sequence in the batch): $2bdd'$ FLOPs, but
+all $2dd'$ bytes of the bf16 weight must be read. So $I \approx b$, and at batch size $1$
+the step runs at about $1/250$ of peak on $\mathcal{X}$. Its duration is set by bytes, not
+FLOPs: streaming the $\approx 14.8$\,GB of $\mathcal{M}$'s weights once (the tied
+embedding is read in full by the output head) takes at least
+$14.8\,\text{GB} / 4\,\text{TB/s} \approx 3.7$\,ms per token, and reading a $4.3$\,GB
+($4$\,GiB) KV cache for a $32{,}768$-token context adds about $1.1$\,ms more
+\citep[see also][for a detailed analysis of inference costs]{c01-pope2023inference}.
+
+\paragraph{Attention in decode cannot be batched.} Batching raises the intensity of the weight
+products, because all sequences share the weights. It does nothing for attention, because
+each sequence has its \emph{own} cache. Per cached token and key--value head, decode reads
+$2d_k$ bf16 numbers ($4d_k$ bytes) and, for each of the $H/G$ query heads that share them,
+performs $2d_k$ FLOPs for the score and $2d_k$ for the weighted value: intensity
+$(H/G)\cdot 4d_k / (4d_k) = H/G$ FLOP/byte. Multi-head attention sits at $I = 1$; GQA with
+$H/G = 4$ at $I = 4$; MQA and MLA, where all heads share one cached vector, at $I \approx H$
+(\cref{tab:c01-attn-variants}). All of these are far below $I^\star$. Every cached byte
+costs bandwidth at every step, which is why shrinking, skipping or replacing the KV cache
+speeds up decoding almost proportionally.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, x=1.5cm, y=1.0cm]
+  % log10 axes: x = log10(I) from -1 to 4.3, y = log10(TFLOP/s) from -1 to 3.6
+  \draw[->] (-1,-1) -- (4.4,-1);
+  \draw[->] (-1,-1) -- (-1,3.7);
+  \node[anchor=north] at (1.7,-1.55) {arithmetic intensity $I$ (FLOP/byte, log scale)};
+  \node[anchor=south west] at (-1.05,3.7) {attainable TFLOP/s (log scale)};
+  \foreach \x/\lab in {0/1, 1/10, 2/100, 3/1000, 4/10^4} {
+    \draw (\x,-1) -- (\x,-1.08) node[below] {$\lab$};
+  }
+  \foreach \y/\lab in {-1/0.1, 0/1, 1/10, 2/100, 3/1000} {
+    \draw (-1,\y) -- (-1.08,\y) node[left] {$\lab$};
+  }
+  % memory roof: y = log10(4 I) = log10(4) + x ; ridge at x = log10(250) = 2.398
+  \draw[very thick, blue!60!black] (-1,-0.398) -- (2.398,3) -- (4.3,3);
+  \draw[dashed, gray] (2.398,-1) -- (2.398,3);
+  \node[anchor=west, font=\scriptsize] at (2.45,-0.6) {ridge point $I^\star = \pi/\beta = 250$};
+  \node[rotate=34, font=\scriptsize, blue!60!black, anchor=south] at (0.9,1.5) {memory-bound: $\beta I$};
+  \node[font=\scriptsize, blue!60!black, anchor=south] at (3.4,3.05) {compute-bound: $\pi$};
+  % points
+  \fill[red!70!black] (0,0.602) circle (2pt) node[right=2pt, font=\scriptsize] {decode, $b = 1$ ($I \approx 1$)};
+  \fill[red!70!black] (0.602,1.204) circle (2pt) node[right=2pt, font=\scriptsize] {decode attention, GQA with $H/G = 4$};
+  \fill[green!50!black] (3.135,3) circle (2pt) node[below right=1pt, font=\scriptsize] {prefill / training matmul};
+\end{tikzpicture}
+\caption{Roofline of the hypothetical accelerator $\mathcal{X}$ ($\pi = 1000$\,TFLOP/s,
+$\beta = 4$\,TB/s). Decode steps sit far to the left of the ridge point: their speed is set
+by how many bytes of weights and KV cache must be read.}
+\label{fig:c01-roofline}
+\end{figure}
+
+\subsection{FlashAttention}\label{sec:c01-flash}
+
+The standard implementation of \eqref{eq:c01-attn-matrix} writes the $T\times T$ score
+matrix to HBM, reads it back for the softmax, writes the probabilities, and reads them again
+for the product with $\mV$. For long sequences these $\Theta(T^2)$ reads and writes per head
+dominate the running time, and storing the matrix costs $\Theta(T^2)$ memory.
+FlashAttention \citep{c01-dao2022flashattention,c01-dao2024flashattention2} computes
+\emph{exactly} the same output without ever materializing the score matrix, by processing it
+in tiles that fit in SRAM. The obstacle is the softmax: its normalizer depends on the whole
+row. The \emph{online softmax} \citep{c01-milakov2018online,c01-rabe2021selfattention} removes
+the obstacle.
+
+\paragraph{Online softmax, derived.} Consider one query and scores $s_1, \dots, s_n$ arriving
+one at a time, with values $\vv_1, \dots, \vv_n$. For numerical safety a softmax subtracts the
+maximum before exponentiating, but the maximum is not known until the end. Keep three running
+quantities after seeing $j$ scores: the running maximum $m_j$, the rescaled normalizer
+$\ell_j$ and the rescaled unnormalized output $\vo_j$, initialized to $m_0 = -\infty$,
+$\ell_0 = 0$, $\vo_0 = \bm{0}$, and updated by
+\begin{equation}\label{eq:c01-online-softmax}
+  m_j = \max(m_{j-1}, s_j),\qquad
+  \ell_j = e^{m_{j-1} - m_j}\,\ell_{j-1} + e^{s_j - m_j},\qquad
+  \vo_j = e^{m_{j-1} - m_j}\,\vo_{j-1} + e^{s_j - m_j}\,\vv_j .
+\end{equation}
+\emph{Claim:} $\ell_j = \sum_{i\le j} e^{s_i - m_j}$ and $\vo_j = \sum_{i\le j} e^{s_i -
+m_j}\vv_i$. \emph{Proof} by induction: the case $j = 0$ holds trivially (empty sums), and if it
+holds for $j-1$, then
+$e^{m_{j-1}-m_j}\ell_{j-1} = \sum_{i<j}e^{s_i - m_{j-1}}e^{m_{j-1} - m_j} = \sum_{i<j}e^{s_i -
+m_j}$; adding the new term $e^{s_j - m_j}$ gives the claim for $\ell_j$, and the same steps
+give it for $\vo_j$. Hence
+\[
+  \frac{\vo_n}{\ell_n} = \frac{\sum_i e^{s_i - m_n}\vv_i}{\sum_i e^{s_i - m_n}}
+  = \sum_i \softmax(\vs)_i\,\vv_i ,
+\]
+which is exactly the attention output, computed in one pass with $\bigO(1)$ extra state per
+query, and with every exponent $\le 0$. Nothing changes if the scores arrive in
+\emph{blocks}: replace $s_j$ by the maximum of the block, and the single terms by sums over the
+block. The rescaling factor $e^{m_{j-1} - m_j}$ corrects everything accumulated so far
+whenever a larger score appears.
+
+\begin{algorithm}[t]
+\caption{FlashAttention forward pass for one head (causal), with row block $B_r$ and column block $B_c$.}\label{alg:c01-flash}
+\begin{algorithmic}[1]
+\Require $\mQ, \mK, \mV \in \R^{T\times d_k}$ in HBM
+\Ensure $\mO \in \R^{T\times d_k}$ and row log-sum-exp $\bm{\lambda} \in \R^{T}$ in HBM
+\For{each query block $\mQ_i \in \R^{B_r\times d_k}$} \Comment{in parallel across blocks}
+  \State load $\mQ_i$ to SRAM; $\vm \gets -\bm{\infty}$, $\bm{\ell} \gets \bm{0}$, $\mO_i \gets \bm{0}$ \Comment{per-row state}
+  \For{each key block $j$ that is not entirely in the future of block $i$}
+    \State load $\mK_j, \mV_j \in \R^{B_c\times d_k}$ to SRAM
+    \State $\mS \gets \mQ_i\mK_j\T/\sqrt{d_k}$; set entries with key position $>$ query position to $-\infty$
+    \State $\vm' \gets \max(\vm, \mathrm{rowmax}(\mS))$; \quad $\mP \gets \exp(\mS - \vm')$ \Comment{row-wise broadcast}
+    \State $\bm{\ell} \gets e^{\vm - \vm'}\had\bm{\ell} + \mathrm{rowsum}(\mP)$; \quad $\mO_i \gets \diag(e^{\vm - \vm'})\,\mO_i + \mP\mV_j$; \quad $\vm \gets \vm'$
+  \EndFor
+  \State write $\mO_i \gets \diag(\bm{\ell})^{-1}\mO_i$ and $\bm{\lambda}_i \gets \vm + \log\bm{\ell}$ to HBM
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c01-flash} applies \eqref{eq:c01-online-softmax} block-wise
+(\cref{fig:c01-flash}). Its properties:
+\begin{itemize}
+  \item \textbf{Exactness.} By the claim above, the output equals \eqref{eq:c01-attn-matrix}
+  up to floating-point rounding; it is not an approximation. Our NumPy implementation of
+  \cref{alg:c01-flash} with deliberately awkward block sizes matches naive causal attention to
+  machine precision.
+  \item \textbf{Memory.} Besides inputs and outputs, only $\vm$, $\bm{\ell}$ (and the stored
+  log-sum-exp $\bm{\lambda}$) are kept: $\bigO(T)$ instead of $\bigO(T^2)$.
+  \item \textbf{IO.} With SRAM of size $M$, the number of HBM accesses is
+  $\Theta(T^2d_k^2/M)$, compared with $\Theta(Td_k + T^2)$ for the standard implementation
+  \citep{c01-dao2022flashattention}; for typical head sizes this is many times fewer.
+  \item \textbf{Compute is unchanged.} FlashAttention still performs $\bigO(T^2d_k)$ FLOPs (the
+  backward pass even recomputes $\mS$ and $\mP$ from $\mQ$, $\mK$ and $\bm{\lambda}$ rather
+  than storing them). It removes the quadratic \emph{activation memory} and most of the
+  memory traffic of training and prefill, but it does not shrink the KV cache, which stays
+  linear in $T$.
+  \item \textbf{Causal skipping.} Key blocks entirely above the diagonal are never loaded,
+  which halves the work of causal attention.
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize, x=0.55cm, y=0.55cm]
+  % 6x6 block grid, rows = query blocks (top to bottom), cols = key blocks
+  \foreach \i in {0,...,5} {
+    \foreach \j in {0,...,5} {
+      \pgfmathtruncatemacro{\isup}{\j > \i ? 1 : 0}
+      \ifnum\isup=1
+        \draw[gray!40] (\j,-\i) rectangle ++(1,-1);
+      \else
+        \ifnum\j=\i
+          \fill[blue!12] (\j,-\i) -- ++(0,-1) -- ++(1,0) -- cycle;
+          \draw[gray!70] (\j,-\i) rectangle ++(1,-1);
+        \else
+          \fill[blue!25] (\j,-\i) rectangle ++(1,-1);
+          \draw[gray!70] (\j,-\i) rectangle ++(1,-1);
+        \fi
+      \fi
+    }
+  }
+  \draw[very thick, red!70!black] (0,-3) rectangle (6,-4);
+  \draw[->, thick, red!70!black] (0.3,-3.5) -- (3.7,-3.5);
+  \node[anchor=west, align=left] at (6.4,-3.5) {query block $\mQ_i$: loop over key blocks\\$j = 1, \dots, i$, updating $\vm, \bm{\ell}, \mO_i$ in SRAM};
+  \node[anchor=west, align=left] at (6.4,-0.8) {blocks above the diagonal:\\never loaded (causal)};
+  \node[anchor=west, align=left] at (6.4,-5.3) {diagonal blocks: masked inside\\the block};
+  \node at (3,0.6) {key blocks $\mK_j, \mV_j$ $\rightarrow$};
+  \node[rotate=90] at (-0.6,-3) {query blocks $\downarrow$};
+\end{tikzpicture}
+\caption{Tiling in FlashAttention. The $T\times T$ score matrix is never stored; each query
+block streams through the key blocks it may see, keeping only per-row running statistics.}
+\label{fig:c01-flash}
+\end{figure}
+
+\paragraph{Decoding with the same algebra.} Because the update \eqref{eq:c01-online-softmax}
+can merge partial results computed on disjoint sets of keys
+(\cref{ex:c01-merge}), a long KV cache can be split across processors that each compute a
+partial $(m, \ell, \vo)$, followed by a cheap merge. This is how decode kernels parallelize a
+single query over a long cache, and the same merge rule reappears whenever a model combines
+attention over several memories.
+
+\subsection{PagedAttention}\label{sec:c01-paged}
+
+A serving system holds the KV caches of many concurrent requests whose final lengths are
+unknown in advance. Allocating each request a contiguous buffer for its maximum length (as
+the OLMo-core \code{KVCacheManager} above does) wastes memory twice: reserved but unused
+slots inside each buffer, and gaps between buffers of different sizes.
+PagedAttention \citep{kwon2023paged}, the core of the vLLM serving system, borrows the idea of
+virtual memory from operating systems. The cache is divided into fixed-size \emph{blocks} of
+$B_{\mathrm{kv}}$ tokens; each sequence has a \emph{block table} mapping its logical blocks
+$0, 1, 2, \dots$ to arbitrary physical blocks in a shared pool; blocks are allocated only when
+the previous one is full; and the attention kernel gathers keys and values through the
+table. The waste per sequence is at most one partially filled block, and sequences that share
+a prefix (several samples from one prompt, or a common system prompt) can point to the same
+physical blocks, copying a block only when one of them writes to it. The survey summarizes
+the effect: by ``decoupling logical attention memory from contiguous physical allocation,
+this method reduces memory fragmentation and supports large-batch long-context inference''
+\citep{zhoubian2026memory}. PagedAttention changes where the KV cache lives, not what it
+contains or how fast it grows; the systems of \cref{ch:routing} change the latter.
+
+% ===========================================================================
+\section{A from-scratch reference implementation}\label{sec:c01-reference}
+% ===========================================================================
+
+\Cref{lst:c01-tinylm} assembles the pieces of this chapter into a complete decoder-only
+language model: RMSNorm, rotate-half RoPE, grouped-query attention with an optional KV cache,
+a SwiGLU FFN, pre-norm residual blocks and a tied output head. \Cref{lst:c01-generate} is
+the generation loop of \cref{alg:c01-generate} with temperature and top-$p$ sampling. Since
+PyTorch is not available in our build environment, we checked the listings through a
+line-by-line NumPy port: decoding token by token with the cache reproduces the logits of a
+single full forward pass to about $10^{-14}$, which is the content of
+\cref{prop:c01-kv-cache}.
+
+\begin{lstlisting}[caption={Reference implementation (ours): a minimal decoder-only Transformer with RoPE, GQA, SwiGLU and a KV cache.},label={lst:c01-tinylm}]
+import math, torch
+import torch.nn as nn, torch.nn.functional as F
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-6):
+        super().__init__(); self.eps = eps; self.g = nn.Parameter(torch.ones(d))
+    def forward(self, x):                                    # x: (B, T, d)
+        return self.g * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+def rope(x, pos, base=10000.0):                              # x: (B, heads, T, dh)
+    half = x.shape[-1] // 2
+    theta = base ** (-torch.arange(half, device=x.device) / half)
+    ang = pos[:, None].float() * theta[None, :]               # (T, dh/2) angles m*theta_i
+    cos, sin = ang.cos(), ang.sin()
+    x1, x2 = x[..., :half], x[..., half:]                     # pair i with i + dh/2
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+class Attention(nn.Module):
+    def __init__(self, d, H, G):                             # H query heads, G kv heads
+        super().__init__(); self.H, self.G, self.dh = H, G, d // H
+        self.wq = nn.Linear(d, H * self.dh, bias=False)
+        self.wkv = nn.Linear(d, 2 * G * self.dh, bias=False)
+        self.wo = nn.Linear(H * self.dh, d, bias=False)
+    def forward(self, x, pos, cache=None):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.H, self.dh).transpose(1, 2)
+        k, v = self.wkv(x).view(B, T, 2, self.G, self.dh).permute(2, 0, 3, 1, 4)
+        q, k = rope(q, pos), rope(k, pos)                     # cache holds rotated keys
+        if cache is not None:                                 # append, then read all
+            if 'k' in cache:
+                k = torch.cat([cache['k'], k], 2); v = torch.cat([cache['v'], v], 2)
+            cache['k'], cache['v'] = k, v
+        k = k.repeat_interleave(self.H // self.G, dim=1)      # GQA: share kv heads
+        v = v.repeat_interleave(self.H // self.G, dim=1)
+        S = k.shape[2]                                        # number of visible keys
+        mask = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(S - T)
+        att = (q @ k.transpose(-1, -2)) / math.sqrt(self.dh)
+        att = att.masked_fill(~mask, float('-inf')).softmax(-1)
+        return self.wo((att @ v).transpose(1, 2).reshape(B, T, -1))
+class Block(nn.Module):
+    def __init__(self, d, H, G, d_ff):
+        super().__init__()
+        self.n1, self.n2, self.attn = RMSNorm(d), RMSNorm(d), Attention(d, H, G)
+        self.w1 = nn.Linear(d, d_ff, bias=False); self.w3 = nn.Linear(d, d_ff, bias=False)
+        self.w2 = nn.Linear(d_ff, d, bias=False)
+    def forward(self, x, pos, cache=None):
+        x = x + self.attn(self.n1(x), pos, cache)             # attention sublayer
+        h = self.n2(x)
+        return x + self.w2(F.silu(self.w1(h)) * self.w3(h))   # SwiGLU sublayer
+class TinyLM(nn.Module):
+    def __init__(self, V, d=256, L=4, H=8, G=2, d_ff=704):
+        super().__init__()
+        self.emb = nn.Embedding(V, d)
+        self.blocks = nn.ModuleList(Block(d, H, G, d_ff) for _ in range(L))
+        self.norm = RMSNorm(d)
+    def forward(self, ids, start=0, caches=None):             # ids: (B, T)
+        pos = torch.arange(start, start + ids.shape[1], device=ids.device)
+        x = self.emb(ids)
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, pos, None if caches is None else caches[i])
+        return self.norm(x) @ self.emb.weight.T               # tied head -> logits
+\end{lstlisting}
+
+Two details deserve comment. The mask \texttt{tril(S - T)} keeps key $j$ for query $i$ when
+$j \le i + (S - T)$: during prefill $S = T$ and this is the ordinary causal mask; during
+decoding $T = 1$ and the single query sees all $S$ cached keys. Training uses the same
+model without caches:
+\texttt{loss = F.cross\_entropy(logits[:, :-1].flatten(0, 1), ids[:, 1:].flatten())}, the
+shift-by-one of \eqref{eq:c01-ce}.
+
+\begin{lstlisting}[caption={Reference implementation (ours): KV-cache generation with temperature and top-$p$ sampling.},label={lst:c01-generate}]
+def sample_top_p(z, p):                                      # z: (B, V) logits
+    probs = z.softmax(-1)
+    sp, idx = probs.sort(-1, descending=True)
+    keep = (sp.cumsum(-1) - sp) < p                          # mass before token < p
+    sp = sp * keep
+    choice = torch.multinomial(sp / sp.sum(-1, keepdim=True), 1)
+    return idx.gather(-1, choice)                             # (B, 1) token ids
+
+@torch.no_grad()
+def generate(model, prompt, n_new, temperature=1.0, top_p=1.0):
+    caches = [dict() for _ in model.blocks]                  # one KV cache per layer
+    logits = model(prompt, start=0, caches=caches)           # prefill the whole prompt
+    out, T0 = [prompt], prompt.shape[1]
+    for s in range(n_new):
+        z = logits[:, -1]                                     # last position only
+        if temperature == 0:
+            nxt = z.argmax(-1, keepdim=True)                  # greedy
+        else:
+            nxt = sample_top_p(z / temperature, top_p)
+        out.append(nxt)
+        logits = model(nxt, start=T0 + s, caches=caches)     # decode one token
+    return torch.cat(out, dim=1)
+\end{lstlisting}
+
+% ===========================================================================
+\section{Where memory lives in a standard LLM}\label{sec:c01-where-memory}
+% ===========================================================================
+
+We can now answer the question the chapter opened with. \Cref{tab:c01-where-memory} lists
+every store of information in the standard model, with its size for model $\mathcal{M}$ and
+its place on the survey's axes \citep{zhoubian2026memory}.
+
+\begin{table}[t]
+\centering
+\caption{Where information is stored in a standard decoder-only LLM. Sizes are for model
+$\mathcal{M}$ (\cref{def:c01-model-m}) in bf16, by arithmetic. The axes are those of the
+survey's taxonomy (\cref{ch:taxonomy}).}
+\label{tab:c01-where-memory}
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{3.6cm}@{}}
+\toprule
+Store & What it holds; how it is written & Size ($\mathcal{M}$) & Survey axes\\
+\midrule
+Weights (dense) & knowledge from pre-training; written by gradient descent, then frozen & $\approx 14.8$\,GB, fixed & static parameters (outside the survey's scope); offline, long-term\\
+MoE experts & as above, but addressed by a router & grows with $E$ & explicit, offline, long-term\\
+KV cache & the context, one $(\vk, \vv)$ pair per token, layer and KV head; appended every step & $128$\,KiB per token; $4$\,GiB at $T = 32$K & implicit, online, short-term\\
+Residual stream / activations & per-token working state within one forward pass & $d$ numbers per position, overwritten layer by layer & transient (not memory in the survey's sense)\\
+Optimizer state & master weights and Adam moments, training only & $12$\,B per parameter & none at inference\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three observations set the agenda for the rest of the book.
+\begin{enumerate}
+  \item \textbf{The only online memory is the KV cache.} Everything the model learns about
+  the current context lives there, and the cache is exact, uncompressed, append-only and
+  forgotten at the end of the sequence. It is a \emph{short-term} memory with perfect recall
+  inside the window and none outside it.
+  \item \textbf{Its cost grows without bound.} Size is linear in $T$, per sequence; every
+  decode step reads all of it, at an arithmetic intensity of only $H/G$ FLOP/byte; and
+  attention compute is quadratic in $T$. FlashAttention and PagedAttention make the standard
+  cache as cheap as it can be, but they do not change its growth.
+  \item \textbf{Long-term memory is frozen.} The weights hold vast knowledge but cannot be
+  written at inference. Nothing the model reads today survives into tomorrow's session unless
+  it is put back into the context.
+\end{enumerate}
+The architectures in the following chapters attack these limits from different sides:
+reading only part of the cache (\cref{ch:sparse}), replacing it by a fixed-size recurrent
+state with a learned write rule (\cref{ch:linear,ch:delta,ch:expressive,ch:structured,ch:probabilistic}),
+writing the context into weights at test time (\cref{ch:ttt}), adding explicit addressable
+stores (\cref{ch:lookup}), updating parameters on several timescales (\cref{ch:multiscale}),
+combining several memories in one model (\cref{ch:hybrid}), and managing what the cache keeps
+(\cref{ch:routing}). \Cref{ch:taxonomy} first gives the vocabulary to compare them.
+
+\begin{summarybox}
+\begin{itemize}
+  \item An LLM factorizes $p(x_1, \dots, x_T) = \prod_t p(x_t\mid x_{<t})$ over BPE tokens and
+  is trained with cross-entropy, whose gradient with respect to the logits is
+  $\bm{p} - \ve_y$; perplexity is $\exp$ of the mean loss.
+  \item A decoder-only Transformer is a residual stream written by $L$ pre-norm blocks of
+  causal attention and FFN (or MoE). Attention is a soft key--value lookup,
+  $\softmax(\mQ\mK\T/\sqrt{d_k} + \mM)\mV$; the $1/\sqrt{d_k}$ keeps score variance
+  independent of $d_k$ and the softmax responsive.
+  \item MQA, GQA and MLA reduce the cached numbers per token from $2Hd_k$ to $2Gd_k$ or
+  $d_c + d_R$; MLA works because the up-projections can be absorbed, and needs a decoupled
+  RoPE part because rotations break the absorption.
+  \item RoPE is the unique (up to a change of basis) linear, position-multiplicative scheme
+  whose scores depend only on $n - m$: powers of an orthogonal matrix, i.e.\ rotations.
+  \item The FFN is a context-independent key--value memory; MoE turns it into an addressable
+  bank of experts, balanced by $E\sum_i f_i\bar{P}_i$.
+  \item AdamW with warmup, cosine decay, clipping and mixed precision is the standard recipe;
+  Muon replaces the momentum of each matrix by its orthogonal factor, computed with a
+  Newton--Schulz polynomial.
+  \item Causality makes keys and values cacheable. The KV cache is the model's only online
+  memory: $2LGd_kT$ numbers per sequence, read in full at every memory-bound decode step.
+  FlashAttention (online softmax, tiling) removes the $T^2$ activation memory; PagedAttention
+  removes fragmentation; neither changes the linear growth.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Cross-entropy and tied embeddings]\label{ex:c01-ce-gradient}
+(a) Derive \eqref{eq:c01-ce-grad} and show that $\sum_i \partial\ell/\partial z_i = 0$.
+(b) With a tied head $\mW_U = \mW_E\T$, write the gradient of the loss for one position with
+respect to the embedding row of token $i$. Show that it has a term from the output head for
+\emph{every} $i$ and an additional term from the input lookup only for tokens that occur in
+the input.
+\end{exercise}
+
+\begin{exercise}[Relative position, absolute position]\label{ex:c01-rope-relative}
+(a) Show that if $\bm{R}_m = \bm{A}^m$ with $\bm{A}$ orthogonal, then
+$(\bm{R}_m\vq)\T(\bm{R}_n\vk)$ depends only on $n - m$, and verify
+\eqref{eq:c01-rope-complex}. (b) For additive absolute encodings, expand
+$(\vx_t + \vr_t)\T\mW_Q\mW_K\T(\vx_j + \vr_j)$ and identify which of the four terms depend on
+absolute positions. (c) Show that RoPE with all frequencies divided by $s$ is the same as
+RoPE applied at positions $m/s$, which is position interpolation.
+\end{exercise}
+
+\begin{exercise}[KV-cache budgets]\label{ex:c01-kv-budget}
+For model $\mathcal{M}$ on accelerator $\mathcal{X}$ ($80$\,GB HBM): (a) with the weights
+loaded, what is the largest total number of cached tokens (summed over the batch) for MHA,
+for GQA with $G = 8$, and for MQA? (b) Replace attention by MLA with $d_c = 512$, $d_R = 64$ in
+every layer and repeat. (c) At what context length does one sequence's GQA cache equal the
+size of the weights? (d) Estimate a lower bound on the time per decode step at batch size
+$b$ and context $T$ from bytes read alone, and find $b$ at which the KV reads equal the weight
+reads for $T = 32{,}768$.
+\end{exercise}
+
+\begin{exercise}[Merging partial softmaxes]\label{ex:c01-merge}
+For a set of keys $J$, let $(m_J, \ell_J, \vo_J)$ be the state of \eqref{eq:c01-online-softmax}
+after processing exactly the keys in $J$. Define
+$(m, \ell, \vo)\oplus(m', \ell', \vo') = \bigl(M,\; e^{m-M}\ell + e^{m'-M}\ell',\;
+e^{m-M}\vo + e^{m'-M}\vo'\bigr)$ with $M = \max(m, m')$. Prove that
+$(m_J, \ell_J, \vo_J)\oplus(m_{J'}, \ell_{J'}, \vo_{J'}) = (m_{J\cup J'}, \ell_{J\cup J'},
+\vo_{J\cup J'})$ for disjoint $J, J'$, and that $\oplus$ is associative and commutative.
+Explain how this lets $P$ processors share one decode query over a cache of length $T$, and
+what the merge costs.
+\end{exercise}
+
+\begin{exercise}[Newton--Schulz]\label{ex:c01-ns}
+(a) Show that the cubic map $p(\sigma) = \tfrac{3}{2}\sigma - \tfrac{1}{2}\sigma^3$ maps
+$(0, 1)$ into itself, increases every $\sigma \in (0,1)$, and converges to $1$; show that the
+convergence is quadratic near $1$. (b) For which $\sigma > 1$ does the iteration still
+converge to $1$? Why does Muon normalize by $\norm{\mG}_F$ rather than by an estimate of
+$\norm{\mG}_2$? (c) Implement \cref{alg:c01-muon} in NumPy for a random $64\times 256$
+matrix, and plot the singular values of the result against the number of iterations for the
+cubic and the quintic polynomials.
+\end{exercise}
+
+\begin{exercise}[A tiny MoE layer]\label{ex:c01-moe}
+Implement a top-$k$ MoE layer with $E$ SwiGLU experts and the loss \eqref{eq:c01-lb-loss}.
+(a) Verify that $\loss_{\mathrm{LB}} = 1$ when routing is uniform and that it approaches
+$E/k$ when every token is sent to the same $k$ experts with confident scores. (b) Show that,
+for fixed counts $f_i$, the gradient with respect to $\bar{P}_i$ is $Ef_i$, and explain in
+words why this reduces imbalance. (c) Add a shared expert and compare the outputs of the two
+mixing rules $\vy_{\mathrm{sh}} + \vy_{\mathrm{routed}}$ and the OLMo-core rule
+$\vy_{\mathrm{sh}}/(k+1) + \vy_{\mathrm{routed}}\cdot k/(k+1)$.
+\end{exercise}

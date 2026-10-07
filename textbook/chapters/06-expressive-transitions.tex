@@ -1,3 +1,1887 @@
 \chapter{Expressive State Transitions: DeltaProduct, Comba, RWKV-7}\label{ch:expressive}
 
-(Chapter in preparation.)
+The recurrent memories of \cref{ch:linear} and \cref{ch:delta} were judged mainly as
+\emph{associative stores}: how many key--value pairs fit into the matrix state
+$\mS_t\in\R^{d_v\times d_k}$, how cleanly an old association can be erased before a new one
+is written, and how accurately a query retrieves what was stored. This chapter studies a
+different memory capability, \emph{state tracking}. Think of a program that executes
+\texttt{a, b = b, a} a thousand times, of a story in which characters keep swapping
+objects, or of a chess game written as a list of moves. Nothing has to be retrieved
+verbatim; instead the memory must hold a small state that is \emph{transformed} by every
+token, and the final answer depends on the order of all the transformations. Whether a
+recurrent model can do this is decided almost entirely by its \emph{state-transition
+matrices}: the matrices that multiply the old state at every step.
+
+We first build the necessary background from scratch
+(\cref{sec:c06-background}): the general form of a matrix-state recurrence, a precise
+definition of state tracking, a proof that diagonal transitions with positive entries cannot
+even track parity, a short tour of the circuit-complexity argument (TC$^0$ versus NC$^1$)
+that separates ``easy'' from ``hard'' state tracking, the eigenvalues of generalized
+Householder matrices, and diagonal-plus-low-rank (DPLR) transitions. We then study three
+2025 systems that enrich the transition while keeping training parallel:
+DeltaProduct~\citep{siems2025deltaproduct} (\cref{sec:c06-deltaproduct}), which applies
+several delta-rule steps per token so that every transition is a product of Householder
+matrices; Comba~\citep{hu2025comba} (\cref{sec:c06-comba}), which uses a
+scalar-plus-low-rank transition with state and output feedback; and RWKV-7
+``Goose''~\citep{peng2025rwkv7} (\cref{sec:c06-rwkv7}), whose generalized delta rule has a
+vector-valued decay, a vector-valued in-context learning rate and separate keys for removal
+and replacement. \Cref{sec:c06-comparison} compares the three.
+
+% ===========================================================================
+\section{Background: state tracking and the geometry of transitions}\label{sec:c06-background}
+
+\subsection{Recap: one recurrence, many transition matrices}\label{sec:c06-recap}
+
+All recurrent memories in this part of the book can be written, per head, as
+\begin{equation}\label{eq:c06-general}
+  \mS_t = \mS_{t-1}\mA_t + \mB_t, \qquad \vo_t = \mS_t\vq_t,
+\end{equation}
+with state $\mS_t\in\R^{d_v\times d_k}$, a \emph{transition matrix}
+$\mA_t\in\R^{d_k\times d_k}$ that acts on the key side of the state, and a \emph{write}
+$\mB_t\in\R^{d_v\times d_k}$. Both $\mA_t$ and $\mB_t$ are functions of the current token
+only. \Cref{tab:c06-transitions} lists the choices made by the models of
+\cref{ch:linear,ch:delta}. Unrolling \eqref{eq:c06-general} from $\mS_0$ gives
+\begin{equation}\label{eq:c06-unroll}
+  \mS_t = \mS_0\,\mA_1\mA_2\cdots\mA_t + \sum_{s=1}^{t}\mB_s\,\mA_{s+1}\cdots\mA_t ,
+\end{equation}
+where an empty product is the identity. The write $\mB_s$ deposits information; the
+products $\mA_{s+1}\cdots\mA_t$ decide what happens to it afterwards. In
+\cref{ch:linear,ch:delta} we read these products as \emph{forgetting} (a decay
+$\alpha_t<1$ shrinks old content) and \emph{erasing} (the delta rule removes the value
+stored under the current key). In this chapter we read them as \emph{computation}: the
+product of transition matrices is itself a summary of the input sequence, and what that
+summary can represent is limited by the set of matrices that $\mA_t$ may take.
+
+\begin{table}[t]
+\centering\small
+\caption{Transition and write of common matrix-state recurrences in the form
+$\mS_t=\mS_{t-1}\mA_t+\mB_t$ (unit-norm keys; $\alpha_t\in(0,1)$, $\beta_t\in(0,1)$ unless
+stated).}
+\label{tab:c06-transitions}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Model & Transition $\mA_t$ & Write $\mB_t$ \\
+\midrule
+Linear attention & $\mI$ & $\vv_t\vk_t\T$ \\
+RetNet, Mamba-2 & $\alpha_t\mI$ & $\vv_t\vk_t\T$ (Mamba-2: scaled) \\
+GLA, RWKV-6 & $\diag(\valpha_t)$ & $\vv_t\vk_t\T$ \\
+DeltaNet & $\mI-\beta_t\vk_t\vk_t\T$ & $\beta_t\vv_t\vk_t\T$ \\
+Gated DeltaNet & $\alpha_t(\mI-\beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ \\
+KDA (\cref{ch:delta}) & $\diag(\valpha_t)(\mI-\beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ \\
+\midrule
+DeltaProduct (this chapter) & $\alpha_t\prod_{j=1}^{n_h}(\mI-\beta_{t,j}\vk_{t,j}\vk_{t,j}\T)$, $\beta_{t,j}\in(0,2)$ & see \eqref{eq:c06-dp-B} \\
+Comba (this chapter) & $\alpha_t\mI-\tilde\beta_t\bm{p}_t\vk_t\T$ & $\beta_t\vv_t\vk_t\T$ \\
+RWKV-7 (this chapter) & $\diag(\vw_t)-\hat{\bm\kappa}_t(\va_t\had\hat{\bm\kappa}_t)\T$ & $\vv_t\tilde\vk_t\T$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The delta rule as one step of online gradient descent.}
+We will use one fact from \cref{ch:delta} repeatedly. Consider the regression loss
+$\loss_t(\mS)=\tfrac12\norm{\mS\vk_t-\vv_t}^2$, which is small when the memory maps the key
+$\vk_t$ to the value $\vv_t$. Its gradient with respect to $\mS$ is
+$\nabla_{\mS}\loss_t=(\mS\vk_t-\vv_t)\vk_t\T$ (differentiate entry $(i,j)$:
+$\partial\loss_t/\partial S_{ij}=(\mS\vk_t-\vv_t)_i\,k_{t,j}$). One gradient step with step
+size $\beta_t$ is therefore
+\begin{equation}\label{eq:c06-delta-gd}
+  \mS_t=\mS_{t-1}-\beta_t(\mS_{t-1}\vk_t-\vv_t)\vk_t\T
+       =\mS_{t-1}(\mI-\beta_t\vk_t\vk_t\T)+\beta_t\vv_t\vk_t\T ,
+\end{equation}
+which is the delta rule. The transition $\mI-\beta_t\vk_t\vk_t\T$ is the price of
+correcting the memory, and it is \emph{not} diagonal: it mixes the key channels of the
+state. This single fact is the source of the extra expressivity studied below.
+
+\subsection{State tracking as a memory capability}\label{sec:c06-state-tracking}
+
+\begin{definition}[State tracking]\label{def:c06-tracking}
+Let $Q$ be a finite set of states, $\Sigma$ a finite input alphabet and
+$\delta:Q\times\Sigma\to Q$ a transition function (a deterministic finite automaton). The
+\emph{state-tracking} problem is: given $x_1,\dots,x_T\in\Sigma$ and a start state $s_0$,
+output $s_t=\delta(s_{t-1},x_t)$ for every $t$. When the inputs are elements of a finite
+group $G$ and $s_t=x_1x_2\cdots x_t$ is their running product, the problem is called the
+\emph{word problem} for $G$.
+\end{definition}
+
+Three word problems recur in this chapter.
+\begin{itemize}
+\item \textbf{Parity}, the group $\mathbb{Z}_2=\{0,1\}$ under addition modulo~2: is the
+number of ones seen so far odd?
+\item \textbf{Counting modulo $m$}, the cyclic group $\mathbb{Z}_m$.
+\item \textbf{Permutation composition}, the symmetric group $S_n$ of all permutations of
+$n$ objects. Each token says ``swap the cups in positions 1 and 3'' or ``rotate the three
+cups''; the state is the current arrangement. $S_3$ is the smallest group in which the
+order of operations matters (it is not commutative); $S_5$ is the smallest symmetric group
+that is not \emph{solvable}, which will matter in \cref{sec:c06-complexity}.
+\end{itemize}
+State tracking is a memory problem because the correct output depends on \emph{every}
+earlier token and on their order, yet there is nothing to look up: the model must keep a
+running summary and update it by composition. A Transformer can solve short instances by
+attending to all earlier tokens, but its fixed depth limits how long a chain of
+compositions it can evaluate (\cref{sec:c06-complexity}).
+
+\paragraph{How a linear recurrence can track a group.}
+Suppose each group element $g$ is assigned a $d\times d$ matrix $\rho(g)$ with
+$\rho(g)\rho(h)=\rho(gh)$ (a \emph{matrix representation}). If the transition is
+$\mA_t=\rho(x_t)$, the write is $\mB_t=\bm 0$ and $\mS_0=\mI$, then by
+\eqref{eq:c06-unroll}
+\begin{equation}\label{eq:c06-rep}
+  \mS_t=\rho(x_1)\rho(x_2)\cdots\rho(x_t)=\rho(x_1x_2\cdots x_t),
+\end{equation}
+so the state \emph{is} the running product, and a query that compares $\mS_t$ with the
+finitely many matrices $\rho(g)$ reads it out. Small examples:
+\begin{itemize}
+\item Parity: $\rho(0)=1$, $\rho(1)=-1$ (with $d=1$). The state is $(-1)^{\#\text{ones}}$.
+\item $\mathbb{Z}_3$: $\rho(1)$ is the rotation of the plane by $120^\circ$.
+\item $S_n$: $\rho(\sigma)$ is the $n\times n$ permutation matrix of $\sigma$.
+\end{itemize}
+
+\begin{keyidea}
+A recurrent memory can track a group exactly when its transition matrices can realize a
+representation of that group. Parity needs the eigenvalue $-1$; counting modulo $m$ needs
+rotations (complex eigenvalues $e^{\pm 2\pi i/m}$); non-commutative groups such as $S_3$
+and $S_5$ need transitions that do not commute with one another, hence cannot all be
+diagonal in the same basis.
+\end{keyidea}
+
+\subsection{Why diagonal, positive transitions cannot track parity}\label{sec:c06-parity}
+
+Most efficient recurrences of \cref{ch:linear} use diagonal transitions with entries in
+$[0,1]$ (decays). The following proposition shows that such a layer cannot compute parity
+for all lengths, however many channels it has. We prove it for one layer with a threshold
+read-out; \citet{c03-grazzi2025unlocking} prove the general finite-precision statement for
+multi-layer linear RNNs whose transitions have only non-negative eigenvalues.
+
+\begin{proposition}[Positive diagonal transitions and parity]\label{prop:c06-parity}
+Consider $\vh_t=\va(x_t)\had\vh_{t-1}+\vb(x_t)$ with $\vh_t\in\R^m$, inputs
+$x_t\in\{0,1\}$, any functions $\va:\{0,1\}\to[0,1]^m$, $\vb:\{0,1\}\to\R^m$, and the
+read-out $y_t=\mathbb{1}[\bm{c}\T\vh_t>\theta]$. Then on the all-ones input $1^n$ the output
+$y_n$ is eventually constant in $n$ (up to a measure-zero tie $\bm{c}\T\vh^\star=\theta$). In
+particular no such model outputs the parity of $1^n$ for every $n$.
+\end{proposition}
+
+\begin{proof}
+On the input $1^n$ the coefficients are constant: $\va=\va(1)$, $\vb=\vb(1)$. Treat each
+channel $i$ separately.
+If $a_i<1$, let $h_i^\star=b_i/(1-a_i)$ be the fixed point. Subtracting
+$h_i^\star=a_ih_i^\star+b_i$ from $h_{n,i}=a_ih_{n-1,i}+b_i$ gives
+$h_{n,i}-h_i^\star=a_i(h_{n-1,i}-h_i^\star)$, hence
+$h_{n,i}=h_i^\star+a_i^{\,n}(h_{0,i}-h_i^\star)\to h_i^\star$.
+If $a_i=1$, then $h_{n,i}=h_{0,i}+nb_i$, a linear function of $n$.
+So $f(n)=\bm{c}\T\vh_n-\theta=\gamma_0+\gamma_1 n+\varepsilon(n)$ with $\varepsilon(n)\to0$,
+where $\gamma_1=\sum_{i:a_i=1}c_ib_i$. If $\gamma_1\neq0$ the sign of $f(n)$ is
+eventually the sign of $\gamma_1$. If $\gamma_1=0$ then $f(n)\to\gamma_0$, and if
+$\gamma_0\ne0$ the sign is eventually that of $\gamma_0$. In both cases $y_n$ stops
+changing, while parity alternates forever.
+\end{proof}
+
+The argument has a simple reading: with non-negative decays every channel moves
+\emph{monotonically} toward a fixed point (or away from it at constant speed); nothing in the
+state can oscillate. A deeper network does not help: if the input to a layer is eventually
+constant, the same argument applies to that layer, and in finite precision a convergent
+state becomes \emph{exactly} constant after finitely many steps, so the next layer also sees
+an eventually constant input. This induction is the core of the finite-precision theorem of
+\citet{c03-grazzi2025unlocking}. Our numerical check (2000 random four-channel models on
+$1^{400}$) found at most two sign changes of the read-out, whereas parity needs 399.
+
+A single negative eigenvalue repairs this. Take $m=1$, $a(0)=1$, $a(1)=-1$, $b\equiv0$
+and $h_0=1$: then $h_n=(-1)^{\#\text{ones}}$ and the sign of the state is the parity. In
+delta-rule form this is \eqref{eq:c06-delta-gd} with $d_k=d_v=1$, $k_t=1$, $v_t=0$ and
+$\beta_t=2x_t$: the transition $1-\beta_t$ is $+1$ for a zero and $-1$ for a one. Our check
+tracked parity without error over $10^5$ random bits this way.
+
+\subsection{A circuit-complexity view: TC\texorpdfstring{$^0$}{0} versus NC\texorpdfstring{$^1$}{1}}\label{sec:c06-complexity}
+
+Parity is not a ``hard'' problem; it failed above only because of the sign of the
+eigenvalues. A second, deeper limitation concerns \emph{non-commutative} composition. It is
+best explained with Boolean circuits, which model parallel computation: the \emph{size} of
+a circuit is its number of gates and its \emph{depth} is the length of the longest path
+from an input to the output, i.e.\ the parallel running time.
+\begin{itemize}
+\item \textbf{NC$^1$}: problems solvable by circuits of polynomial size and depth
+$\bigO(\log n)$ built from AND, OR and NOT gates with two inputs each.
+\item \textbf{TC$^0$}: problems solvable by circuits of polynomial size and \emph{constant}
+depth, where gates may have any number of inputs and may be \emph{threshold} (majority)
+gates, which output 1 when enough of their inputs are 1.
+\end{itemize}
+Threshold gates can count, so TC$^0$ contains addition and multiplication of integers,
+counting, and parity. It is known that TC$^0\subseteq$ NC$^1$, and it is widely believed,
+though unproven, that the inclusion is strict. The canonical NC$^1$-hard problem is a word
+problem: \citet{c06-barrington1989} showed that the word problem for $S_5$ (more generally,
+for any non-solvable group) is complete for NC$^1$. Intuitively, composing permutations of
+five objects is ``inherently sequential'': unlike sums, which can be regrouped and counted,
+the result depends on the order in a way no constant-depth threshold circuit can capture,
+unless TC$^0=$ NC$^1$.
+
+Where do sequence models sit?
+\begin{itemize}
+\item Transformers with log-precision arithmetic can be simulated by uniform TC$^0$
+circuits~\citep{c06-merrill2023parallelism}. So, under the standard conjecture, a
+fixed-depth Transformer cannot solve the $S_5$ word problem for all lengths.
+\item \citet{c06-merrill2024illusion} show the same for state-space models such as S4 and
+Mamba, whose transitions are diagonal (or fixed): their ``state'' is in this sense an
+illusion. The intuition: with diagonal transitions, every entry of the state is a sum of
+terms $b_s\prod_{r=s+1}^{t}a_r$; products of scalars are sums of logarithms, and iterated
+sums and products of numbers are computable in TC$^0$.
+\item Non-diagonal, input-dependent transitions escape this argument. Multiplying
+$t$ permutation matrices \emph{is} the $S_5$ word problem. Such a product can still be
+computed in parallel by a tree of pairwise multiplications (matrix multiplication is
+associative), in depth $\bigO(\log T)$, which places these models naturally in NC$^1$.
+This is exactly the regime of DeltaNet with negative eigenvalues, DeltaProduct and RWKV-7.
+\end{itemize}
+Two cautions keep this picture honest. First, these are statements about exact solutions
+for \emph{all} sequence lengths; for bounded lengths a deep enough Transformer or SSM can
+learn shortcuts. Second, the bounds concern what an architecture \emph{can} represent, not
+what training finds. Still, the theory makes a sharp, testable prediction, and the
+experiments in the DeltaProduct repository follow it: with eigenvalues restricted to $[0,1]$,
+or with too few Householder factors per token, a single layer fails on $S_3$ and $S_5$, while
+enough factors with eigenvalues in $[-1,1]$ succeed (\cref{sec:c06-dp-results}).
+
+\subsection{Eigenvalues of generalized Householder matrices}\label{sec:c06-householder}
+
+\begin{definition}[Generalized Householder matrix]\label{def:c06-householder}
+For a unit vector $\vk\in\R^{d}$ ($\norm{\vk}=1$) and a scalar $\beta$, let
+$\mH(\vk,\beta)=\mI-\beta\vk\vk\T$. For $\beta=2$ this is the Householder
+reflection~\citep{c06-householder1958} across the hyperplane orthogonal to $\vk$.
+\end{definition}
+
+The spectrum follows from two one-line computations. For the key itself,
+$\mH\vk=\vk-\beta\vk(\vk\T\vk)=(1-\beta)\vk$. For any $\vu\perp\vk$,
+$\mH\vu=\vu-\beta\vk(\vk\T\vu)=\vu$. Hence
+\begin{equation}\label{eq:c06-hh-eig}
+  \text{eigenvalues of }\mH(\vk,\beta):\quad \underbrace{1,\dots,1}_{d-1\text{ times}},\;1-\beta .
+\end{equation}
+Since $\mH$ is symmetric, its spectral norm is the largest absolute eigenvalue,
+$\norm{\mH}_2=\max(1,\abs{1-\beta})$, which is at most one exactly when
+$\beta\in[0,2]$. Three regimes matter (our check confirmed the eigenvalues numerically):
+\begin{itemize}
+\item $\beta\in[0,1]$ (DeltaNet and Gated DeltaNet with $\beta_t=\sigmoid(\cdot)$):
+eigenvalue $1-\beta\in[0,1]$. At $\beta=1$ the memory under $\vk$ is erased and replaced
+(a projection).
+\item $\beta\in(1,2)$: eigenvalue in $(-1,0)$. The memory \emph{overshoots}.
+\item $\beta=2$: eigenvalue $-1$, an orthogonal reflection.
+\end{itemize}
+The memory interpretation of a negative eigenvalue is instructive. Multiply
+\eqref{eq:c06-delta-gd} by $\vk_t$ and subtract $\vv_t$:
+\begin{equation}\label{eq:c06-residual}
+  \mS_t\vk_t-\vv_t=(1-\beta_t)\,(\mS_{t-1}\vk_t-\vv_t).
+\end{equation}
+The retrieval error for the current key shrinks by the factor $1-\beta_t$. For
+$\beta_t\in(0,1)$ the correction stops short of the target, for $\beta_t=1$ it hits it, and
+for $\beta_t\in(1,2)$ it passes the target and flips the sign of the error, while still
+reducing its size. This is the familiar stability condition of gradient descent on a
+quadratic with curvature $\norm{\vk_t}^2=1$: step sizes up to $2/\text{curvature}$ converge.
+Allowing $\beta_t\in(0,2)$ is therefore a natural extension of the online-learning view,
+and in code it is literally one line: \texttt{beta = beta * 2}~\citep{c03-grazzi2025unlocking}.
+
+\begin{pitfall}
+The eigenvalue along $\vk$ is $1-\beta\norm{\vk}^2$, not $1-\beta$. All implementations in
+this chapter normalize keys (\code{use_qk_l2norm_in_kernel=True} in \fla); without unit
+keys, doubling $\beta$ can push the eigenvalue below $-1$ and make the recurrence explode.
+\end{pitfall}
+
+\paragraph{Products of Householder matrices.}
+A single generalized Householder matrix is symmetric, so all its eigenvalues are real. Their
+products are not symmetric and can have complex eigenvalues. The classical example
+(proved in \cref{ex:c06-rotation}) is that two reflections compose to a rotation: if $\vk_1,\vk_2$
+are unit vectors at angle $\theta$, then $\mH(\vk_1,2)\mH(\vk_2,2)$ rotates the plane
+$\mathrm{span}\{\vk_1,\vk_2\}$ by $2\theta$ and leaves its orthogonal complement fixed, with
+eigenvalues $e^{\pm 2i\theta}$ there (our check confirmed this to $10^{-16}$). Two
+reflections whose normals are $60^\circ$ apart give a rotation $\bm{R}$ by $120^\circ$ with
+$\bm{R}^3=\mI$, a representation of $\mathbb{Z}_3$. More generally, the
+Cartan--Dieudonn\'e theorem states that every orthogonal $d\times d$ matrix is a product of
+at most $d$ reflections, so products of Householders can reach every rotation and every
+permutation.
+
+Two facts make long products cheap. First, a product of $n$ generalized Householders is
+the identity minus a matrix of rank at most $n$. Writing
+$\prod_{j=1}^{n}(\mI-\beta_j\vk_j\vk_j\T)=\mI-\sum_{j=1}^{n}\vw_j\vk_j\T$ and multiplying
+one more factor on the right shows, by induction, that
+\begin{equation}\label{eq:c06-wy}
+  \vw_j=\beta_j\Big(\vk_j-\sum_{i<j}\vw_i\,(\vk_i\T\vk_j)\Big),
+\end{equation}
+the WY representation~\citep{c03-bischof1987wy} that \cref{ch:linear} turns into the
+chunkwise ``UT transform''. Second, applying the product to a state never requires forming
+it: $n$ rank-one updates cost $\bigO(n\,d_kd_v)$. Finally, every factor with
+$\beta_j\in[0,2]$ has norm at most one, so the product has norm at most one and all its
+eigenvalues lie in the closed unit disk: products of stable Householders are stable.
+
+\paragraph{Exact permutation tracking.}
+The next proposition, which we derive here because it explains the experiments of the
+DeltaProduct repository, pins down exactly how many Householder factors a transition needs
+in order to \emph{be} a permutation matrix.
+
+\begin{proposition}[Permutations as Householder products]\label{prop:c06-perm}
+Let $\mP$ be the $n\times n$ permutation matrix of $\sigma\in S_n$ and let $c(\sigma)$ be the
+number of cycles of $\sigma$, counting fixed points. Suppose
+$\mP=\prod_{j=1}^{m}\mH(\vk_j,\beta_j)$ with unit $\vk_j$ and $\beta_j\in[0,2]$. Then
+(a) every $\beta_j\in\{0,2\}$, i.e.\ every non-trivial factor is an exact reflection;
+(b) $m\ge n-c(\sigma)$; and (c) $m=n-c(\sigma)$ factors suffice. Hence $n-1$ factors
+represent every element of $S_n$, and $n-1$ are needed for an $n$-cycle.
+\end{proposition}
+
+\begin{proof}
+(a) Determinants multiply, and by \eqref{eq:c06-hh-eig}
+$\det\mH(\vk,\beta)=1-\beta$. A permutation matrix has $\det\mP=\pm1$, so
+$\prod_j\abs{1-\beta_j}=1$. Each factor satisfies $\abs{1-\beta_j}\le1$ when
+$\beta_j\in[0,2]$, so every factor must equal one in absolute value: $\beta_j\in\{0,2\}$.
+(b) By \eqref{eq:c06-wy}, $\mI-\mP=\sum_{j}\vw_j\vk_j\T$ has rank at most $m$. The kernel of
+$\mI-\mP$ is the set of vectors fixed by the permutation, i.e.\ vectors that are constant
+on each cycle, a space of dimension $c(\sigma)$; so $\rank(\mI-\mP)=n-c(\sigma)\le m$.
+(c) A transposition $(i\,j)$ is the reflection with $\vk=(\ve_i-\ve_j)/\sqrt2$ and $\beta=2$:
+indeed $(\mI-(\ve_i-\ve_j)(\ve_i-\ve_j)\T)\ve_i=\ve_i-(\ve_i-\ve_j)=\ve_j$, symmetrically
+$\ve_j\mapsto\ve_i$, and every other basis vector is orthogonal to $\ve_i-\ve_j$ and fixed. A
+cycle of length $\ell$ is a product of $\ell-1$ transpositions, so $\sigma$ is a product of
+$\sum(\ell-1)=n-c(\sigma)$ transpositions.
+\end{proof}
+
+Part (a) explains why eigenvalues in $[0,1]$ are useless for exact permutation tracking no
+matter how many factors are used (every factor would need $\beta_j=0$). Part (b)--(c)
+predicts that one layer tracks $S_3$ with two factors per token and $S_5$ with four. We
+verified the construction numerically: with transposition reflections and $v=0$, a state
+initialized at $\mI$ tracked random words of length 2000 over $S_3$, $S_4$ and $S_5$ with no
+error, using at most 2, 3 and 4 delta steps per token. A single factor is not enough for a
+3-cycle for a simpler reason as well: a 3-cycle has the complex eigenvalues
+$e^{\pm2\pi i/3}$, while $\mH(\vk,\beta)$ is symmetric with real eigenvalues.
+
+\subsection{Diagonal-plus-low-rank transitions}\label{sec:c06-dplr}
+
+The transitions of \cref{tab:c06-transitions} share one structure: a diagonal matrix plus
+a matrix of low rank,
+\begin{equation}\label{eq:c06-dplr}
+  \mA_t=\mD_t+\bm\phi_t\bm\psi_t\T,\qquad \mD_t \text{ diagonal},\ \bm\phi_t,\bm\psi_t\in\R^{d_k}
+\end{equation}
+(DPLR; with $n$ rank-one terms for DeltaProduct). The \fla{} library names the special
+cases \emph{IPLR} ($\mD_t=\mI$, identity plus low rank) and DPLR; Comba calls the case
+$\mD_t=\alpha_t\mI$ \emph{SPLR} (scalar plus low rank). DeltaNet is IPLR with
+$\bm\phi_t=-\beta_t\vk_t$, $\bm\psi_t=\vk_t$; Gated DeltaNet is SPLR with
+$\bm\phi_t=-\alpha_t\beta_t\vk_t$, $\bm\psi_t=\vk_t$; KDA is DPLR with
+$\mD_t=\diag(\valpha_t)$, $\bm\phi_t=-\beta_t\valpha_t\had\vk_t$, $\bm\psi_t=\vk_t$; RWKV-7 is DPLR with
+$\bm\phi_t=-\hat{\bm\kappa}_t$, $\bm\psi_t=\va_t\had\hat{\bm\kappa}_t$.
+
+DPLR matrices are attractive because (i) multiplying a state by one costs $\bigO(d_kd_v)$,
+like a diagonal transition, (ii) unlike a diagonal, they mix channels and need not commute
+with each other, and (iii) products of them inside a chunk have a compact
+WY-like form, which gives chunkwise-parallel training (we derive the DPLR version in
+\cref{sec:c06-rwkv-formulation}). Their eigenvalues, however, are not automatically
+controlled. For the identity-plus-rank-one case the answer is simple: $\mI+\bm\phi\bm\psi\T$
+fixes every vector orthogonal to $\bm\psi$, and $(\mI+\bm\phi\bm\psi\T)\bm\phi=
+(1+\bm\psi\T\bm\phi)\bm\phi$, so the eigenvalues are $1$ (with multiplicity $d-1$) and
+$1+\bm\psi\T\bm\phi$. To stay in $[-1,1]$ one needs $\bm\psi\T\bm\phi\in[-2,0]$, which is why
+the \fla{} documentation (\repofile{repos/fla-org__flash-linear-attention/fla/ops/generalized_delta_rule/README.md})
+warns that $\bm\phi$ and $\bm\psi$ must point in opposite directions. With a non-identity
+diagonal no such closed form exists in general; each system in this chapter restricts the
+structure so that the spectrum stays controlled, and we analyze each one in turn.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=3.6cm,y=0.62cm]
+  \draw[->,thick] (-1.12,0) -- (1.18,0) node[right] {\small $\mathrm{Re}\,\lambda$};
+  \foreach \x/\l in {-1/{$-1$},-0.4548/{$-0.45$},0/{$0$},1/{$1$}} {
+    \draw (\x,0.12) -- (\x,-0.12) node[below] {\scriptsize \l};
+  }
+  \draw[dotted] (-1,0) -- (-1,6.6); \draw[dotted] (0,0) -- (0,6.6); \draw[dotted] (1,0) -- (1,6.6);
+  \draw[line width=3pt,gray!70] (0.02,1) -- (0.98,1);
+  \node[left] at (-1.15,1) {\small Mamba-2, GLA (diagonal decay)};
+  \draw[line width=3pt,blue!60] (0,2) -- (1,2);
+  \node[left] at (-1.15,2) {\small DeltaNet, Gated DeltaNet};
+  \draw[line width=3pt,blue!80!black] (-1,3) -- (1,3);
+  \node[left] at (-1.15,3) {\small DeltaNet with $\beta\in(0,2)$};
+  \draw[line width=3pt,teal!70] (-0.98,4) -- (0.98,4);
+  \node[left] at (-1.15,4) {\small Comba (SPLR, $\alpha-\beta$ and $\alpha$)};
+  \draw[line width=3pt,orange!80] (-0.4548,5) -- (1,5);
+  \node[left] at (-1.15,5) {\small RWKV-7 (clamped decay)};
+  \draw[line width=3pt,red!60] (-1,6) -- (1,6);
+  \node[left] at (-1.15,6) {\small DeltaProduct (complex, $\abs{\lambda}\le1$)};
+\end{tikzpicture}
+\caption{Real parts of the eigenvalues that a \emph{single} transition matrix can have in
+each family (unit keys). Only DeltaProduct can produce complex eigenvalues (rotations) in a
+single step; DeltaNet with $\beta\in(0,2)$, Comba and RWKV-7 have real spectra per step.
+The RWKV-7 bound is derived in \cref{sec:c06-rwkv-eig}.}
+\label{fig:c06-eig}
+\end{figure}
+
+% ===========================================================================
+\section{DeltaProduct: several delta steps per token}\label{sec:c06-deltaproduct}
+
+\subsection{Motivation}
+
+DeltaNet with $\beta_t\in(0,2)$ can realize one reflection per token, which is enough for
+parity (\cref{sec:c06-parity}) but, by \cref{prop:c06-perm}, not for a 3-cycle, let alone
+for $S_5$. Its transition is identity plus \emph{rank one}, and a rank-one change of the
+identity can only move one direction of the state. DeltaProduct~\citep{siems2025deltaproduct}
+asks: since the delta rule is one step of online gradient descent on
+$\tfrac12\norm{\mS\vk-\vv}^2$ (\cref{eq:c06-delta-gd}), why not take \emph{several} steps per
+token, each with its own key, value and step size? The transition then becomes a product
+of $n_h$ generalized Householder matrices, identity plus rank $n_h$, and $n_h$ becomes a
+dial between the cost of DeltaNet ($n_h=1$) and the expressivity of arbitrary orthogonal
+transitions ($n_h=d_k$). Crucially, the state size does not change: DeltaProduct buys
+expressivity with computation, not with memory.
+
+\begin{taxonomy}
+Following \citet{zhoubian2026memory}: \textbf{representation} implicit (a fixed-size
+recurrent state inside the forward pass); \textbf{update dynamics} online (written at every
+token during inference); \textbf{persistence}: DeltaProduct is discussed in the survey's
+\S III-C (``Expressive Delta and Bilinear Updates'') but not listed in its Table~I; by the
+survey's criteria for the related Gated DeltaNet it would be long-term (our
+classification); \textbf{update rule} (Table~II): state-transition update, here a product of
+$n_h$ delta-rule corrections per token.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c06-dp-formulation}
+
+\paragraph{Per-token recurrence.}
+At token $t$ the layer produces one query $\vq_t$, a forget gate $\alpha_t\in(0,1]$ and
+$n_h$ triples $(\vk_{t,j},\vv_{t,j},\beta_{t,j})$, $j=1,\dots,n_h$, with unit keys and
+$\beta_{t,j}\in(0,2)$ (or $(0,1)$ if negative eigenvalues are disabled). Starting from the
+decayed state $\mS_{t,0}=\alpha_t\mS_{t-1}$, it takes $n_h$ gradient steps, step $j$ on the
+loss $\tfrac12\norm{\mS\vk_{t,j}-\vv_{t,j}}^2$:
+\begin{equation}\label{eq:c06-dp-step}
+  \mS_{t,j}=\mS_{t,j-1}-\beta_{t,j}(\mS_{t,j-1}\vk_{t,j}-\vv_{t,j})\vk_{t,j}\T
+          =\mS_{t,j-1}\mH_{t,j}+\beta_{t,j}\vv_{t,j}\vk_{t,j}\T,
+\end{equation}
+with $\mH_{t,j}=\mI-\beta_{t,j}\vk_{t,j}\vk_{t,j}\T$. The new state is
+$\mS_t=\mS_{t,n_h}$ and the read-out is $\vo_t=\mS_t\vq_t$, \emph{after} all $n_h$ steps.
+
+\paragraph{The equivalent one-step form.}
+Unrolling the $n_h$ inner steps exactly as in \eqref{eq:c06-unroll} gives the standard form
+$\mS_t=\mS_{t-1}\mA_t+\mB_t$ with
+\begin{align}
+  \mA_t&=\alpha_t\,\mH_{t,1}\mH_{t,2}\cdots\mH_{t,n_h}, \label{eq:c06-dp-A}\\
+  \mB_t&=\sum_{j=1}^{n_h}\beta_{t,j}\vv_{t,j}\vk_{t,j}\T\,\mH_{t,j+1}\cdots\mH_{t,n_h}. \label{eq:c06-dp-B}
+\end{align}
+By \eqref{eq:c06-wy}, $\mA_t=\alpha_t(\mI-\sum_j\vw_{t,j}\vk_{t,j}\T)$ is a scalar times
+identity-plus-rank-$n_h$, which is the ``diagonal plus rank $n_h$'' structure the paper
+emphasizes (it uses a scalar gate; with a diagonal gate it would be DPLR). Every factor has
+norm at most one when $\beta_{t,j}\in[0,2]$, so $\norm{\mA_t}_2\le\alpha_t\le1$ and the
+eigenvalues lie in the disk of radius $\alpha_t$; unlike DeltaNet they can be complex. Our
+check confirmed \eqref{eq:c06-dp-A}--\eqref{eq:c06-dp-B} to $10^{-16}$, that
+$\rank(\mI-\mH_{t,1}\cdots\mH_{t,n_h})=n_h$ for generic keys, and that the spectral norm of
+the product is one.
+
+\paragraph{Special cases.}
+With $n_h=1$ the recurrence is exactly the gated delta rule (our check: zero difference).
+With $\alpha_t\equiv1$ it is the ungated DeltaProduct. With $\beta_{t,j}\in(0,1)$ it is
+DeltaProduct$_{n_h}[0,1]$ in the paper's notation, with $\beta_{t,j}\in(0,2)$ it is
+DeltaProduct$_{n_h}[-1,1]$: the bracket names the eigenvalue range of each factor.
+
+\paragraph{Expressivity.}
+By \cref{prop:c06-perm}, DeltaProduct$_{n_h}[-1,1]$ can realize every permutation of
+$n_h+1$ objects as a single transition, so one layer can track $S_{n_h+1}$ by
+\eqref{eq:c06-rep}; with $[0,1]$ factors it can realize no non-trivial permutation at all.
+By the Cartan--Dieudonn\'e theorem, $n_h=d_k$ reaches every orthogonal transition. The
+paper goes further: it characterizes state tracking in finite precision and how it improves
+with $n_h$ and with depth (see the paper for the exact theorems), and it reads the
+improvement in language modeling partly as better length extrapolation.
+
+\paragraph{How the $n_h$ keys, values and step sizes are produced.}
+Each token embedding $\vx_t$ is projected separately for each step $j$, followed by the
+usual short causal convolution and SiLU (the same pipeline as Gated DeltaNet in
+\cref{ch:delta}):
+\begin{equation}\label{eq:c06-dp-proj}
+  \vk_{t,j}=\frac{\SiLU(\mathrm{conv}(\mW_{K,j}\T\vx_t))}{\norm{\cdot}},\quad
+  \vv_{t,j}=\SiLU(\mathrm{conv}(\mW_{V,j}\T\vx_t)),\quad
+  \beta_{t,j}=c\,\sigmoid(\vw_{\beta,j}\T\vx_t),
+\end{equation}
+with $c=2$ when negative eigenvalues are allowed and $c=1$ otherwise. The query and the gate
+are produced once per token; the gate has the Mamba-2 form
+$\log\alpha_t=-e^{A}\,\mathrm{softplus}(\vw_\alpha\T\vx_t+b_{\Delta})$ with learned scalars
+$A$ and $b_\Delta$ per head. The extra parameters are $(n_h-1)$ copies of the key, value and
+$\beta$ projections; the parameter-matched configurations in the official repository
+compensate by using fewer heads (\cref{sec:c06-dp-code}).
+
+\paragraph{Chunkwise form by interleaving.}
+The inner loop \eqref{eq:c06-dp-step} is just the gated delta rule run on a sequence that is
+$n_h$ times longer. Define the interleaved sequence of length $Tn_h$, indexed by
+$\tau=(t-1)n_h+j$:
+\begin{equation}\label{eq:c06-interleave}
+  \tilde\vk_\tau=\vk_{t,j},\quad \tilde\vv_\tau=\vv_{t,j},\quad
+  \tilde\beta_\tau=\beta_{t,j},\quad
+  \log\tilde\alpha_\tau=\begin{cases}\log\alpha_t & j=1\\ 0 & j>1\end{cases},\quad
+  \tilde\vq_\tau=\begin{cases}\vq_t & j=n_h\\ \bm 0 & j<n_h\end{cases}.
+\end{equation}
+Run the gated delta rule
+$\tilde\mS_\tau=\tilde\alpha_\tau\tilde\mS_{\tau-1}(\mI-\tilde\beta_\tau\tilde\vk_\tau\tilde\vk_\tau\T)
++\tilde\beta_\tau\tilde\vv_\tau\tilde\vk_\tau\T$ and keep the outputs
+$\tilde\vo_{tn_h}$, $t=1,\dots,T$.
+
+\begin{proposition}\label{prop:c06-interleave}
+$\tilde\mS_{tn_h}=\mS_t$ and $\tilde\vo_{tn_h}=\vo_t$ for all $t$.
+\end{proposition}
+\begin{proof}
+By induction on $t$; $t=0$ is trivial ($\tilde\mS_0=\mS_0$). Assume
+$\tilde\mS_{(t-1)n_h}=\mS_{t-1}$. At $\tau=(t-1)n_h+1$ the gate is $\alpha_t$ and the update
+is step $j=1$ of \eqref{eq:c06-dp-step} applied to $\alpha_t\mS_{t-1}=\mS_{t,0}$. At the
+following $n_h-1$ positions the gate is $e^0=1$, so the updates are exactly steps
+$j=2,\dots,n_h$. Hence $\tilde\mS_{tn_h}=\mS_{t,n_h}=\mS_t$, and the output at that position
+uses $\tilde\vq_{tn_h}=\vq_t$. Outputs at the other positions use a zero query and are
+discarded.
+\end{proof}
+
+Consequently every chunkwise algorithm for the gated delta rule (the WY/UT transform of
+\cref{ch:linear,ch:delta}) trains DeltaProduct unchanged. For completeness we restate the
+one we checked numerically, in our notation. Split the interleaved sequence into chunks of
+length $C$. Inside a chunk with start state $\mS_{[i]}$, let
+$\gamma_r=\prod_{s\le r}\tilde\alpha_s$ (cumulative within the chunk) and let
+$\vu_r$ be the ``pseudo-value'' written at position $r$, so that
+$\tilde\mS_r=\gamma_r\mS_{[i]}+\sum_{s\le r}(\gamma_r/\gamma_s)\vu_s\tilde\vk_s\T$. Matching
+with the recurrence gives
+$\vu_r=\tilde\beta_r(\tilde\vv_r-\gamma_r\mS_{[i]}\tilde\vk_r-\sum_{s<r}(\gamma_r/\gamma_s)(\tilde\vk_s\T\tilde\vk_r)\vu_s)$,
+a lower-triangular linear system. In matrix form, with
+$(\mT)_{rs}=\tilde\beta_r(\gamma_r/\gamma_s)\tilde\vk_r\T\tilde\vk_s$ for $s<r$ (zero
+otherwise) and $\mM=(\mI+\mT)^{-1}$:
+\begin{equation}\label{eq:c06-ut}
+  \mU=\mM\diag(\tilde\vbeta)\tilde\mV-\mM\diag(\tilde\vbeta\had\bm{\gamma})\tilde\mK\,\mS_{[i]}\T,
+\end{equation}
+\begin{equation}\label{eq:c06-ut-out}
+  \tilde\mO_{[i]}=\diag(\bm{\gamma})\tilde\mQ\mS_{[i]}\T+\big((\tilde\mQ\tilde\mK\T)\had\bm{\Gamma}\big)_{\le}\mU,\qquad
+  \mS_{[i+1]}=\gamma_C\mS_{[i]}+\mU\T\diag(\gamma_C/\bm{\gamma})\tilde\mK,
+\end{equation}
+where $\bm{\Gamma}_{rs}=\gamma_r/\gamma_s$ and $(\cdot)_{\le}$ keeps the lower triangle including
+the diagonal. Our NumPy implementation of \eqref{eq:c06-ut}--\eqref{eq:c06-ut-out} on the
+interleaved sequence matched the DeltaProduct recurrence to $3\times10^{-15}$ for chunk sizes
+4, 8 and 16.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  tok/.style={draw,rounded corners=1pt,minimum width=1.0cm,minimum height=0.55cm,font=\scriptsize},
+  >=Stealth]
+  \foreach \tk/\x in {1/0,2/4.6} {
+    \node[tok,fill=blue!8]  (a\tk) at (\x,0)     {$\vk_{\tk,1},\vv_{\tk,1}$};
+    \node[tok,fill=blue!8]  (b\tk) at (\x+1.5,0) {$\vk_{\tk,2},\vv_{\tk,2}$};
+    \node[tok,fill=blue!8]  (c\tk) at (\x+3.0,0) {$\vk_{\tk,3},\vv_{\tk,3}$};
+    \node[font=\scriptsize,above=0.05cm of a\tk] {gate $\alpha_{\tk}$};
+    \node[font=\scriptsize,above=0.05cm of b\tk] {gate $1$};
+    \node[font=\scriptsize,above=0.05cm of c\tk] {gate $1$};
+    \node[font=\scriptsize,below=0.05cm of a\tk] {$\vq=\bm 0$};
+    \node[font=\scriptsize,below=0.05cm of b\tk] {$\vq=\bm 0$};
+    \node[font=\scriptsize,below=0.05cm of c\tk,fill=red!8] {$\vq=\vq_{\tk}$};
+    \draw[decorate,decoration={brace,amplitude=4pt}] ([yshift=0.55cm]a\tk.north west) -- ([yshift=0.55cm]c\tk.north east)
+      node[midway,above=4pt,font=\scriptsize] {token $\tk$};
+  }
+  \node[font=\scriptsize] at (8.6,0) {$\cdots$};
+  \node[font=\scriptsize,align=left,anchor=west] at (-0.6,-1.25)
+    {gated delta rule over $Tn_h$ positions; keep outputs $n_h,2n_h,\dots$};
+\end{tikzpicture}
+\caption{DeltaProduct with $n_h=3$ as a gated delta rule over an interleaved sequence: the
+decay is applied once per token (first sub-step) and the memory is read once per token
+(last sub-step).}
+\label{fig:c06-interleave}
+\end{figure}
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{DeltaProduct (one head): decoding step and chunkwise prefill}
+\label{alg:c06-deltaproduct}
+\begin{algorithmic}[1]
+\Require state $\mS\in\R^{d_v\times d_k}$; gate $\alpha_t$; query $\vq_t$; triples $(\vk_{t,j},\vv_{t,j},\beta_{t,j})_{j=1}^{n_h}$
+\Statex \textbf{Decoding one token}
+\State $\mS\gets\alpha_t\mS$ \Comment{decay once per token}
+\For{$j=1,\dots,n_h$}
+  \State $\ve\gets\mS\vk_{t,j}-\vv_{t,j}$ \Comment{prediction error, $\bigO(d_kd_v)$}
+  \State $\mS\gets\mS-\beta_{t,j}\,\ve\,\vk_{t,j}\T$ \Comment{one online gradient step}
+\EndFor
+\State \Return $\vo_t=\mS\vq_t$ and $\mS$
+\Statex \textbf{Prefill of a sequence of $T$ tokens}
+\State Build $(\tilde\mQ,\tilde\mK,\tilde\mV,\tilde\vbeta,\log\tilde\valpha)$ of length $Tn_h$ by \eqref{eq:c06-interleave}
+\For{each chunk $[i]$ of $C$ interleaved positions}
+  \State Solve \eqref{eq:c06-ut} for the pseudo-values $\mU$ (one $C\times C$ triangular inverse)
+  \State Compute the chunk outputs and $\mS_{[i+1]}$ by \eqref{eq:c06-ut-out}
+\EndFor
+\State \Return rows $n_h,2n_h,\dots,Tn_h$ of $\tilde\mO$ and the final state
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c06-deltaproduct} summarizes both modes. Per head:
+\begin{itemize}
+\item \textbf{State size}: $d_kd_v$, the same as DeltaNet for every $n_h$.
+\item \textbf{Decoding}: $n_h$ rank-one updates and one read, $\bigO(n_h\,d_kd_v)$ time per
+token (about $n_h$ times Gated DeltaNet).
+\item \textbf{Prefill}: the chunkwise gated delta rule on $Tn_h$ positions costs
+$\bigO(Tn_h(Cd_k+Cd_v+d_kd_v))$ time plus $\bigO(Tn_hC^2)$ for the triangular inverses, i.e.\
+roughly $n_h$ times Gated DeltaNet. The sequential depth is $Tn_h/C$ chunk steps.
+\item \textbf{Parameters}: $n_h$ key, value and $\beta$ projections instead of one.
+\end{itemize}
+The trade-off is thus linear: each extra Householder costs about one Gated DeltaNet's worth of
+compute and projection parameters, and adds one more direction that the transition can
+reflect or rotate.
+
+\subsection{Implementation walkthrough}\label{sec:c06-dp-code}
+
+There are two code bases: the experiment code of the paper
+(\repo{automl__DeltaProduct}), which contains a snapshot of \fla{} with a first
+DeltaProduct layer, and the maintained version that the authors contributed to \fla{}
+(\repo{fla-org__flash-linear-attention}). The repository README says that the \fla{} version
+is the one that will be kept up to date.
+
+\begin{implnote}[title={In the code: the official experiment layer}]
+The layer \code{GatedDeltaProduct} in
+\repofile{repos/automl__DeltaProduct/flash-linear-attention/fla/layers/gated_deltaproduct.py}
+keeps $n_h$ separate \code{nn.Linear} modules in \code{k_projs}, \code{v_projs},
+\code{b_projs} (one per Householder, controlled by \code{num_householder}) and $n_h$ short
+convolutions. Its forward pass implements \cref{prop:c06-interleave} literally with the helper
+\code{interleave_multiple_sequences}, which stacks $n_h$ tensors of shape
+\texttt{[B, T, ...]} along a new axis and reshapes to \texttt{[B, T*n\_h, ...]}, and then calls the
+ordinary \code{chunk_gated_delta_rule} kernel (or \code{chunk_delta_rule} without the forget
+gate) with \code{use_qk_l2norm_in_kernel=True}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}automl\_\_DeltaProduct/\allowbreak{}flash-linear-attention/\allowbreak{}fla/\allowbreak{}layers/\allowbreak{}gated\_deltaproduct.py}},label={lst:c06-dp-official}]
+            beta = self.b_projs[i](
+                hidden_states
+            ).sigmoid()  # bs, sequence_length, num_heads
+            if attention_mask is not None:
+                beta = beta.mul(attention_mask[:, -hidden_states.shape[1]:, None])
+            if self.allow_neg_eigval:
+                beta = beta * 2
+            betas.append(beta)
+        # ...
+        q = interleave_multiple_sequences(
+            [torch.zeros_like(q)] * (self.num_householder - 1) + [q]
+        )
+        # Interleave all sequences
+        k = interleave_multiple_sequences(ks)
+        v = interleave_multiple_sequences(vs)
+        beta = interleave_multiple_sequences(betas)
+        # ...
+                # Interleave g with zeros for non-first transformations
+                g = interleave_multiple_sequences(
+                    [g] + [torch.zeros_like(g)] * (self.num_householder - 1)
+                )
+        # ...
+        # Take every nth element for n householder transformations
+        o = o[:, self.num_householder - 1:: self.num_householder, :]
+\end{lstlisting}
+
+The excerpt shows all three ingredients of \eqref{eq:c06-interleave}: zero queries before the
+last sub-step, the log-gate \code{g} only at the first sub-step, and the output slice
+\texttt{o[:, n\_h-1::n\_h]}. The doubling \texttt{beta * 2} is the whole of the negative-eigenvalue
+extension.
+
+\begin{implnote}[title={In the code: the maintained \fla{} layer}]
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/gated_deltaproduct.py} fuses the
+$n_h$ projections into single matrices: \code{k_proj} maps \code{hidden_size} to
+\texttt{key\_dim * num\_householder}, \code{v_proj} to \texttt{value\_dim * num\_householder} and
+\code{b_proj} to \texttt{num\_v\_heads * num\_householder}, each followed by one wide
+\code{ShortConvolution}. An \code{einops} pattern \texttt{'... t (n h d) -> ... (t n) h d'}
+then produces the interleaved key and value sequences of length $Tn_h$ directly. Layer
+defaults: \code{num_householder=2}, \code{allow_neg_eigval=True},
+\code{use_forget_gate=True}, \code{head_dim=256}, \code{expand_v=2}; the model configuration
+\code{GatedDeltaProductConfig} defaults to \code{num_householder=1},
+\code{allow_neg_eigval=False}, \code{use_forget_gate=False}, so a model must set them
+explicitly. The gate is the Mamba-2 parameterization
+\texttt{g = -A\_log.exp() * softplus(a\_proj(x) + dt\_bias)} with one value per head and token.
+Training and prefill call \code{chunk_gated_delta_product}; short inputs at inference
+($T\le64$, no gradients) call \code{fused_recurrent_gated_delta_rule} on the zero-padded
+interleaved sequence and slice the last sub-step, as in the official layer.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}layers/\allowbreak{}gated\_deltaproduct.py}},label={lst:c06-dp-fla}]
+        q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
+        k = rearrange(k, '... t (n h d) -> ... (t n) h d', n=self.num_householder, d=self.head_k_dim)
+        v = rearrange(v, '... t (n h d) -> ... (t n) h d', n=self.num_householder, d=self.head_v_dim)
+        # ...
+        beta = self.b_proj(hidden_states).sigmoid()
+        if self.allow_neg_eigval:
+            beta = beta * 2.
+
+        beta = rearrange(beta, '... t (n h) -> ... (t n) h', n=self.num_householder)
+        if self.use_forget_gate:
+            g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
+        else:
+            g = None
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the dedicated \fla{} kernels}]
+The directory \repofile{repos/fla-org__flash-linear-attention/fla/ops/gated_delta_product/}
+holds a reference recurrence (\code{naive.py}), a reference that calls the gated delta rule
+on the interleaved sequence (\code{chunk_ref.py}), and the Triton path (\code{chunk.py},
+\code{chunk_deltaproduct_h.py}, \code{chunk_deltaproduct_o.py}). Tensors use the \fla{}
+layout: queries \texttt{[B, T, H, K]}, keys and values \texttt{[B, T*n\_h, H, K]} and
+\texttt{[B, T*n\_h, H, V]}, \code{beta} \texttt{[B, T*n\_h, H]}, the log-gate \code{g}
+\texttt{[B, T, H]}, and the state \texttt{[B, H, K, V]}, which is the \emph{transpose} of our
+$\mS_t$. The forward pass \code{chunk_gated_delta_product_fwd} goes through four stages:
+\begin{enumerate}
+\item The per-token gate is scattered to the first sub-step (\code{g_interleaved}) and both
+gates are turned into chunk-local cumulative sums (\code{chunk_local_cumsum}, chunk size 64,
+in base 2 via the constant \code{RCP_LN2}).
+\item The WY representation is computed on the \emph{interleaved} sequence:
+\code{chunk_scaled_dot_kkt_fwd} builds the strictly lower-triangular matrix $\mT$,
+\code{solve_tril} inverts $\mI+\mT$, and \code{recompute_w_u_fwd} forms the analogues of
+the two terms of \eqref{eq:c06-ut}.
+\item \code{chunk_gated_delta_product_fwd_h} walks over the interleaved chunks of 64
+sub-steps, updates the state and stores the pseudo-values \code{v_new}, but writes the state
+to memory only when \code{i_t} is a multiple of \code{num_householder}, i.e.\ once every 64
+\emph{real} tokens.
+\item \code{chunk_fwd_kernel_o} works on chunks of 64 real tokens. It reads the stored state
+for the inter-chunk term and adds, in a loop \texttt{for i\_dp in range(num\_householder)},
+the intra-chunk contribution of every sub-step's key and pseudo-value. The causal mask
+compares \emph{token} positions with \code{>=}, so a query sees all $n_h$ sub-steps of its own
+token, which is the ``read after the last step'' rule.
+\end{enumerate}
+Why may stage 4 use pseudo-values that were computed relative to the state at the start of an
+\emph{interleaved} chunk, while it only adds the state at the start of the \emph{real} chunk?
+Because the state update telescopes: the state at the start of each interleaved chunk is the
+previous one plus exactly the decayed $\vu\vk\T$ terms of that chunk, so summing all terms
+since the start of the real chunk gives the same result. The backward pass simply calls
+\code{chunk_gated_delta_rule_bwd} on the interleaved sequence; a comment in \code{chunk.py}
+says ``TODO: optimize the backward pass like the forward pass''.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}gated\_delta\_product/\allowbreak{}naive.py}},label={lst:c06-dp-naive}]
+    for i in range(T):
+        if g is not None:
+            h = h * g[:, i, :].exp()[..., None, None]
+        # multiple state transition
+        for j in range(num_householder):
+            k_ij = k[:, i*num_householder+j, :, :]
+            v_ij = v[:, i*num_householder+j, :, :]
+            beta_ij = beta[:, i*num_householder+j, :]
+            h = h + (v_ij - (h * k_ij[..., None]).sum(-2)).unsqueeze(-2) * k_ij[..., None] * beta_ij[..., None, None]
+        # memory readout
+        q_i = q[:, i, :, :]
+        o_i = (h * q_i[..., None]).sum(-2)
+        o[:, i] = o_i
+\end{lstlisting}
+
+With $h=\mS\T$, the update line reads $\mS\gets\mS+\beta(\vv-\mS\vk)\vk\T$, which is
+\eqref{eq:c06-dp-step}.
+
+\begin{implnote}[title={In the code: experiments and configurations}]
+The state-tracking experiments live in \repofile{repos/automl__DeltaProduct/state_tracking/}.
+The code is adapted from the word-problem repository of \citet{c06-merrill2024illusion}
+(\code{state_tracking/README_old.md}); \code{src/generate_data.py} generates words over
+groups such as \code{S3}, \code{S5}, \code{A5} or \code{Z60}, and \texttt{src/main.py train}
+trains with flags \code{--num_householder}, \code{--allow_neg_eigval} and \code{--n_layers}.
+The model wrapper \code{state_tracking/src/gated_delta_product.py} simply subclasses
+\code{GatedDeltaProductForCausalLM}. Language-model configurations are under
+\texttt{language\_modeling /model\_configs/} (note the space in the directory name). The file
+names encode the eigenvalue range and $n_h$: for example
+\code{delta_product_340m_-1_1_2.json} sets \texttt{allow\_neg\_eigval: true},
+\texttt{num\_householder: 2}, 24 layers, \code{hidden_size} 1024 and 8 heads of dimension 128.
+The \code{*_param_equiv.json} variants reduce the number of heads (to 4, from 8 for $n_h=2$
+and from 6 for $n_h=3$) to offset the extra projections.
+\end{implnote}
+
+\subsection{Reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): DeltaProduct recurrence and the interleaving map},label={lst:c06-dp-ours}]
+import torch
+import torch.nn.functional as F
+
+def deltaproduct(q, k, v, beta, log_alpha, S=None):
+    """One head. q: [T, dk]; k: [T, nh, dk]; v: [T, nh, dv];
+    beta: [T, nh] in (0, 2); log_alpha: [T] (<= 0). State S: [dv, dk]."""
+    T, nh, dk = k.shape
+    k = F.normalize(k, dim=-1)            # unit keys: eigenvalues 1 and 1 - beta
+    S = k.new_zeros(v.shape[-1], dk) if S is None else S
+    out = []
+    for t in range(T):
+        S = log_alpha[t].exp() * S        # gate once per token
+        for j in range(nh):               # n_h online gradient steps
+            err = S @ k[t, j] - v[t, j]   # prediction error, [dv]
+            S = S - beta[t, j] * torch.outer(err, k[t, j])
+        out.append(S @ q[t])              # read after the last step
+    return torch.stack(out), S
+
+def interleave(q, k, v, beta, log_alpha):
+    """Map DeltaProduct inputs to a gated delta rule over T * nh positions."""
+    T, nh, dk = k.shape
+    q_i = q.new_zeros(T, nh, dk); q_i[:, -1] = q              # read at last step
+    g_i = log_alpha.new_zeros(T, nh); g_i[:, 0] = log_alpha  # decay at first step
+    flat = lambda x: x.reshape(T * nh, *x.shape[2:])
+    return flat(q_i), flat(k), flat(v), flat(beta), flat(g_i)
+
+# o_dp = gated_delta_rule(*interleave(q, k, v, beta, log_alpha))[0][nh - 1::nh]
+\end{lstlisting}
+
+We checked a NumPy transcription of \cref{lst:c06-dp-ours} in four ways: $n_h=1$ coincides
+with the gated delta rule; the interleaved gated delta rule reproduces the outputs and
+final state exactly; the chunkwise UT algorithm on the interleaved sequence agrees to
+$3\times10^{-15}$; and the WY formula \eqref{eq:c06-wy} reproduces the product of
+Householders to $3\times10^{-16}$.
+
+\subsection{Reported results}\label{sec:c06-dp-results}
+
+\begin{results}
+Source: \repofile{repos/automl__DeltaProduct/README.md} and the figure
+\repofile{repos/automl__DeltaProduct/experiments.png} shown in that README.
+\begin{itemize}
+\item On words over $S_3$ (train length 128, test length 512, one layer), the README states
+the expected outcomes of four configurations: DeltaProduct$_1[-1,1]$ ``is not expected to
+converge'' because ``a single layer of DeltaProduct requires a minimum of two Householder
+reflections''; DeltaProduct$_2[-1,1]$ ``is expected to train successfully'';
+DeltaProduct$_1[0,1]$ and DeltaProduct$_2[0,1]$ are not expected to converge because
+``negative eigenvalues are required''. These are exactly the predictions of
+\cref{prop:c06-perm}.
+\item The figure caption states that DeltaProduct$_{n_h}$ ``learns higher-order permutation
+groups like $S_5$ in one layer, while DeltaNet ($n_h=1$) is limited to $S_2$ (parity)'', and
+that length extrapolation in language modeling (CodeParrot) ``improves significantly with
+higher $n_h$''. In the plotted $S_5$ curves, only $n_h=4$ (the value required by
+\cref{prop:c06-perm}) is accurate at the training length.
+\item The abstract (quoted in the README) claims that DeltaProduct outperforms DeltaNet in
+state tracking and language modeling and extrapolates better. For numbers see the paper.
+\end{itemize}
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} DeltaProduct turns the eigenvalue argument of
+\cref{sec:c06-background} into a single, interpretable dial. It reuses the delta-rule
+kernels unchanged (by interleaving), keeps the state size fixed, and its theory is clean:
+products of reflections reach rotations, permutations and, with $n_h=d_k$, all orthogonal
+matrices. The ``several gradient steps per token'' reading connects it to test-time
+training (\cref{ch:ttt}), where taking more inner steps is a standard way to fit the
+in-context objective better.
+
+\textbf{Limitations.} Compute and projection parameters grow linearly in $n_h$, and the
+interleaved sequence is $n_h$ times longer, which also lengthens the sequential part of the
+chunkwise scan. The Householder factors of one token are generated in parallel from the same
+input, so the model must learn $n_h$ coordinated keys; whether language data needs
+rotations of high rank is an empirical question. Exact reflections require
+$\beta_{t,j}$ to reach the boundary value 2 of a sigmoid, so in practice tracking is
+approximate and relies on read-out tolerance and finite length.
+
+\textbf{Relations.} With $n_h=1$ it is Gated DeltaNet (\cref{ch:delta}). Complex-valued
+diagonal transitions such as Mamba-3's rotary updates (\cref{ch:structured}) also produce
+rotations, but rotations that commute with one another: they can count modulo $m$ but cannot
+represent non-abelian groups. DeltaProduct's rotations act in input-dependent planes and do
+not commute. In hybrid models (\cref{ch:hybrid}) a few attention layers can supply exact
+retrieval while expressive recurrent layers supply state tracking.
+
+% ===========================================================================
+\section{Comba: scalar-plus-low-rank transitions with closed-loop control}\label{sec:c06-comba}
+
+\subsection{Motivation}
+
+Comba~\citep{hu2025comba} starts from a classification of recurrent memories. In the
+authors' terms (their own summary is in
+\repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/paper.md}), \emph{linear RNNs}
+such as GLA, HGRN2 and Mamba-2 update the state with data-dependent gates but never multiply
+the state by the key; \emph{bilinear RNNs} such as Gated DeltaNet and RWKV-7 contain a
+product of the state with the current key ($\mS_{t-1}\vk_t\vk_t\T$), so the dynamics are
+linear in the state for fixed inputs and linear in the inputs for a fixed state, but not
+jointly linear; \emph{nonlinear RNNs} such as TTT-MLP use deep memories updated by gradients
+and lose cheap chunkwise parallelism. (Strictly speaking, an input-dependent gate
+$\alpha_t\mS_{t-1}$ is also a state--input product; the distinction the authors draw is
+whether the \emph{key} feeds back on the state.) The name ``bilinear'' comes from control
+theory, where a bilinear system has dynamics
+$\dot\vx=\mA\vx+\sum_iu_i\bm{N}_i\vx+\mB\vu$, linear in the state $\vx$ and in the control
+$\vu$ separately.
+
+From the control viewpoint, the memory $\mS$ is the \emph{plant}, the value $\vv_t$ is the
+\emph{reference} the plant should reproduce for the key $\vk_t$, and the question is whether
+the controller uses \emph{feedback}. Mamba-2 is an open-loop system: it writes $\vv_t$
+without looking at what the memory currently returns. The delta rule closes the loop on
+the input side: it writes the error $\vv_t-\mS_{t-1}\vk_t$. Comba closes the loop twice,
+on the input with a \emph{state feedback} and on the output with an \emph{output feedback},
+and it does so with a scalar-plus-low-rank (SPLR) transition that the authors argue is both
+expressive enough and cheaper to parallelize than the alternatives.
+
+\begin{taxonomy}
+Following \citet{zhoubian2026memory}: \textbf{representation} implicit (recurrent matrix
+state); \textbf{update dynamics} online; \textbf{persistence}: Comba is discussed in the
+survey's \S III-C (``\ldots Comba uses scalar-plus-low-rank transitions and closed-loop
+feedback'') but not listed in Table~I; by analogy with Gated DeltaNet it would be
+long-term (our classification); \textbf{update rule} (Table~II): state-transition update
+with feedback correction.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c06-comba-formulation}
+
+\paragraph{The recurrence.}
+The paper writes Comba as (this form is reproduced as an image in
+\repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/figure/eq1.png})
+\begin{equation}\label{eq:c06-comba}
+  \mS_t=\mS_{t-1}\big(\alpha_t\mI-\tilde\beta_t\vk_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T,
+  \qquad
+  \vo_t=\mS_t(\vq_t-d\,\vk_t),
+\end{equation}
+with the first term labelled ``state correction'' and the second ``output correction''. In
+the code the feedback vector is a separate $\bm{p}_t$, proportional to the key:
+$\bm{p}_t=\sigmoid(\lambda)\vk_t$ with a learned scalar $\lambda$ per head (\code{decay}). With
+$\bm{p}_t$ the general form, which we use from now on, is
+\begin{equation}\label{eq:c06-comba-p}
+  \vu_t=\beta_t(\vv_t-\mS_{t-1}\bm{p}_t),\qquad
+  \mS_t=\alpha_t\mS_{t-1}+\vu_t\vk_t\T=\mS_{t-1}\big(\alpha_t\mI-\beta_t\bm{p}_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T,
+\end{equation}
+\begin{equation}\label{eq:c06-comba-out}
+  \vo_t=\mS_t\vq_t-d\,\mS_t\bm{p}_t=\mS_t(\vq_t-d\,\bm{p}_t).
+\end{equation}
+Read \eqref{eq:c06-comba-p} as a control loop. The \emph{state feedback}
+$P(\mS)=\mS\bm{p}_t$ measures what the memory currently associates with the (feedback) key,
+and the controller writes only the residual $\vv_t-P(\mS_{t-1})$, scaled by the gain
+$\beta_t$. The \emph{output feedback} in \eqref{eq:c06-comba-out} subtracts $d$ times the
+same measurement taken on the new state. The authors' Table~3 (reproduced in
+\repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/figure/control.png}) lines up the three
+cases: Mamba-2 has no feedback and $\vo_t=\mS_t\vq_t$; the gated delta rule has
+$\vv_t^{\text{new}}=\vv_t-\alpha_t\mS_{t-1}\vk_t$ and $\vo_t=\mS_t\vq_t$; Comba has
+$\vv_t^{\text{new}}=\vv_t-P_t(\mS_{t-1})$ and $\vo_t=\mS_t\vq_t-dP_t(\mS_t)$. In the
+authors' view, models with only the first correction (TTT, DeltaNet, RWKV-7) are not
+strictly closed-loop.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[>=Stealth,
+  blk/.style={draw,rounded corners=2pt,minimum height=0.8cm,font=\small,align=center},
+  sum/.style={draw,circle,inner sep=1pt,font=\small}]
+  \node (vin) at (0,0) {$\vv_t$};
+  \node[sum] (s1) at (1.2,0) {$+$};
+  \node[blk,minimum width=0.9cm] (gain) at (2.6,0) {$\beta_t$};
+  \node[blk,fill=blue!6,minimum width=3.0cm] (mem) at (5.6,0) {memory $\mS$\\[-1pt] $\alpha_t\mS+\vu_t\vk_t\T$};
+  \node[blk,minimum width=1.4cm] (read) at (9.0,0) {read\\[-1pt] $\mS_t\vq_t$};
+  \node[sum] (s2) at (10.6,0) {$+$};
+  \node (out) at (11.6,0) {$\vo_t$};
+  \node[blk,fill=teal!6] (fb1) at (2.9,-1.9) {state feedback\\[-1pt] $P(\mS_{t-1})=\mS_{t-1}\bm{p}_t$};
+  \node[blk,fill=teal!6] (fb3) at (8.6,-1.9) {output feedback\\[-1pt] $d\,P(\mS_t)=d\,\mS_t\bm{p}_t$};
+  \draw[->] (vin) -- (s1);
+  \draw[->] (s1) -- (gain);
+  \draw[->] (gain) -- node[above,font=\scriptsize] {$\vu_t$} (mem);
+  \draw[->] (mem) -- (read);
+  \draw[->] (read) -- (s2);
+  \draw[->] (s2) -- (out);
+  \draw[->] ([xshift=-0.6cm]mem.south) |- (fb1.east);
+  \draw[->] (fb1.west) -| node[pos=0.85,left,font=\scriptsize] {$-$} (s1.south);
+  \draw[->] ([xshift=0.6cm]mem.south) |- (fb3.west);
+  \draw[->] (fb3.east) -| node[pos=0.85,right,font=\scriptsize] {$-$} (s2.south);
+\end{tikzpicture}
+\caption{Comba as a closed-loop controller: state feedback corrects the value that is
+written, output feedback corrects what is read.}
+\label{fig:c06-comba-loop}
+\end{figure}
+
+\paragraph{Which transition does the code implement?}
+There are two natural orderings of ``decay'' and ``feedback'', and they give different
+models:
+\begin{align}
+  \text{SPLR (feedback, then decay):}\quad
+  &\mS_t=\mS_{t-1}\big(\alpha_t\mI-\beta_t\bm{p}_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T,\label{eq:c06-splr}\\
+  \text{decay first:}\quad
+  &\mS_t=\alpha_t\mS_{t-1}\big(\mI-\beta_t\bm{p}_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T.\label{eq:c06-decayfirst}
+\end{align}
+The second is Gated DeltaNet's ordering. Comparing with \eqref{eq:c06-comba}, SPLR
+corresponds to $\tilde\beta_t=\beta_t$ (with $\bm{p}_t=\vk_t$) and Gated DeltaNet to
+$\tilde\beta_t=\alpha_t\beta_t$; our check confirmed both identities numerically, and also
+that the two orderings agree when $\alpha_t=1$ and differ otherwise. The maintained \fla{}
+kernels and the official ``\code{dplr}'' kernels implement SPLR \eqref{eq:c06-splr}; the
+official repository also contains an ``\code{iplr}'' variant with the decay-first ordering
+and $\beta_t\in(0,2)$ (\cref{sec:c06-comba-code}).
+
+\paragraph{Eigenvalues.}
+For a unit key and $\bm{p}_t=\vk_t$ (the case of the \fla{} kernels, see below), the SPLR
+transition $\alpha_t\mI-\beta_t\vk_t\vk_t\T$ has eigenvalue $\alpha_t$ on every direction
+orthogonal to $\vk_t$ and $\alpha_t-\beta_t$ along $\vk_t$ (the computation of
+\eqref{eq:c06-hh-eig}). With $\alpha_t,\beta_t\in(0,1)$ the second eigenvalue lies in
+$(-1,1)$, and it is \emph{negative whenever $\beta_t>\alpha_t$}, without doubling $\beta$.
+Gated DeltaNet's corresponding eigenvalue is $\alpha_t(1-\beta_t)\in[0,1)$. Our check: for
+$(\alpha,\beta)=(0.5,0.9)$ the SPLR eigenvalues are $\{0.5,-0.4\}$ while Gated DeltaNet gives
+$0.05$. There is a catch (our analysis): a strongly negative eigenvalue requires
+$\alpha_t$ small, and $\alpha_t$ also multiplies every other direction of the memory. SPLR
+cannot produce a clean reflection (eigenvalue $-1$ along $\vk_t$ and $+1$ elsewhere) the
+way DeltaNet with $\beta=2$ can; it trades sign flips against forgetting. The decay-first
+variant with $\beta_t\in(0,2)$ has eigenvalue $\alpha_t(1-\beta_t)\in(-\alpha_t,\alpha_t)$
+along the key and can approach a reflection when $\alpha_t\to1$. Like DeltaNet, both are
+rank-one corrections with real spectra, so a single step cannot rotate.
+
+\paragraph{What the output correction does.}
+Right after a write with $\alpha_t=\beta_t=1$ and unit $\bm{p}_t=\vk_t$, the memory returns the
+fresh value exactly: $\mS_t\vk_t=\mS_{t-1}(\vk_t-\vk_t)+\vv_t=\vv_t$ (checked numerically).
+The read-out \eqref{eq:c06-comba-out} is then $\mS_t\vq_t-d\,\vv_t$: for $d>0$ it removes a
+multiple of what the current token just stored, so the output emphasizes information
+retrieved by the query \emph{beyond} the current key--value pair. Mamba-2's skip term
+$D\vx_t$ adds a multiple of the current input; Comba's correction is its feedback analogue,
+and the \fla{} warning text makes the comparison explicit (``\code{correction_factor} is set
+to 1 by default similar to Mamba2''). The authors also give an objective view, listing
+Comba's per-step loss as
+$\beta_t\norm{\vv_t-\mS_t\vk_t}^2+\frac{\alpha_t}{2}\norm{\mS_t}^2+\inner{\vq_t}{d\vk_t}$
+in their Table~1 (\repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/figure/table1.png}).
+
+\paragraph{Chunkwise form with a single inverse.}
+We now derive the chunkwise algorithm for SPLR in our notation; the result has the same
+structure as the paper's equations (9)--(12), which are reproduced in
+\repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/figure/eq2.png} and \code{eq3.png}.
+Take a chunk of length $C$ with start state $\mS_{[i]}$ and positions $r=1,\dots,C$. Let
+$\gamma_r=\prod_{s\le r}\alpha_s$ ($\gamma_0=1$). From \eqref{eq:c06-comba-p}, the state is
+the decayed start state plus decayed rank-one writes,
+\begin{equation}\label{eq:c06-comba-state}
+  \mS_r=\gamma_r\mS_{[i]}+\sum_{s\le r}\frac{\gamma_r}{\gamma_s}\vu_s\vk_s\T .
+\end{equation}
+Insert this (at $r-1$) into $\vu_r=\beta_r\vv_r-\beta_r\mS_{r-1}\bm{p}_r$:
+\begin{equation}
+  \vu_r+\beta_r\sum_{s<r}\frac{\gamma_{r-1}}{\gamma_s}(\bm{p}_r\T\vk_s)\,\vu_s
+  =\beta_r\vv_r-\beta_r\gamma_{r-1}\mS_{[i]}\bm{p}_r .
+\end{equation}
+Stack $\vu_r\T$ as the rows of $\mU\in\R^{C\times d_v}$ and define the strictly
+lower-triangular $\mT_{rs}=\beta_r(\gamma_{r-1}/\gamma_s)\bm{p}_r\T\vk_s$ ($s<r$). Then
+$(\mI+\mT)\mU=\diag(\vbeta)\mV-\diag(\vbeta\had\bm{\gamma}_{-})\mP\mS_{[i]}\T$, where
+$\bm{\gamma}_-=(\gamma_0,\dots,\gamma_{C-1})$. With the \emph{single} inverse
+$\mM=(\mI+\mT)^{-1}$:
+\begin{equation}\label{eq:c06-comba-wu}
+  \mW=\mM\diag(\vbeta\had\bm{\gamma}_-)\mP,\qquad \mU^{0}=\mM\diag(\vbeta)\mV,\qquad
+  \mU=\mU^{0}-\mW\mS_{[i]}\T .
+\end{equation}
+The outputs and the next chunk state follow from \eqref{eq:c06-comba-state}, with
+$\tilde\mQ$ the rows $(\vq_r-d\bm{p}_r)\T$:
+\begin{equation}\label{eq:c06-comba-out-chunk}
+  \mO_{[i]}=\diag(\bm{\gamma})\tilde\mQ\mS_{[i]}\T+\big((\tilde\mQ\mK\T)\had\bm{\Gamma}\big)_{\le}\mU,
+  \qquad
+  \mS_{[i+1]}=\gamma_C\mS_{[i]}+\mU\T\diag(\gamma_C/\bm{\gamma})\mK,
+\end{equation}
+with $\bm{\Gamma}_{rs}=\gamma_r/\gamma_s$. Both $\mW$ (which multiplies the incoming state) and
+$\mU^0$ (which carries the values) use the same $\mM$. This is the point the authors
+emphasize: their summary attributes Comba's forward-pass speed to needing one inverse where
+their Gated DeltaNet formulation needs two. In the decay-first ordering the coefficient of
+$\vu_s$ in $\vu_r$ is $\gamma_r/\gamma_s$ rather than $\gamma_{r-1}/\gamma_s$; the official
+reference code for that variant (\code{chunk_comba_iplr_ref}) indeed builds two triangular
+matrices, one with and one without the decay. (The current \fla{} Gated DeltaNet forward pass also
+uses a single triangular matrix, returned by \code{chunk_gated_delta_rule_fwd_intra} in
+\code{fla/ops/gated_delta_rule/chunk.py}, so the size of the advantage depends on the baseline
+implementation.) Our NumPy implementation of
+\eqref{eq:c06-comba-wu}--\eqref{eq:c06-comba-out-chunk} matched the SPLR recurrence to
+$2\times10^{-16}$ for chunk sizes 4, 8 and 16, also for a general $\bm{p}_t$ not parallel to
+$\vk_t$.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{Comba (SPLR, one head): chunkwise forward pass}
+\label{alg:c06-comba}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK,\mP\in\R^{T\times d_k}$, $\mV\in\R^{T\times d_v}$, gains $\vbeta$, log-decays $\log\valpha$, factor $d$, chunk size $C$
+\State $\tilde\mQ\gets\mQ-d\,\mP$ \Comment{output feedback}
+\State $\mS\gets\bm 0$
+\For{each chunk $[i]$}
+  \State $\bm{\gamma}\gets$ cumulative products of $\alpha$ in the chunk; $\bm{\gamma}_-\gets(1,\gamma_1,\dots,\gamma_{C-1})$
+  \State $\mT\gets\mathrm{strictlower}\big(\diag(\vbeta)\,((\mP\mK\T)\had[\gamma_{r-1}/\gamma_s]_{rs})\big)$
+  \State $\mM\gets(\mI+\mT)^{-1}$ \Comment{forward substitution, $\bigO(C^3)$ or blocked}
+  \State $\mW\gets\mM\diag(\vbeta\had\bm{\gamma}_-)\mP$;\quad $\mU\gets\mM\diag(\vbeta)\mV-\mW\mS\T$
+  \State $\mO_{[i]}\gets\diag(\bm{\gamma})\tilde\mQ\mS\T+((\tilde\mQ\mK\T)\had\bm{\Gamma})_{\le}\mU$
+  \State $\mS\gets\gamma_C\mS+\mU\T\diag(\gamma_C/\bm{\gamma})\mK$
+\EndFor
+\State \Return $\mO$, $\mS$
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c06-comba} costs per head $\bigO(TC(d_k+d_v)+Td_kd_v)$ for the matrix products
+and $\bigO(TC^2)$ for the triangular solves, the same order as Gated DeltaNet. Decoding uses
+\eqref{eq:c06-comba-p}--\eqref{eq:c06-comba-out} directly: two matrix--vector products, one
+rank-one update and one read, $\bigO(d_kd_v)$ time per token; the state is $d_kd_v$ per
+head. Comba adds essentially no parameters: one scalar $\lambda$ (feedback scale) and one
+scalar $d$ (output correction) per head.
+
+\subsection{Implementation walkthrough}\label{sec:c06-comba-code}
+
+\begin{implnote}[title={In the code: the official repository}]
+\repofile{repos/AwesomeSeq__Comba-triton/fla/layers/comba.py} defines \code{Comba} with
+q/k/v projections, short convolutions, a per-head gate \code{a_proj} (Mamba-2
+parameterization with \code{A_log} and \code{dt_bias}), a per-head \code{b_proj} for
+$\beta_t$, a per-head parameter \code{decay} (initialized to ones) and the correction factor
+\code{D} (initialized to \code{1e-2}). The feedback vector is \texttt{p = k * decay.sigmoid()}
+and, if \code{qk_sim} is set, the query is corrected as \texttt{q - D * p}. The argument
+\code{A_type} selects the kernel family: \code{'iplr'} uses $\beta_t=2\sigmoid(\cdot)$ and the
+decay-first ordering \eqref{eq:c06-decayfirst} (kernels in
+\code{fla/ops/comba/comba_iplr/}); \code{'dplr'} uses $\beta_t=\sigmoid(\cdot)$ and the SPLR
+ordering \eqref{eq:c06-splr} (\code{fla/ops/comba/comba_dplr/}). The two orderings are visible
+in the fused recurrent kernels: in \code{comba_iplr/fused_recurrent.py} the line
+\texttt{b\_h *= exp(b\_g)} precedes \texttt{b\_v -= tl.sum(b\_h * b\_p[:, None], 0)}, in
+\code{comba_dplr/fused_recurrent.py} it follows it. Training configurations
+(\code{training/configs/comba_iplr_340M.json}, \code{comba_dplr_340M.json}) use 24 layers,
+\code{hidden_size} 1024 and 4 heads of dimension 256, and differ only in \code{A_type}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}layers/\allowbreak{}comba.py}},label={lst:c06-comba-fla}]
+        q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
+
+        if self.use_inner_decay:
+            p = (k * self.decay[None, None, :, None].sigmoid()).to(k.dtype)
+        else:
+            p = k
+
+        if self.use_output_correction:
+            q = (q - self.D[None, None, :, None] * p).to(q.dtype)
+
+        v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+
+        beta = self.b_proj(hidden_states).sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the maintained \fla{} version}]
+The \fla{} layer (\cref{lst:c06-comba-fla}) exposes the two ideas as switches:
+\code{use_inner_decay} (feedback vector $\bm{p}_t=\sigmoid(\lambda)\vk_t$) and
+\code{use_output_correction} with \code{correction_factor} (default 1, initial value of
+\code{D}). Its constructor warns that ``sometimes \code{correction_factor} = 0.02 works better
+for small-scale models''. The layer then calls \code{chunk_comba} (training, prefill) or
+\code{fused_recurrent_comba} (short inference inputs) with \code{use_qk_l2norm_in_kernel=True}.
+Both kernels normalize $\vq$, $\vk$ \emph{and} $\bm{p}$ to unit length inside the kernel
+(\code{l2norm_fwd(p)} in \code{ops/comba/chunk.py}; \texttt{b\_p / tl.sqrt(...)} in
+\code{ops/comba/fused_recurrent.py}). Since $\bm{p}_t$ is a positive multiple of $\vk_t$, after
+normalization $\hat{\bm{p}}_t=\hat\vk_t$: as we read the code, the transition is exactly
+$\alpha_t\mI-\beta_t\hat\vk_t\hat\vk_t\T$, and the learned scale $\sigmoid(\lambda)$ survives
+only in the output correction, which is applied to the \emph{unnormalized} query and key
+before the kernel normalizes $\vq_t-D\sigmoid(\lambda)\vk_t$. The paper's exact
+parameterization may differ. The Triton chunk path \code{chunk_comba_fwd} mirrors \cref{alg:c06-comba}:
+\code{chunk_comba_cumsum_scalar_fwd} (\code{ops/comba/utils.py}) computes two chunk-local
+cumulative sums of the log-gate, exclusive (\code{g0}) and inclusive (\code{g}) of the current
+step, i.e.\ our $\log\bm{\gamma}_-$ and $\log\bm{\gamma}$;
+\code{chunk_scaled_dot_comba_pkt_fwd} (\code{ops/comba/wy_fast.py}) builds $\mT$ from $\bm{p}$,
+$\vk$, $\beta$ and both sums; the generic \code{solve_tril} inverts $\mI+\mT$ once;
+\code{recompute_w_u_fwd} forms $\mW$ and $\mU^0$ (it is called with \code{k=p} and
+\code{g_cumsum=g0}); and the generic gated-delta-rule kernels
+\code{chunk_gated_delta_rule_fwd_h} and \code{chunk_fwd_o} compute the states and outputs.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}fla-org\_\_flash-linear-attention/\allowbreak{}fla/\allowbreak{}ops/\allowbreak{}comba/\allowbreak{}fused\_recurrent.py}},label={lst:c06-comba-kernel}]
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_p = b_p / tl.sqrt(tl.sum(b_p * b_p) + 1e-6)
+        b_q = b_q * scale
+        # [BV]
+        b_v -= tl.sum(b_h * b_p[:, None], 0)
+        # [BK, BV]
+        b_h *= exp(b_g)
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta).to(tl.float32)
+        b_v *= b_beta
+        # [BK, BV]
+        b_h += b_k[:, None] * b_v[None, :]
+\end{lstlisting}
+
+In \cref{lst:c06-comba-kernel}, \code{b_h} is the state tile $\mS\T$ of shape
+\texttt{[BK, BV]}; the feedback \texttt{b\_v -= ...} uses the state \emph{before} the decay
+\texttt{b\_h *= exp(b\_g)}, which is the SPLR ordering \eqref{eq:c06-splr}.
+
+\begin{pitfall}[title={Pitfall: two reference recurrences}]
+In \repofile{repos/fla-org__flash-linear-attention/fla/ops/comba/naive.py}, the function
+\code{naive_recurrent_comba} applies the decay \emph{before} the feedback
+(\texttt{h = h.clone() * g[:, :, i].exp()[...]} precedes \texttt{b\_v = b\_v - ...}), i.e.\ the
+decay-first ordering \eqref{eq:c06-decayfirst}, whereas \code{naive_chunk_comba} and the
+Triton kernels implement SPLR. The \fla{} tests (\code{tests/ops/test_comba.py}) compare the
+kernels with \code{naive_chunk_comba} only. Our NumPy versions of the two orderings differ by
+up to $0.18$ in the outputs on random inputs and agree exactly when $\alpha_t\equiv1$. When
+porting Comba, decide which ordering you want and test against the matching reference.
+\end{pitfall}
+
+\subsection{Reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): Comba recurrence (SPLR) and chunkwise form},label={lst:c06-comba-ours}]
+import torch
+
+def comba_recurrent(q, k, v, p, beta, log_alpha, d, S=None):
+    """One head, unit q, k, p: [T, dk]; v: [T, dv]; beta, log_alpha: [T]."""
+    S = k.new_zeros(v.shape[1], k.shape[1]) if S is None else S
+    out = []
+    for t in range(k.shape[0]):
+        u = beta[t] * (v[t] - S @ p[t])               # state feedback on S_{t-1}
+        S = log_alpha[t].exp() * S + torch.outer(u, k[t])
+        out.append(S @ (q[t] - d * p[t]))             # output feedback
+    return torch.stack(out), S
+
+def comba_chunk(q, k, v, p, beta, log_alpha, d, C=64):
+    T, dk = k.shape
+    S = k.new_zeros(v.shape[1], dk)
+    q, out = q - d * p, []
+    for c in range(0, T, C):
+        Q, K, V, P = q[c:c+C], k[c:c+C], v[c:c+C], p[c:c+C]
+        b, g = beta[c:c+C], log_alpha[c:c+C]
+        G = g.cumsum(0); G0 = G - g                    # log gamma_r, log gamma_{r-1}
+        T_ = torch.tril(b[:, None] * (G0[:, None] - G[None, :]).exp() * (P @ K.T), -1)
+        M = torch.linalg.inv(torch.eye(len(G)) + T_)   # the single inverse
+        W = M @ (b[:, None] * G0.exp()[:, None] * P)
+        U = M @ (b[:, None] * V) - W @ S.T             # pseudo-values
+        A = torch.tril((G[:, None] - G[None, :]).exp() * (Q @ K.T))
+        out.append(G.exp()[:, None] * (Q @ S.T) + A @ U)
+        S = G[-1].exp() * S + (U * (G[-1] - G).exp()[:, None]).T @ K
+    return torch.cat(out), S
+\end{lstlisting}
+
+The NumPy version of \cref{lst:c06-comba-ours} is the one whose agreement we reported above.
+Note that the exponent in \code{T_} is masked to the strictly lower triangle \emph{after}
+exponentiation; for long chunks, production kernels instead keep the cumulative log-decays
+bounded (sub-chunking, base-2 exponentials) to avoid overflow in
+$\exp(\log\gamma_{r-1}-\log\gamma_s)$ above the diagonal.
+
+\subsection{Reported results}
+
+\begin{results}
+Source: \repofile{repos/AwesomeSeq__Comba-triton/comba_chinese/paper.md} (the authors'
+Chinese-language summary of the paper; our translation) and the \fla{} layer
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/comba.py}.
+\begin{itemize}
+\item Speed: because SPLR needs one matrix inverse where (their) Gated DeltaNet needs two,
+the summary reports a forward-pass speed-up of 40\% over Gated DeltaNet for models with head
+dimension 128; in the backward pass, for medium-sized models (hidden size 1024 or 2048), the
+gain is described as small.
+\item Quality: the summary states that SPLR Comba outperforms Gated DeltaNet (IPLR) and RWKV-7
+(DPLR) in its language-modeling experiments while keeping the fastest speed, that the
+output correction ``significantly reduces perplexity'', and that Comba's recall is close to
+that of a Transformer; ablations attribute part of the recall gain to the output correction.
+\item The correction factor $d$ should be initialized differently by scale: the summary
+recommends $d=0.02$ for 340M-parameter models and $d=1$ for 1.3B; the \fla{} layer warns
+that $0.02$ ``sometimes'' works better for small models.
+\end{itemize}
+For benchmark tables see the paper.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} Comba changes very little relative to Gated DeltaNet, two scalars per
+head and the order of two lines, yet the SPLR ordering gives the transition a negative
+eigenvalue range without doubling $\beta$, and the single-inverse chunk form is simple. The
+control-theory reading gives names to design choices (feedback on the input, feedback on
+the output) that are otherwise easy to overlook, and it suggests further variants, e.g.\
+feedback vectors $\bm{p}_t$ that are not parallel to the key; the chunk algorithm
+above handles any $\bm{p}_t$.
+
+\textbf{Limitations.} The transition is still identity-like plus rank one, with a real
+spectrum; for state tracking it is in the DeltaNet class, not the DeltaProduct class. In the
+maintained kernels the feedback key is normalized to the key itself, so the ``closed loop''
+on the state side reduces to the delta rule with an SPLR decay. The recommended $d$ depends on
+scale, a sign that the output correction interacts with normalization and depth in ways
+not yet well understood.
+
+\textbf{Relations.} Comba's SPLR transition sits between Gated DeltaNet (decay-first,
+eigenvalues in $[0,1)$) and KDA/RWKV-7 (per-channel diagonal); the output feedback is
+orthogonal to the transition and could be added to any of the models in this chapter or in
+\cref{ch:delta}. Gated DeltaNet-2 (\cref{ch:delta}) likewise decouples erasing from
+writing, by splitting the single strength $\beta_t$ into a key-side erase gate and a value-side
+write gate.
+
+% ===========================================================================
+\section{RWKV-7 ``Goose'': a generalized delta rule with vector gates}\label{sec:c06-rwkv7}
+
+\subsection{Motivation: from RWKV-5/6 to RWKV-7}
+
+RWKV is a line of attention-free language models trained in parallel like Transformers and
+run as RNNs at inference~\citep{c06-peng2023rwkv}. RWKV-5 (``Eagle'') and RWKV-6
+(``Finch'')~\citep{peng2024eagle} introduced matrix-valued states. In our notation, RWKV-6
+updates each head as
+\begin{equation}\label{eq:c06-rwkv6}
+  \mS_t=\mS_{t-1}\diag(\vw_t)+\vv_t\vk_t\T,\qquad
+  \vo_t=\big(\mS_{t-1}+\vv_t(\vu\had\vk_t)\T\big)\vr_t ,
+\end{equation}
+with a per-channel decay $\vw_t\in(0,1)^{d_k}$ (fixed in RWKV-5, data-dependent in RWKV-6), a
+learned ``bonus'' $\vu$ for the current token and a query called the \emph{receptance}
+$\vr_t$. (This is the recurrence of the \fla{} reference
+\code{naive_recurrent_rwkv6}.) The transition is diagonal with positive entries, so by
+\cref{prop:c06-parity} it cannot track parity, and the memory can only fade, never be
+selectively overwritten. RWKV-7~\citep{peng2025rwkv7} keeps the per-channel decay and adds
+the delta rule, generalized in three ways:
+\begin{enumerate}
+\item the erase strength becomes a \emph{vector} $\va_t\in(0,1)^{d_k}$, the
+\emph{in-context learning rate}, one rate per key channel;
+\item the key used to \emph{remove} old content ($\hat{\bm\kappa}_t$) is decoupled from the
+key used to \emph{write} new content ($\tilde\vk_t$);
+\item the decay $\vw_t$ is vector-valued and is applied together with the low-rank
+correction, giving a diagonal-plus-low-rank transition.
+\end{enumerate}
+The survey summarizes it as a generalized delta rule ``with vector-valued state gates and
+in-context learning rates while decoupling removal and addition keys, enabling channel-wise
+state replacement''~\citep{zhoubian2026memory}.
+
+\begin{taxonomy}
+Following \citet{zhoubian2026memory} (Table~I: ``Vector-Gated Generalized Delta
+Recurrence''): \textbf{representation} implicit; \textbf{update dynamics} online;
+\textbf{persistence} long-term; \textbf{update rule} (Table~II): state-transition update,
+a generalized delta rule with vector-valued decay and learning rate.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c06-rwkv-formulation}
+
+We follow the reference code
+(\repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/train_temp/src/model.py} and the RNN-mode demo
+\repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/rwkv_v7_demo_rnn.py}). RWKV calls its
+sequence mixer \emph{time mixing} and its MLP \emph{channel mixing}. Let
+$\vx_t\in\R^{C}$ be the (layer-normed) input of the time-mixing block, $C=d$ the model
+width, split into $H$ heads of size $N=C/H$ (the reference code asserts $N=64$), so per head
+$d_k=d_v=N$.
+
+\paragraph{Token shift.} Every branch first mixes the current token with the previous one,
+using a learned per-channel interpolation weight $\bm\mu_c\in\R^C$:
+\begin{equation}\label{eq:c06-tokenshift}
+  \vx^{c}_t=\vx_t+\bm\mu_c\had(\vx_{t-1}-\vx_t),\qquad c\in\{r,w,k,v,a,g\}.
+\end{equation}
+This is a two-tap causal convolution, the RWKV counterpart of the short convolutions in
+Gated DeltaNet and DeltaProduct: it gives every key, value and gate direct access to a
+bigram of tokens.
+
+\paragraph{Projections and gates.} With $\mW_r,\mW_k,\mW_v\in\R^{C\times C}$ and small
+low-rank (LoRA) maps $\mW_{\cdot1}\in\R^{C\times D}$, $\mW_{\cdot2}\in\R^{D\times C}$:
+\begin{align}
+  \vr_t&=\mW_r\vx^r_t,\quad \vk_t=\mW_k\vx^k_t,\quad \vv_t=\mW_v\vx^v_t,\\
+  \vw_t&=\exp\!\big(-e^{-1/2}\,\sigmoid(\vw_0+\tanh(\vx^w_t\mW_{w1})\mW_{w2})\big)
+        \in\big(e^{-e^{-1/2}},1\big)^C\approx(0.545,1)^C, \label{eq:c06-rwkv-decay}\\
+  \va_t&=\sigmoid(\va_0+\vx^a_t\mW_{a1}\mW_{a2})\in(0,1)^C,\\
+  \vg_t&=\sigmoid(\vx^g_t\mW_{g1})\mW_{g2}.
+\end{align}
+(We write row vectors times matrices where the code does.) The decay
+\eqref{eq:c06-rwkv-decay} is a soft clamp: $-\log w=e^{-1/2}\sigmoid(\cdot)$ lies in
+$(0,e^{-1/2})$, so no channel can lose more than a factor $e^{-0.6065}\approx0.545$ per token.
+The RNN demo also gives the equivalent ``naive'' form $w=\exp(-\exp(\tilde w))$ with
+$\tilde w=-\mathrm{softplus}(-(\vw_0+\cdot))-0.5$; since $-\mathrm{softplus}(-z)=\log\sigmoid(z)$,
+both are the same. In layers after the first, the value is pulled toward the first layer's
+value (a ``value residual''):
+$\vv_t\gets\vv_t+(\vv^{(1)}_t-\vv_t)\had\sigmoid(\vv_0+\vx^v_t\mW_{v1}\mW_{v2})$.
+
+\paragraph{Removal and replacement keys.} Per head, with learned vectors $\bm\xi$
+(\code{k_k}) and $\bm\zeta$ (\code{k_a}):
+\begin{equation}\label{eq:c06-rwkv-keys}
+  \hat{\bm\kappa}_t=\frac{\vk_t\had\bm\xi}{\norm{\vk_t\had\bm\xi}},\qquad
+  \tilde\vk_t=\vk_t\had\big(\bm1+(\va_t-\bm1)\had\bm\zeta\big).
+\end{equation}
+The \emph{removal key} $\hat{\bm\kappa}_t$ is unit-norm, as the delta rule needs. The
+\emph{replacement key} $\tilde\vk_t$ interpolates per channel between $\vk_t$ (when
+$\zeta_i=0$) and $\vk_t\had\va_t$ (when $\zeta_i=1$, the delta rule's ``write with the same
+rate you erase''); $\bm\zeta$ is initialized at $1.02$. The paper calls this a relaxed value
+replacement rule.
+
+\paragraph{State update and read-out.} Per head,
+\begin{equation}\label{eq:c06-rwkv7}
+  \boxed{\;\mS_t=\mS_{t-1}\big(\diag(\vw_t)-\hat{\bm\kappa}_t(\va_t\had\hat{\bm\kappa}_t)\T\big)+\vv_t\tilde\vk_t\T,
+  \qquad \vy_t=\mS_t\vr_t\;}
+\end{equation}
+and the block output is
+\begin{equation}\label{eq:c06-rwkv-out}
+  \vo_t=\mW_o\Big[\Big(\mathrm{GroupNorm}(\vy_t)+\big(\textstyle\sum_{j}r_{t,j}\tilde k_{t,j}\rho_j\big)\vv_t\Big)\had\vg_t\Big],
+\end{equation}
+where the group norm normalizes each head separately and the scalar
+$\sum_jr_{t,j}\tilde k_{t,j}\rho_j$ (learned $\bm\rho$, \code{r_k}, one vector per head) is a
+``bonus'' that adds the current value directly, the successor of RWKV-6's $\vu$ term.
+
+\paragraph{Reading \eqref{eq:c06-rwkv7} as a delta rule.}
+Expand the transition:
+\begin{equation}\label{eq:c06-rwkv-expanded}
+  \mS_t=\mS_{t-1}\diag(\vw_t)-\big(\mS_{t-1}\hat{\bm\kappa}_t\big)(\va_t\had\hat{\bm\kappa}_t)\T+\vv_t\tilde\vk_t\T .
+\end{equation}
+The vector $\mS_{t-1}\hat{\bm\kappa}_t$ is what the memory currently returns for the
+removal key; it is subtracted along the direction $\hat{\bm\kappa}_t$, channel by channel at
+rate $\va_t$, and the new value is written along the replacement key. With $\vw_t=\bm1$,
+$\va_t=\beta_t\bm1$, $\bm\zeta=\bm1$ and a unit $\vk_t=\hat{\bm\kappa}_t$ this is exactly
+DeltaNet, $\mS_t=\mS_{t-1}(\mI-\beta_t\vk_t\vk_t\T)+\beta_t\vv_t\vk_t\T$ (our check: agreement
+to $2\times10^{-15}$). The \fla{} derivation note
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/rwkv7/RWKV7(Goose).md} presents the
+same reading as gradient descent with weight decay: on $\loss=\tfrac12\norm{\vv-\mS\vk}^2$,
+$\mS_t=\mS_{t-1}\mD_t-\eta_t(\mS_{t-1}\vk_t\vk_t\T-\vv_t\vk_t\T)$, whose term
+$-\eta_t\vk_t\vk_t\T$ RWKV-7 generalizes to a general rank-one product. Note also the
+ordering: the removal is measured on the \emph{undecayed} state, as in Comba's SPLR
+\eqref{eq:c06-splr}, whereas KDA decays first.
+
+\paragraph{The rest of the block.} A layer computes
+$\vx\gets\vx+\mathrm{TimeMix}(\LayerNorm_1(\vx))$ and then
+$\vx\gets\vx+\mathrm{ChannelMix}(\LayerNorm_2(\vx))$ (the first layer also normalizes the
+embeddings with an extra $\LayerNorm_0$). Channel mixing is a token-shifted MLP with a squared
+ReLU and hidden width $4C$:
+\begin{equation}\label{eq:c06-cmix}
+  \vx^k_t=\vx_t+\bm\mu_k\had(\vx_{t-1}-\vx_t),\qquad
+  \mathrm{ChannelMix}(\vx)_t=\mW^{\text{ffn}}_v\,\ReLU(\mW^{\text{ffn}}_k\vx^k_t)^2 .
+\end{equation}
+
+\subsection{Eigenvalues of the RWKV-7 transition}\label{sec:c06-rwkv-eig}
+
+The transition $\mA_t=\diag(\vw_t)-\hat{\bm\kappa}_t(\va_t\had\hat{\bm\kappa}_t)\T$ is not
+symmetric when $\va_t$ is not constant, so a priori its eigenvalues could be complex or
+large. The following analysis is ours; the paper's own expressivity results are summarized
+after it.
+
+\begin{proposition}[Spectrum of the RWKV-7 transition]\label{prop:c06-rwkv-eig}
+Let $\vw\in(0,1]^{d}$, $\va\in(0,1)^{d}$ and $\norm{\hat{\bm\kappa}}=1$. Then
+$\mA=\diag(\vw)-\hat{\bm\kappa}(\va\had\hat{\bm\kappa})\T$ is similar to the symmetric matrix
+$\diag(\vw)-\bm{c}\bm{c}\T$ with $\bm{c}=\sqrt{\va}\had\hat{\bm\kappa}$. Hence all eigenvalues of $\mA$
+are real and lie in $[\min_iw_i-\norm{\bm{c}}^2,\ \max_iw_i]\subset(\min_iw_i-1,\ 1]$. With the
+clamp \eqref{eq:c06-rwkv-decay} this interval is contained in $(-0.455,\,1)$.
+\end{proposition}
+
+\begin{proof}
+Let $\mP=\diag(\sqrt{\va})$, which is invertible because every $a_i>0$. Diagonal matrices
+commute, hence $\mP\diag(\vw)\mP^{-1}=\diag(\vw)$. For the rank-one part,
+\[
+  \mP\hat{\bm\kappa}(\va\had\hat{\bm\kappa})\T\mP^{-1}
+  =(\sqrt{\va}\had\hat{\bm\kappa})\,(\va\had\hat{\bm\kappa}\had\va^{-1/2})\T=\bm{c}\bm{c}\T .
+\]
+So $\mP\mA\mP^{-1}=\diag(\vw)-\bm{c}\bm{c}\T$, which is symmetric, and similar matrices have the same
+eigenvalues. For the bounds, $\bm{c}\bm{c}\T$ is positive semidefinite with largest eigenvalue
+$\norm{\bm{c}}^2$, so by Weyl's inequality every eigenvalue of $\diag(\vw)-\bm{c}\bm{c}\T$ lies between
+$\min_iw_i-\norm{\bm{c}}^2$ and $\max_iw_i$. Finally
+$\norm{\bm{c}}^2=\sum_ia_i\hat\kappa_i^2<\sum_i\hat\kappa_i^2=1$, and the clamp gives
+$\min_iw_i>e^{-e^{-1/2}}\approx0.5452$.
+\end{proof}
+
+Three consequences. First, a single RWKV-7 step has a \emph{real} spectrum, like DeltaNet and
+Comba, so it cannot rotate. Second, negative eigenvalues are possible, down to about
+$-0.45$: put $\hat{\bm\kappa}_t$ on a channel $i$ with the strongest allowed decay and
+$a_{t,i}\to1$; then that direction gets $w_i-a_i\approx0.545-1$ while channels with $w\approx1$
+are kept. Per-channel decay is what makes this possible: unlike Comba's SPLR, the decay of
+the flipped direction is decoupled from the decay of the rest of the memory. Third, the
+clamp keeps the spectrum away from $-1$, so an exact reflection is not available in one step.
+Our numerical check sampled 20{,}000 random transitions: the largest imaginary part of any
+eigenvalue was exactly zero, all eigenvalues obeyed the bounds of
+\cref{prop:c06-rwkv-eig}, the observed range was $[-0.389,1.000]$, and the extreme
+construction above gives $-0.4548$.
+
+\paragraph{What the paper proves.} The RWKV-7 abstract states that RWKV-7 ``can perform state
+tracking and recognize all regular languages, while retaining parallelizability of
+training'', which exceeds what Transformers can do under the standard conjecture
+TC$^0\ne$ NC$^1$ (\cref{sec:c06-complexity}). These are statements about stacks of complete
+RWKV-7 layers and about products of transitions over several tokens; products of
+non-commuting real-spectrum matrices can have complex eigenvalues, so the single-step bound
+above does not limit them. See the paper for the constructions.
+
+\paragraph{Chunkwise form for DPLR transitions.}
+Training can use a chunkwise algorithm that generalizes the UT transform to DPLR transitions.
+We derive it for $\mS_t=\mS_{t-1}(\mD_t+\bm\phi_t\bm\psi_t\T)+\vv_t\vk_t\T$, with RWKV-7 as
+the case $\mD_t=\diag(\vw_t)$, $\bm\phi_t=-\hat{\bm\kappa}_t$,
+$\bm\psi_t=\va_t\had\hat{\bm\kappa}_t$, $\vk_t\to\tilde\vk_t$, $\vq_t=\vr_t$. Define the
+``removal read-out'' $\vz_t=\mS_{t-1}\bm\phi_t$, so that
+$\mS_t=\mS_{t-1}\mD_t+\vz_t\bm\psi_t\T+\vv_t\vk_t\T$. Inside a chunk with start state
+$\mS_{[i]}$ let $\mLambda_r=\mD_1\cdots\mD_r$ (diagonal, cumulative within the chunk,
+$\mLambda_0=\mI$). Unrolling,
+\begin{equation}\label{eq:c06-dplr-state}
+  \mS_r=\mS_{[i]}\mLambda_r+\sum_{s\le r}\big(\vz_s\bm\psi_s\T+\vv_s\vk_s\T\big)\mLambda_s^{-1}\mLambda_r .
+\end{equation}
+Multiply \eqref{eq:c06-dplr-state} (at $r-1$) by $\bm\phi_r$ and introduce the decayed vectors
+$\hat{\bm\phi}_r=\mLambda_{r-1}\bm\phi_r$, $\bar{\bm\psi}_s=\mLambda_s^{-1}\bm\psi_s$,
+$\bar\vk_s=\mLambda_s^{-1}\vk_s$, $\hat\vq_r=\mLambda_r\vq_r$:
+\begin{equation}
+  \vz_r=\mS_{[i]}\hat{\bm\phi}_r+\sum_{s<r}\big[(\bar{\bm\psi}_s\T\hat{\bm\phi}_r)\,\vz_s+(\bar\vk_s\T\hat{\bm\phi}_r)\,\vv_s\big].
+\end{equation}
+With rows stacked, the strictly lower-triangular matrices
+$(\mA_{\phi\psi})_{rs}=\hat{\bm\phi}_r\T\bar{\bm\psi}_s$ and
+$(\mA_{\phi k})_{rs}=\hat{\bm\phi}_r\T\bar\vk_s$ ($s<r$), and one triangular inverse,
+\begin{equation}\label{eq:c06-dplr-z}
+  \mZ=(\mI-\mA_{\phi\psi})^{-1}\big(\hat{\bm\Phi}\mS_{[i]}\T+\mA_{\phi k}\mV\big)
+     =\mW\mS_{[i]}\T+\mU .
+\end{equation}
+Reading out $\vy_r=\mS_r\vq_r$ from \eqref{eq:c06-dplr-state}, with the lower-triangular
+(including diagonal) matrices $(\mA_{q\psi})_{rs}=\hat\vq_r\T\bar{\bm\psi}_s$ and
+$(\mA_{qk})_{rs}=\hat\vq_r\T\bar\vk_s$ ($s\le r$):
+\begin{equation}\label{eq:c06-dplr-out}
+  \mY_{[i]}=\hat\mQ\mS_{[i]}\T+\mA_{q\psi}\mZ+\mA_{qk}\mV,\qquad
+  \mS_{[i+1]}=\big(\mS_{[i]}+\mZ\T\bar{\bm\Psi}+\mV\T\bar\mK\big)\mLambda_C .
+\end{equation}
+These are, up to notation, the quantities \code{A_ab}, \code{A_ak}, \code{A_qb}, \code{A_qk},
+\code{w}, \code{u} computed by \fla{}'s \code{chunk_dplr_fwd}. Our NumPy implementation of
+\eqref{eq:c06-dplr-z}--\eqref{eq:c06-dplr-out} matched the RWKV-7 recurrence to
+$3\times10^{-15}$ for chunk sizes 4, 8 and 16. The factors $\mLambda_s^{-1}$ grow
+exponentially inside a chunk, which is why production kernels bound the per-step log-decay
+and the chunk length (next subsection).
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{RWKV-7 time mixing (one head): decoding step}
+\label{alg:c06-rwkv7}
+\begin{algorithmic}[1]
+\Require state $\mS\in\R^{N\times N}$; previous input $\vx_{t-1}$; current input $\vx_t$
+\State $\vx^c_t\gets\vx_t+\bm\mu_c\had(\vx_{t-1}-\vx_t)$ for $c\in\{r,w,k,v,a,g\}$ \Comment{token shift}
+\State compute $\vr_t,\vk_t,\vv_t,\vw_t,\va_t,\vg_t$; value residual for layers after the first
+\State $\hat{\bm\kappa}_t\gets\mathrm{normalize}(\vk_t\had\bm\xi)$;\quad $\tilde\vk_t\gets\vk_t\had(\bm1+(\va_t-\bm1)\had\bm\zeta)$
+\State $\vz\gets\mS(-\hat{\bm\kappa}_t)$ \Comment{removal read-out on the old state, $\bigO(N^2)$}
+\State $\mS\gets\mS\diag(\vw_t)+\vz(\hat{\bm\kappa}_t\had\va_t)\T+\vv_t\tilde\vk_t\T$ \Comment{$\bigO(N^2)$}
+\State $\vy_t\gets\mS\vr_t$
+\State $\vo_t\gets\mW_o[(\mathrm{GroupNorm}(\vy_t)+(\sum_jr_{t,j}\tilde k_{t,j}\rho_j)\vv_t)\had\vg_t]$
+\State \Return $\vo_t$, $\mS$, $\vx_t$ \Comment{$\vx_t$ is the token-shift state}
+\end{algorithmic}
+\end{algorithm}
+
+Per head, the state is $N^2$ numbers plus one $C$-vector of token-shift state per block for
+time mixing and one for channel mixing; decoding (\cref{alg:c06-rwkv7}) costs $\bigO(N^2)$
+time per token. For training there are two strategies.
+\begin{itemize}
+\item \textbf{Sequential scan (official CUDA kernel).} One thread block per (batch, head) pair
+and one thread per state row; each thread keeps its row of $\mS$ ($N=64$ floats) in registers
+and loops over time. Work is $\bigO(TN^2)$ per head, parallel over $B\cdot H\cdot N$
+threads, with sequential depth $T$. Because the per-token work is tiny and the state fits in
+registers, this simple scan is fast in practice.
+\item \textbf{Chunkwise DPLR (\fla{}).} \eqref{eq:c06-dplr-z}--\eqref{eq:c06-dplr-out} cost
+$\bigO(TC N+TN^2)$ for the products plus $\bigO(TC^2)$ for the inverses, with depth $T/C$,
+and map onto tensor cores.
+\end{itemize}
+
+\subsection{Implementation walkthrough}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak{}BlinkDL\_\_RWKV-LM/\allowbreak{}RWKV-v7/\allowbreak{}rwkv\_v7\_demo\_rnn.py} (time mixing in RNN mode)},label={lst:c06-rwkv-rnn}]
+    xx = x_prev - x
+    xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
+
+    r = rw @ xr
+    w = torch.tanh(xw @ w1) @ w2
+    k = kw @ xk
+    v = vw @ xv
+    a = torch.sigmoid(a0 + (xa @ a1) @ a2)
+    g = torch.sigmoid(xg @ g1) @ g2
+
+    kk = k * k_k
+    kk = torch.nn.functional.normalize(kk.view(H,N), dim=-1, p=2.0).view(-1)
+    k = k * (1 + (a-1) * k_a)
+    # ...
+    w = w0 + w.float()
+    assert w.dtype == torch.float
+    w = torch.exp(-0.606531 * torch.sigmoid(w)) # 0.606531 = exp(-0.5)
+    
+    # rwkv-7 kernel
+    vk = v.view(H,N,1) @ k.view(H,1,N)
+    ab = (-kk).view(H,N,1) @ (kk*a).view(H,1,N)
+    state = state * w.view(H,1,N) + state @ ab.float() + vk.float()
+    out = state.to(dtype=x.dtype) @ r.view(H,N,1)
+
+    out = torch.nn.functional.group_norm(out.view(1,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(H*N)    
+    out = out + ((r * k * r_k).view(H,N).sum(dim=-1, keepdim=True) * v.view(H,N)).view(H*N)
+    return ow @ (out * g), x, state, v_first
+\end{lstlisting}
+
+\Cref{lst:c06-rwkv-rnn} contains the whole of
+\eqref{eq:c06-tokenshift}--\eqref{eq:c06-rwkv-out} for one token. The state has shape \texttt{[H, N, N]} = (head, value, key), the same orientation as
+our $\mS_t$; \code{ab} is the rank-one matrix $(-\hat{\bm\kappa})(\hat{\bm\kappa}\had\va)\T$
+and \texttt{state @ ab} is the removal term of \eqref{eq:c06-rwkv-expanded}. The elided lines
+apply the value residual and give the equivalent ``naive'' form of the decay.
+
+\begin{implnote}[title={In the code: the official training model}]
+\repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/train_temp/src/model.py} implements the same block for
+training. \code{RWKV_Tmix_x070} (time mixing) keeps the ``slow pytorch version'' of each step
+in comments next to fused CUDA calls: \code{tmix_mix6_bf16_v5} (the six token shifts),
+\code{tmix_vres_gate_bf16_v3} (value residual), \code{tmix_a_gate_bf16} ($\va_t$),
+\code{tmix_kk_pre_bf16_v5} (removal and replacement keys), \code{RWKV7_CLAMPW_CUDA} (the
+recurrence) and \code{tmix_lnx_rkvres_xg_bf16_v1} (group norm, bonus and gate). The
+recurrence kernel is called as \texttt{RWKV7\_CLAMPW\_CUDA(r, w, k, v, -kk, kk*a)}: its arguments
+\code{a} and \code{b} are $-\hat{\bm\kappa}_t$ and $\hat{\bm\kappa}_t\had\va_t$, not the
+learning rate itself. Module-level constants: \code{HEAD_SIZE} must be 64 and
+\code{CHUNK_LEN} is 16. \code{RWKV_CMix_x070} is the channel mixer \eqref{eq:c06-cmix} with
+a fused kernel, and \code{Block} chains \code{ln0} (layer 0 only), \code{ln1}, \code{att},
+\code{ln2}, \code{ffn}, passing \code{v_first} along for the value residual.
+Initialization is deliberate: token-shift weights follow a power law over channels and
+depth, the decay bias \code{w0} is a ramp from about $-6$ to $0$ across channels, shifted by
+$0.5$, plus a ``zigzag'' pattern within each head, LoRA output matrices are orthogonally initialized with gain 0.1,
+\code{k_k} starts at about 0.71, \code{k_a} at 1.02, \code{r_k} at $-0.04$, and the output
+projection at zero. The code suggests LoRA ranks \texttt{max(32, round(c * sqrt(C) / 32) * 32)} with
+$c=2.5$ (decay, learning rate), 1.7 (value residual) and 5 (gate); the 1.5B model documented in
+the training README uses 96, 96, 64 and 256.
+\end{implnote}
+
+\begin{lstlisting}[language={C++},caption={Excerpt from \texttt{repos/\allowbreak{}BlinkDL\_\_RWKV-LM/\allowbreak{}RWKV-v7/\allowbreak{}train\_temp/\allowbreak{}cuda/\allowbreak{}rwkv7\_clampw.cu} (forward kernel, per-step loop)},label={lst:c06-rwkv-cuda}]
+    for (int t = 0; t < T; ++t)
+    {
+        const int idx = ((bb*T+t)*H+hh)*N+i;
+
+        __syncthreads();
+        r[i] = to_float(r_[idx]);
+        w[i] = __expf(W_SCALE / (1.0f + __expf(-to_float(w_[idx]))));
+        k[i] = to_float(k_[idx]);
+        a[i] = to_float(a_[idx]);
+        b[i] = to_float(b_[idx]);
+        __syncthreads();
+
+        float sa = 0.0f;
+#pragma unroll
+        for (int j=0; j<N; ++j) {
+            sa += state[j] * a[j];
+        }
+        sa_[idx] = sa;
+
+        float vi = to_float(v_[idx]);
+        float y=0.0f;
+#pragma unroll
+        for (int j=0; j<N; ++j) {
+            float s = state[j];
+            s = s * w[j] + (sa * b[j] + k[j] * vi);
+            y += s * r[j];
+            state[j] = s;
+        }
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the CUDA recurrence}]
+In \cref{lst:c06-rwkv-cuda}, thread \code{i} of block (\code{hh}, \code{bb}) owns row $i$ of
+the state, \code{state[j]} $=S_{ij}$. The decay line computes
+$w=\exp(c\,\sigmoid(\cdot))$ with $c=$ \code{W_SCALE} $=-e^{-1/2}=-0.6065306597$,
+i.e.\ the clamp \eqref{eq:c06-rwkv-decay} is applied inside the kernel to the raw decay logits
+(hence ``clampw''). \code{sa} is the removal read-out $z_i=(\mS_{t-1}(-\hat{\bm\kappa}_t))_i$,
+computed from the old row before it is overwritten; it is saved in \code{sa_} for the
+backward pass. After the loop shown, every \code{_CHUNK_LEN_} (16) steps the thread writes its
+row into a checkpoint tensor \code{s} of shape \texttt{[B, H, T/16, N, N]}; the backward kernel
+restarts from these checkpoints. The older kernel \code{wkv7_cuda.cu} in the same folder uses
+the unclamped $w=\exp(-\exp(\cdot))$, and the inference kernels live in
+\code{RWKV-v7/cuda/}.
+\end{implnote}
+
+\begin{implnote}[title={In the code: the \fla{} version and its alignment}]
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/rwkv7.py} defines
+\code{RWKV7Attention} with \code{LoRA} modules for the decay (\code{w_lora}, tanh inside),
+learning rate (\code{a_lora}), value residual (\code{v_lora}) and gate (\code{g_lora},
+sigmoid inside, no bias), fused token shift (\code{token_shift}, \code{fused_addcmul_rwkv7}),
+and the fused replacement-key update \code{fused_k_rwkv7}. It produces the log-decay
+directly, \texttt{w = -0.6065306597126334 * self.w\_lora(xw).sigmoid()}, the same clamp as the
+reference. For training or inputs of 64 tokens or more it calls \code{chunk_rwkv7} with
+\code{a=-kk}, \texttt{b=kk * a}, \code{safe_gate=True}, \code{lower_bound=-0.6065306597126334}
+and \code{chunk_size=64}; \code{chunk_rwkv7} is a thin wrapper around the generic
+\code{chunk_dplr_delta_rule} of \code{fla/ops/generalized_delta_rule/dplr/}. The bound on the
+log-decay is what licenses the larger chunk and tensor-core path (the docstring of
+\code{chunk_rwkv7} gives the safe gate range as approximately $[-5,0)$); without it the chunk
+size defaults to 16. Short inference inputs use \code{fused_mul_recurrent_rwkv7}. The output
+path \code{gate_output_correction} fuses the bonus term and the gate of
+\eqref{eq:c06-rwkv-out}; the group norm uses \texttt{eps = head\_dim * norm\_eps}, which with the
+defaults equals the reference's $64\times10^{-5}$.
+
+\emph{Alignment.} The project README (\repofile{README.md}, \S1c) records that the RWKV-7
+authors say the \fla{} version is not yet aligned with theirs, and the \fla{} constructor
+itself warns: ``According to Bo, you are using a potentially buggy FLA implementation of
+RWKV. If you plan to report any numbers based on this implementation, we strongly recommend
+cross-checking with the official repo''. The training README
+(\repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/train_temp/README.md}) adds that ``there is no good
+simple RWKV-7 layer because a pytorch layer can't make sure itself is using correct init and
+hyperparameters'', and points to a separate RWKV-versus-\fla{} comparison repository. For
+experiments that report numbers, use the official code.
+\end{implnote}
+
+\subsection{Reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): RWKV-7 time mixing, recurrent form},label={lst:c06-rwkv-ours}]
+import math
+import torch
+import torch.nn.functional as F
+
+def rwkv7_time_mix(x, P, H, v_first=None):
+    """x: [T, C] after LayerNorm; P: dict of parameters (names as in the paper's
+    code); H heads of size N = C // H. Returns [T, C] and v_first."""
+    T, C = x.shape
+    N = C // H
+    xx = torch.cat([x.new_zeros(1, C), x[:-1]]) - x            # x_{t-1} - x_t
+    xr, xw, xk, xv, xa, xg = (x + xx * P['mu_' + c] for c in 'rwkvag')
+    r, k, v = xr @ P['Wr'], xk @ P['Wk'], xv @ P['Wv']
+    d = P['w0'] + torch.tanh(xw @ P['w1']) @ P['w2']
+    w = torch.exp(-math.exp(-0.5) * torch.sigmoid(d))          # decay in (0.545, 1)
+    a = torch.sigmoid(P['a0'] + (xa @ P['a1']) @ P['a2'])       # in-context learning rate
+    g = torch.sigmoid(xg @ P['g1']) @ P['g2']                   # output gate
+    if v_first is None:
+        v_first = v                                            # first layer
+    else:
+        v = v + (v_first - v) * torch.sigmoid(P['v0'] + (xv @ P['v1']) @ P['v2'])
+    kap = F.normalize((k * P['k_k']).view(T, H, N), dim=-1)     # removal key
+    k = k * (1 + (a - 1) * P['k_a'])                            # replacement key
+    r, w, k, v, a = (z.view(T, H, N) for z in (r, w, k, v, a))
+    S = x.new_zeros(H, N, N)                                    # [head, value, key]
+    ys = []
+    for t in range(T):
+        z = torch.einsum('hvk,hk->hv', S, -kap[t])              # removal read-out
+        S = (S * w[t][:, None, :]
+             + torch.einsum('hv,hk->hvk', z, kap[t] * a[t])     # remove along kappa
+             + torch.einsum('hv,hk->hvk', v[t], k[t]))          # write v along k~
+        ys.append(torch.einsum('hvk,hk->hv', S, r[t]))          # read after write
+    y = F.group_norm(torch.stack(ys).reshape(T, C), H, P['ln_w'], P['ln_b'], eps=64e-5)
+    bonus = ((r * k * P['r_k']).sum(-1, keepdim=True) * v).reshape(T, C)
+    return ((y + bonus) * g) @ P['Wo'], v_first
+\end{lstlisting}
+
+\Cref{lst:c06-rwkv-ours} follows the reference line by line, with one simplification: the
+input $\vx$ is one sequence without a carried token-shift state. In NumPy we checked the
+recurrence part against the matrix form \eqref{eq:c06-rwkv7} (agreement $2\times10^{-15}$),
+against the DPLR chunkwise algorithm (\cref{sec:c06-rwkv-eig}), against DeltaNet in the special
+case, and the eigenvalue bounds of \cref{prop:c06-rwkv-eig}.
+
+\subsection{Reported results}
+
+\begin{results}
+Sources: \repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/train_temp/README.md},
+\repofile{repos/BlinkDL__RWKV-LM/RWKV-v7/README.md}.
+\begin{itemize}
+\item Reproducibility check: for the default MiniPile run (a 1.5G-token corpus; the default
+configuration needs one GPU with 7G of memory) the training README lists the expected log,
+with loss 4.875856 at the first entry and 3.295895 at the twelfth, and states that a correct
+setup must match ``within +-0.01 or something is wrong''.
+\item The README also documents the parameter shapes of a 1.5B model (24 layers, width 2048,
+vocabulary 65536), for example LoRA ranks of 96 for the decay and the learning rate, 64 for
+the value residual and 256 for the gate, and stresses that weight decay must be applied only
+to the large matrices ``or the performance will be much worse''.
+\item The folder README labels this code ``RWKV-7 `Goose' x070 (final release, `rc4a')''.
+\item The paper's abstract (not in the repository) reports state-of-the-art multilingual
+results at the 3B scale with fewer training tokens than comparable models, and the
+state-tracking results discussed above. See the paper for numbers.
+\end{itemize}
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} RWKV-7 is the most fine-grained transition in this chapter:
+per-channel decay, per-channel learning rate, and separate keys for erasing and writing,
+all at the cost of a rank-one update per token. Its negative eigenvalues (down to about
+$-0.45$) need no doubling of a gate, and its per-channel decay lets one direction flip sign
+while the rest of the memory is preserved. The official CUDA scan shows that for head size
+64 a plain sequential kernel can be competitive, and the released models make it one of
+the most used recurrent architectures.
+
+\textbf{Limitations.} The design depends on many carefully tuned initializations and
+per-parameter learning-rate and weight-decay settings; the authors warn that a stand-alone
+layer is hard to get right and that the \fla{} version is not aligned with theirs. Each step
+is still rank one with a real spectrum and cannot rotate; per-token expressivity grows only
+by composing tokens or layers.
+
+\textbf{Relations.} Setting $\vw_t=\bm1$, $\va_t=\beta_t\bm1$ and tying the keys recovers
+DeltaNet; tying the keys but keeping vector decay gives a KDA-like transition with a different
+ordering (\cref{ch:delta}); DeltaProduct generalizes the other way, from rank one to rank
+$n_h$. RWKV-7's ``generalized delta rule'' is exactly the DPLR family that \fla{} implements
+once (\code{chunk_dplr_delta_rule}) and reuses.
+
+% ===========================================================================
+\section{Comparison and discussion}\label{sec:c06-comparison}
+
+\Cref{tab:c06-compare} puts the three systems next to the baselines of
+\cref{ch:linear,ch:delta}. All of them keep a state of $d_kd_v$ numbers per head; they
+differ in what one transition can do to that state.
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Transitions compared (one head, unit keys). ``Tracking'' refers to exact
+representation by a single layer through \eqref{eq:c06-rep}; multi-layer results are in the
+cited papers.}
+\label{tab:c06-compare}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{1.9cm}@{}}
+\toprule
+System & Transition $\mA_t$ & Eigenvalues of one $\mA_t$ & State tracking & Decode cost per token \\
+\midrule
+Mamba-2, GLA & $\alpha_t\mI$, $\diag(\valpha_t)$ & real, in $(0,1)$ & not parity (\cref{prop:c06-parity}) & $\bigO(d_kd_v)$ \\
+Gated DeltaNet & $\alpha_t(\mI-\beta_t\vk_t\vk_t\T)$, $\beta_t\in(0,1)$ & real, in $[0,1)$ & not parity & $\bigO(d_kd_v)$ \\
+DeltaNet, $\beta\in(0,2)$ & $\mI-\beta_t\vk_t\vk_t\T$ & real, in $[-1,1]$ & parity; one reflection per token & $\bigO(d_kd_v)$ \\
+DeltaProduct$_{n_h}$, $\beta\in(0,2)$ & $\alpha_t\prod_{j=1}^{n_h}\mH_{t,j}$, $\mH_{t,j}=\mI-\beta_{t,j}\vk_{t,j}\vk_{t,j}\T$ & complex, $\abs{\lambda}\le\alpha_t$ & $S_{n_h+1}$ (\cref{prop:c06-perm}); rotations; all orthogonal maps at $n_h=d_k$ & $\bigO(n_hd_kd_v)$ \\
+Comba (SPLR) & $\alpha_t\mI-\beta_t\bm{p}_t\vk_t\T$ & real, $\{\alpha_t,\alpha_t-\beta_t\}\subset(-1,1)$ & sign flips only together with forgetting ($\beta_t>\alpha_t$) & $\bigO(d_kd_v)$ \\
+RWKV-7 & $\diag(\vw_t)-\hat{\bm\kappa}_t(\va_t\had\hat{\bm\kappa}_t)\T$ & real, in $(\min w-1,1)\subset(-0.455,1)$ & partial flips per channel; paper: all regular languages with several layers & $\bigO(d_kd_v)$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Three ways to enrich a transition.} The systems move along different axes from
+Gated DeltaNet. DeltaProduct raises the \emph{rank} of the correction (one to $n_h$), which is
+the only route in this chapter to complex eigenvalues within a single token, and pays for it
+linearly in compute. Comba changes the \emph{ordering} and \emph{scalar structure} (decay
+after feedback, plus an output correction), which costs nothing and opens a negative
+eigenvalue range that is tied to forgetting. RWKV-7 refines the \emph{per-channel structure}
+(vector decay, vector learning rate, decoupled keys), which allows partial sign flips on
+some channels while preserving others, at the price of more projections and a delicate
+initialization.
+
+\paragraph{Training cost.} All three keep a chunkwise algorithm with one triangular inverse
+per chunk: DeltaProduct by interleaving into a gated delta rule (\cref{prop:c06-interleave}),
+Comba by the single-inverse SPLR form \eqref{eq:c06-comba-wu}, RWKV-7 by the DPLR form
+\eqref{eq:c06-dplr-z}. DPLR is the most general and the most delicate numerically because of
+the inverse cumulative decays $\mLambda_s^{-1}$; RWKV-7's decay clamp doubles as a guarantee
+that the kernel can use 64-token chunks.
+
+\paragraph{Recall versus tracking.} The capacity arguments of \cref{ch:delta} (at most $d_k$
+orthogonal keys can be stored without interference) are unchanged by richer transitions: a
+reflection or rotation does not create room for more associations. What changes is what the
+memory can \emph{compute} about the order of events. This is why expressive recurrent layers
+combine naturally with a few attention layers in hybrids (\cref{ch:hybrid}): attention
+provides exact retrieval over the context, the recurrent layers provide cheap, order-sensitive
+state.
+
+\paragraph{From theory to practice.} The theorems are about exact solutions at all lengths.
+Trained models implement them only approximately: exact reflections need $\beta=2$ at the
+boundary of a sigmoid, finite precision blurs long products, and a language model rarely
+needs to compose a thousand permutations. The evidence in the repositories is therefore
+qualitative but consistent: with too few Householder factors or with non-negative eigenvalues,
+single-layer models fail exactly where \cref{prop:c06-perm} says they must, and the
+DeltaProduct README reports better length extrapolation as $n_h$ grows.
+
+\paragraph{A design checklist.} When building a recurrent memory layer: (i) let the
+eigenvalue along the key go negative (doubling $\beta$, SPLR ordering, or per-channel decay);
+(ii) decide whether single-token rotations are needed, and if so use a product of $n_h\ge2$
+Householders; (iii) consider per-channel decay to decouple flipping one direction from
+forgetting the others; (iv) treat output corrections and decoupled write keys as independent
+add-ons; (v) verify the recurrence against a chunkwise kernel and a reference with the
+\emph{same} ordering of decay and feedback.
+
+\begin{summarybox}
+\begin{itemize}
+\item State tracking (parity, modular counting, permutation composition) is a memory
+capability distinct from associative recall: the state must be transformed, not looked up.
+A linear recurrence tracks a group exactly when its transitions can realize a representation
+of the group.
+\item Diagonal transitions with non-negative entries cannot track parity: every channel
+converges monotonically. A single eigenvalue $-1$ fixes parity; non-commuting transitions are
+needed for groups like $S_5$, whose word problem is NC$^1$-complete, beyond the TC$^0$ class
+that contains log-precision Transformers and diagonal SSMs.
+\item A generalized Householder $\mI-\beta\vk\vk\T$ has eigenvalues $1$ and $1-\beta$;
+$\beta\in(0,2)$ gives $[-1,1]$ and corresponds to stable gradient steps that overshoot.
+Products of Householders give rotations and permutations; a permutation with $c$ cycles on
+$n$ objects needs exactly $n-c$ reflections.
+\item DeltaProduct takes $n_h$ delta steps per token, so each transition is a product of
+$n_h$ Householders; it trains as a gated delta rule over an interleaved sequence of length
+$Tn_h$ and tracks $S_{n_h+1}$ in one layer, at $n_h$ times the compute and the same state size.
+\item Comba applies feedback before decay (SPLR, $\alpha_t\mI-\beta_t\bm{p}_t\vk_t\T$) and corrects
+the output with $-d\,\mS_t\bm{p}_t$; its chunk form needs one inverse. In the \fla{} kernels the
+feedback key is normalized to the key, and two reference recurrences use different orderings.
+\item RWKV-7 uses $\diag(\vw_t)-\hat{\bm\kappa}_t(\va_t\had\hat{\bm\kappa}_t)\T$ with a clamped
+vector decay, a vector learning rate and separate removal and replacement keys; each step has
+real eigenvalues in about $(-0.45,1)$. The official code is a sequential CUDA scan; \fla{}
+offers a DPLR chunkwise version that its authors do not consider aligned.
+\end{itemize}
+\end{summarybox}
+
+% ===========================================================================
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Householder spectrum and overshooting]\label{ex:c06-householder}
+Let $\norm{\vk}=1$ and $\mH=\mI-\beta\vk\vk\T$.
+(a) Prove that $\mH$ has eigenvalue $1-\beta$ with eigenvector $\vk$ and eigenvalue 1 on
+$\vk^\perp$, and that $\norm{\mH}_2\le1$ if and only if $\beta\in[0,2]$.
+(b) Derive \eqref{eq:c06-residual} and conclude that, for repeated writes of the same pair
+$(\vk,\vv)$, the retrieval error $\mS_t\vk-\vv$ converges to zero for every
+$\beta\in(0,2)$, alternating in sign when $\beta>1$.
+(c) What happens to the error at $\beta=2$, and what happens to the part of the state
+orthogonal to $\vk$?
+\end{exercise}
+
+\begin{exercise}[Two reflections make a rotation]\label{ex:c06-rotation}
+Let $\vk_1,\vk_2\in\R^d$ be unit vectors with $\vk_1\T\vk_2=\cos\theta$.
+(a) In $d=2$ write $\vk_i=(\cos\theta_i,\sin\theta_i)$ and show that
+$\mH(\vk_1,2)\mH(\vk_2,2)$ is the rotation by $2(\theta_1-\theta_2)$.
+(b) For general $d$, show that the product fixes every vector orthogonal to both keys and
+acts on $\mathrm{span}\{\vk_1,\vk_2\}$ as a rotation by $\pm2\theta$; deduce its eigenvalues.
+(c) Give keys and step sizes for a DeltaProduct$_2[-1,1]$ layer with $d_k=2$ that counts
+modulo 3: the state should return to its initial value after every third ``1'' token and be
+unchanged by ``0'' tokens.
+\end{exercise}
+
+\begin{exercise}[Positive diagonal recurrences and parity]\label{ex:c06-parity}
+(a) Complete the proof of \cref{prop:c06-parity} for a read-out $y_t=f(\vh_t)$ given by a fixed
+ReLU network followed by a threshold. (Hint: a ReLU network is piecewise linear with finitely
+many pieces.)
+(b) Extend the argument to a stack of two such layers, assuming finite precision: show that
+the first layer's state becomes exactly constant after finitely many steps on $1^n$, and
+conclude.
+(c) Show that one channel with $a(1)=-1$ solves parity, and explain in one sentence why this
+does not contradict TC$^0$ lower bounds.
+\end{exercise}
+
+\begin{exercise}[Tracking $S_3$]\label{ex:c06-s3}
+Let $\mP$ be the permutation matrix of the 3-cycle $(1\,2\,3)$.
+(a) Show that $\mP\neq\mI-\beta\vk\vk\T$ for every unit $\vk$ and every real $\beta$.
+(b) Write $\mP$ as a product of two reflections $\mH(\vk_1,2)\mH(\vk_2,2)$ with explicit keys.
+(c) Show that a product of two generalized Householders with $\beta_1,\beta_2\in[0,1]$ has
+only real, non-negative eigenvalues (hint: each factor is positive semidefinite, and $\mA\mB$
+is similar to $\mA^{1/2}\mB\mA^{1/2}$ when $\mA$ is invertible). Relate (a)--(c) to the four
+$S_3$ configurations in the DeltaProduct README.
+\end{exercise}
+
+\begin{exercise}[RWKV-7 eigenvalues]\label{ex:c06-rwkv}
+(a) Prove \cref{prop:c06-rwkv-eig} in detail, including the case where some $a_i$ equals one.
+(b) For $d_k=2$, $\hat{\bm\kappa}=(1,0)$, $\vw=(w_1,w_2)$ and $\va=(a_1,a_2)$, compute the
+eigenvalues explicitly. When is one of them negative? What is the most negative value allowed
+by the clamp \eqref{eq:c06-rwkv-decay}?
+(c) Show that if $\va_t=\beta_t\bm1$ the transition is symmetric, and compare its spectrum with
+that of KDA's $\diag(\valpha_t)(\mI-\beta_t\vk_t\vk_t\T)$ for the same inputs.
+\end{exercise}
+
+\begin{exercise}[Coding: chunkwise forms]\label{ex:c06-code}
+(a) Implement \cref{alg:c06-comba} in NumPy and check it against
+\cref{lst:c06-comba-ours} (recurrent part) for random inputs, chunk sizes 4 to 64 and both
+$\bm{p}_t=\vk_t$ and a general $\bm{p}_t$.
+(b) Derive the chunkwise form of the decay-first ordering \eqref{eq:c06-decayfirst}: which
+$\gamma$ index changes in $\mT$ and in $\mW$? Implement it and confirm that it differs from
+SPLR unless $\alpha_t\equiv1$.
+(c) Implement DeltaProduct prefill by interleaving (\cref{lst:c06-dp-ours}) on top of your
+chunkwise gated delta rule. Count floating-point operations as a function of $n_h$, $C$,
+$d_k$, $d_v$ and $T$ and compare with $n_h$ separate DeltaNet layers.
+\end{exercise}

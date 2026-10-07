@@ -7,8 +7,8 @@ base=$(basename "$1" .tex)
 num=${base%%-*}
 out="$here/build/check-$base"
 rm -rf "$out"; mkdir -p "$out"
-bibs="$here/bib/core"
-[ -f "$here/bib/c$num.bib" ] && bibs="$bibs,$here/bib/c$num"
+# Load every bibliography file: shared references may live in another chapter's file.
+bibs=$(ls "$here"/bib/*.bib | sed 's/\.bib$//' | paste -sd, -)
 cat > "$out/check.tex" <<TEX
 \\documentclass[11pt,twoside,openright]{book}
 \\input{$here/preamble}

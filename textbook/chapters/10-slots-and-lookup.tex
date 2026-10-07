@@ -1,3 +1,2037 @@
 \chapter{Memory Slots and Lookup Memory}\label{ch:lookup}
 
-(Chapter in preparation.)
+The memories of the previous chapters are \emph{computed}. A KV cache is a stack of activations that
+must be recomputed for every new context, a recurrent state is a compressed summary that is
+overwritten token by token, and the fast weights of \cref{ch:ttt} are written by gradient steps.
+None of them has a notion of \emph{where} a piece of knowledge lives. This chapter studies the
+opposite design: memories made of individually \emph{addressable} entries --- slots, table rows,
+stored token sequences --- that persist beyond a single forward pass and are reached through an
+explicit address computation. The survey of \citet{zhoubian2026memory} groups such designs under
+explicit memory, in its sections on dedicated memory slots (\S IV-A(d)), lookup-based and
+retrieval-oriented memory (\S IV-B) and conditional parameter memory (\S IV-C).
+
+Addressable memory matters for three reasons. First, capacity can be decoupled from compute: a
+table with a billion rows costs the same per token as a table with a thousand rows if only a
+constant number of rows is read. Second, an entry that has an address can be inspected, edited or
+moved to another level of the hardware memory hierarchy. Third, it gives the network a native
+primitive for \emph{knowledge lookup}, which a standard Transformer can only imitate by spending
+layers of attention and feed-forward computation on it \citep{cheng2026engram}.
+
+\Cref{sec:c10-background} builds the background from scratch: the read/write interface of an
+addressable memory, nearest-neighbour datastores (kNN-LM), the view of feed-forward layers as
+key--value memories, product-key memory with its $\bigO(\sqrt{N})$ lookup, hashed $N$-gram
+embeddings, Mixture-of-Experts as conditional parameter memory, and two 2023--2024 precursors.
+The four systems of the chapter then follow, ordered from the most ``recurrent'' to the most
+``static'': LM2, a gated bank of memory slots inside every decoder layer
+(\cref{sec:c10-lm2}); Engram, DeepSeek's hashed $N$-gram tables that act as a new axis of
+sparsity next to MoE (\cref{sec:c10-engram}); ExplicitLM, a bank of human-readable token
+sequences reached by a two-stage differentiable retrieval (\cref{sec:c10-explicitlm}); and
+MemoryLLM, which turns the feed-forward layers themselves into context-free per-token lookup
+tables (\cref{sec:c10-memoryllm}). \Cref{sec:c10-comparison} compares them.
+
+% =====================================================================================
+\section{Background: addressable memory inside a language model}\label{sec:c10-background}
+
+\subsection{A common read/write interface}\label{sec:c10-interface}
+
+All memories in this chapter fit one template. A memory holds $N$ \emph{entries}. Entry $i$ has an
+address (a key $\vk_i$, an integer index, or both) and a content $\vv_i \in \R^{d_v}$. Reading
+involves three steps:
+\begin{enumerate}
+  \item \textbf{Address.} From the current context (token ids, a hidden state $\vh_t$, or both)
+        compute a small set of indices $\mathcal{I}_t \subset \{1,\dots,N\}$ with
+        $\abs{\mathcal{I}_t} = k \ll N$, and weights $w_{t,i}$ for $i \in \mathcal{I}_t$.
+  \item \textbf{Read.} Combine the selected contents, usually
+        $\vr_t = \sum_{i \in \mathcal{I}_t} w_{t,i}\, \vv_i$.
+  \item \textbf{Fuse.} Inject $\vr_t$ into the network, typically by adding a gated or projected
+        version of it to the residual stream.
+\end{enumerate}
+Writing changes entries: by gradient descent during training (\emph{offline} memory, in the
+survey's terminology), or by an explicit rule at inference time (\emph{online} memory).
+
+\begin{definition}[Explicit, addressable memory]\label{def:c10-explicit}
+Following \citet{zhoubian2026memory} (\S IV-B(g)), a memory is \emph{explicit} when (i) its entries
+are individually addressable rather than compressed into one evolving state, (ii) its capacity
+scales with the number of entries rather than with a hidden dimension, and (iii) its entries
+persist independently of the forward computation that reads them.
+\end{definition}
+
+The KV cache satisfies (i) but not (iii): its entries are activations of the current context and
+disappear with it. A recurrent state violates (i) and (ii). The memories below satisfy all three,
+with one interesting exception: the memory bank of LM2 is a per-sequence state that is
+nevertheless organized into slots.
+
+The cost of a memory is dominated by the address step, and the address step is where the designs
+differ. \Cref{tab:c10-addressing} lists the schemes used in this chapter; the rest of this section
+derives each of them.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Addressing schemes for a memory of $N$ entries with key dimension $d_k$, reading $k$
+entries. ``Static'' means the address depends only on token ids and can be computed before the
+forward pass.}
+\label{tab:c10-addressing}
+\begin{tabularx}{\linewidth}{@{}lXll@{}}
+\toprule
+Scheme & Address computation & Address cost & Static? \\
+\midrule
+Dense attention over slots & $\softmax(\vq\T\mK\T/\sqrt{d_k})$ over all $N$ keys & $\bigO(N d_k)$ & no \\
+Exact nearest neighbours & $k$ keys closest to $\vq$ & $\bigO(N d_k)$ & no \\
+Approximate nearest neighbours & index structure (clusters, graphs) & sublinear in $N$ & no \\
+Product keys & two half-queries against $\sqrt{N}$ sub-keys each & $\bigO(\sqrt{N} d_k + k^2)$ & no \\
+MoE router & top-$k$ of $E$ router logits & $\bigO(E d)$ & no \\
+Hashing of token ids & arithmetic on the last $n$ token ids & $\bigO(n)$ & yes \\
+Token id (embedding table) & the id itself & $\bigO(1)$ & yes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Datastore memory: the kNN-LM}\label{sec:c10-knnlm}
+
+The cleanest example of explicit memory attached to a language model is the $k$-nearest-neighbour
+language model of \citet{khandelwal2020knnlm}. Take a trained Transformer LM and let
+$f(c) \in \R^{d}$ be its final hidden state after reading a context $c$ (the vector that is fed to
+the output softmax). Run the model once over a corpus and store one pair per token position,
+\begin{equation}
+  \mathcal{D} = \bigl\{ \bigl(f(c_i),\, w_i\bigr) \bigr\}_{i=1}^{N},
+  \label{eq:c10-datastore}
+\end{equation}
+where $c_i$ is the prefix before position $i$ and $w_i$ the token that followed it. The keys are
+neural representations; the values are plain tokens. At test time, with context $x$, the model
+computes $\vq = f(x)$, retrieves the set $\mathcal{N}$ of the $k$ pairs whose keys are nearest to
+$\vq$ under a distance $\delta$ (squared Euclidean distance in the original work), and forms a
+distribution over the vocabulary by a softmax over negative distances:
+\begin{equation}
+  p_{\mathrm{kNN}}(y \mid x) = \frac{\sum_{(\vk_i, w_i) \in \mathcal{N}} \mathbb{1}[y = w_i]\,
+  \exp\bigl(-\delta(\vk_i, \vq)\bigr)}{\sum_{(\vk_i, w_i) \in \mathcal{N}}
+  \exp\bigl(-\delta(\vk_i, \vq)\bigr)} .
+  \label{eq:c10-knn}
+\end{equation}
+The final prediction interpolates the two models with a scalar $\lambda \in [0,1]$:
+$p(y \mid x) = \lambda\, p_{\mathrm{kNN}}(y \mid x) + (1-\lambda)\, p_{\mathrm{LM}}(y \mid x)$.
+
+\begin{example}[Three neighbours]
+Suppose the three nearest keys have distances $1, 2, 4$ and values \emph{Paris}, \emph{Paris},
+\emph{Lyon}. Then $p_{\mathrm{kNN}}(\textit{Paris}) = (e^{-1}+e^{-2})/(e^{-1}+e^{-2}+e^{-4})
+= (0.3679 + 0.1353)/0.5215 \approx 0.965$ and $p_{\mathrm{kNN}}(\textit{Lyon}) \approx 0.035$.
+Every other token gets zero probability from the datastore, which is why the interpolation with
+$p_{\mathrm{LM}}$ is needed.
+\end{example}
+
+The survey treats kNN-LM as the canonical explicit datastore (\S IV-B(a)): the datastore is not
+part of the forward computation graph, survives across inference calls, and can be enlarged or
+edited without touching the network weights. Its weaknesses point at the designs of this chapter.
+The memory is \emph{external} to training (the network never learns to use it), and the address
+step is a nearest-neighbour search over $N$ keys of dimension $d$. Exact search costs
+$\bigO(Nd)$ per token; practical systems use approximate indices. Memorizing Transformers
+\citep{wu2022memorizing} and LongMem \citep{wang2023longmem} move similar retrieval inside the
+network, but store activations of past inputs; the survey treats them as a boundary class between
+explicit datastores and implicit activation memory (\S IV-B(b)).
+
+\subsection{Feed-forward layers as key--value memories}\label{sec:c10-ffnkv}
+
+A Transformer block (\cref{ch:foundations}) contains an attention sub-layer and a position-wise
+feed-forward network (FFN). Drop the biases and write the FFN with weights
+$\mW_1 \in \R^{d_{\mathrm{ff}} \times d}$ and $\mW_2 \in \R^{d \times d_{\mathrm{ff}}}$ and an
+elementwise nonlinearity $\phi$:
+\begin{equation}
+  \mathrm{FFN}(\vx) = \mW_2\, \phi(\mW_1 \vx).
+\end{equation}
+Call the $i$-th row of $\mW_1$ a key $\vk_i\T$ and the $i$-th column of $\mW_2$ a value $\vv_i$.
+Expanding the matrix product column by column gives
+\begin{equation}
+  \mathrm{FFN}(\vx) = \sum_{i=1}^{d_{\mathrm{ff}}} \phi\bigl(\vk_i\T \vx\bigr)\, \vv_i .
+  \label{eq:c10-ffn-kv}
+\end{equation}
+This has exactly the read form $\vr = \sum_i w_i \vv_i$ of \cref{sec:c10-interface}, with
+$N = d_{\mathrm{ff}}$ slots and unnormalized weights $w_i = \phi(\vk_i\T\vx)$ instead of softmax
+weights. \citet{c01-geva2021ffn} made the interpretation empirical: keys respond to recognizable
+patterns in the input prefix, and values promote particular output tokens when projected onto the
+vocabulary. The gated variant used in modern models,
+$\mW_2(\SiLU(\mW_1\vx) \had \mW_3\vx)$, has the same structure with data-dependent value scaling.
+
+Equation~\eqref{eq:c10-ffn-kv} explains why FFNs are often called the knowledge store of a
+Transformer, and also why that store is \emph{implicit}: (i) the address $\vx$ is the full
+contextualized hidden state, so it is unclear which ``slot'' a given input token will touch;
+(ii) every slot is evaluated for every token, so the read costs $\bigO(d_{\mathrm{ff}} d)$ and
+capacity can only grow with compute; (iii) knowledge is spread over many slots and layers. There
+are two ways out, and this chapter covers both: make the address \emph{sparse}, so that only a few
+of a very large number of slots are touched (product keys, MoE, Engram, ExplicitLM), or make the
+address \emph{context-free}, so that the slot read by a token is known in advance (Engram's hashed
+token ids, MemoryLLM).
+
+\subsection{Product-key memory and its \texorpdfstring{$\bigO(\sqrt{N})$}{O(sqrt N)} lookup}\label{sec:c10-pkm}
+
+Suppose we want a key--value layer with $N$ slots, $N$ in the millions, read by top-$k$ attention:
+score every key against a query $\vq \in \R^{d_k}$, keep the $k$ best, and average their values.
+Scoring all keys costs $\bigO(N d_k)$, which defeats the purpose. The product-key memory (PKM) of
+\citet{c10-lample2019pkm} removes this cost by giving the keys a product structure.
+
+\paragraph{Construction.} Let $N = n^2$. Keep two small sets of \emph{sub-keys},
+$\mC^{(1)} = [\bm{c}^{(1)}_1, \dots, \bm{c}^{(1)}_n]\T$ and $\mC^{(2)} = [\bm{c}^{(2)}_1, \dots, \bm{c}^{(2)}_n]\T$,
+each $\bm{c} \in \R^{d_k/2}$. Slot $(i,j)$, for $i,j \in \{1,\dots,n\}$, has the concatenated key
+$\vk_{ij} = [\bm{c}^{(1)}_i ; \bm{c}^{(2)}_j] \in \R^{d_k}$. The $N$ keys are never stored: only the
+$2n = 2\sqrt{N}$ sub-keys are. Split the query the same way, $\vq = [\vq^{(1)} ; \vq^{(2)}]$. Because
+the inner product of concatenations is the sum of the inner products of the halves,
+\begin{equation}
+  s_{ij} \defeq \vq\T \vk_{ij} = \underbrace{\vq^{(1)\top} \bm{c}^{(1)}_i}_{a_i}
+  + \underbrace{\vq^{(2)\top} \bm{c}^{(2)}_j}_{b_j} .
+  \label{eq:c10-pkm-score}
+\end{equation}
+So the $N$ scores form an $n \times n$ outer sum $s_{ij} = a_i + b_j$ of two vectors that cost
+only $2n$ half-length dot products to compute.
+
+\paragraph{Exact top-$k$ from two short lists.} Let $\mathcal{I}_1 = \TopK(\va, k)$ and
+$\mathcal{I}_2 = \TopK(\vb, k)$ be the indices of the $k$ largest entries of $\va$ and $\vb$.
+
+\begin{proposition}[Product-key search is exact]\label{prop:c10-pkm}
+Assume the scores $s_{ij}$ are pairwise distinct. Every pair $(i,j)$ among the $k$ largest
+scores of the full $n \times n$ grid satisfies $i \in \mathcal{I}_1$ and $j \in \mathcal{I}_2$.
+Hence the global top-$k$ can be found among the $k^2$ candidates $\mathcal{I}_1 \times \mathcal{I}_2$.
+The same holds for shortlists of any length $k' \ge k$.
+\end{proposition}
+\begin{proof}
+Let $(i,j)$ be among the $k$ largest scores and suppose $i \notin \mathcal{I}_1$. By definition of
+$\mathcal{I}_1$ there are $k$ indices $i' \in \mathcal{I}_1$ with $a_{i'} > a_i$ (distinct scores
+imply distinct $a$ values within a column). For each of them,
+$s_{i'j} = a_{i'} + b_j > a_i + b_j = s_{ij}$. Thus at least $k$ pairs score strictly higher than
+$(i,j)$, so $(i,j)$ is not among the $k$ largest --- a contradiction. The argument for $j$ is
+symmetric, and a longer shortlist only contains more indices.
+\end{proof}
+
+The proposition fails when the shortlist is shorter than $k$: a pair $(i,j)$ with a mediocre $a_i$
+and an excellent $b_j$ can be in the global top-$k$ even though $i$ is not in a top-$k'$ list with
+$k' < k$. Our numerical check below confirms both directions.
+
+\paragraph{Read and cost.} The selected scores are normalized, $w = \softmax$ over the $k$
+winners, and the output is $\vr = \sum_{(i,j)} w_{ij} \vv_{ij}$ with values stored in a large
+table $\mV \in \R^{N \times d_v}$. The cost per query is
+\begin{equation}
+  \underbrace{2\sqrt{N}\cdot \tfrac{d_k}{2}}_{\text{sub-key scores}}
+  + \underbrace{k^2}_{\text{candidate sums}}
+  + \underbrace{k\, d_v}_{\text{value read}}
+  = \bigO\bigl(\sqrt{N}\, d_k + k^2 + k\, d_v\bigr),
+\end{equation}
+plus two partial sorts of length $\sqrt{N}$ and one of length $k^2$, against $\bigO(N d_k)$ for a
+flat search. For $N = 2^{20}$ slots this is $2^{11} = 2048$ half-length dot products instead of a
+million full-length ones. Only $k$ rows of $\mV$ receive gradient for a given query, so the
+parameter count $N d_v$ can be very large while the update per token stays small.
+\citet{c10-lample2019pkm} also use several independent query/sub-key sets (``heads'') and sum
+their outputs. Product keys reappear in later sparse-memory and expert-retrieval designs such as
+PEER \citep{c10-he2024peer}, memory layers at scale \citep{c10-berges2025memorylayers} and
+UltraMem \citep{c10-huang2025ultramem}, in the product-key memories of Hydra
+\citep{chaudhary2025hydra} (\cref{ch:hybrid}), and as the first retrieval stage of ExplicitLM
+(\cref{sec:c10-explicitlm}).
+
+\begin{example}[$N = 9$, $k = 2$]\label{ex:c10-pkm}
+Let $\va = (0.9, 0.1, 0.5)$ and $\vb = (0.2, 0.8, 0.3)$. Then $\mathcal{I}_1 = \{1, 3\}$ and
+$\mathcal{I}_2 = \{2, 3\}$, and the four candidates score $s_{12} = 1.7$, $s_{13} = 1.2$,
+$s_{32} = 1.3$, $s_{33} = 0.8$. The top two are $(1,2)$ and $(3,2)$. Brute force over all nine
+sums ($1.1, 1.7, 1.2, 0.3, 0.9, 0.4, 0.7, 1.3, 0.8$) gives the same two pairs.
+\end{example}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=0.62cm,y=0.62cm,font=\small,
+  cell/.style={draw,gray!60,minimum size=0.62cm,inner sep=0pt},
+  box/.style={draw,rounded corners=2pt,inner sep=3pt,align=center}]
+  \foreach \i in {0,...,5} \foreach \j in {0,...,5} {\node[cell] at (\j,\i) {};}
+  \foreach \i/\j in {5/1,5/4,2/1,2/4} {\node[cell,fill=orange!25] at (\j,\i) {};}
+  \node[cell,fill=orange!70] at (1,5) {}; \node[cell,fill=orange!70] at (1,2) {};
+  \node[box] (q1) at (-5.2,4.0) {$\vq^{(1)}$ vs.\ sub-keys $\bm{c}^{(1)}_i$\\(rows, scores $a_i$)};
+  \node[box] (q2) at (-5.2,0.6) {$\vq^{(2)}$ vs.\ sub-keys $\bm{c}^{(2)}_j$\\(columns, scores $b_j$)};
+  \draw[-{Stealth}] (q1.east) -- (-0.55,4.0);
+  \draw[-{Stealth}] (q2.east) to[out=0,in=-90] (2.5,-0.55);
+  \node[box,anchor=west] at (6.2,3.6) {$n \times n = N$ slots\\ $s_{ij} = a_i + b_j$};
+  \node[box,anchor=west,fill=orange!10] at (6.2,1.2) {light: $k^2$ candidates\\ dark: final top-$k$};
+\end{tikzpicture}
+\caption{Product-key lookup. Each half of the query is scored against $\sqrt{N}$ sub-keys; only the
+rows and columns of the $k$ best sub-keys (here $k=2$) are combined, and the global top-$k$ is
+guaranteed to lie in that $k \times k$ sub-grid.}
+\label{fig:c10-pkm}
+\end{figure}
+
+\begin{lstlisting}[caption={Reference implementation (ours): product-key top-$k$ retrieval and read.},label={lst:c10-pkm}]
+import torch
+
+def product_key_read(q, C1, C2, V, k, k_short=None):
+    """q: (B, dk) queries; C1, C2: (n, dk/2) sub-keys; V: (n*n, dv) values.
+    Returns the weighted read (B, dv) and the selected slot ids (B, k)."""
+    n, h = C1.shape[0], q.shape[-1] // 2
+    k_short = k if k_short is None else k_short      # exact only if k_short >= k
+    a = q[:, :h] @ C1.T                              # (B, n) first-half scores
+    b = q[:, h:] @ C2.T                              # (B, n) second-half scores
+    a_val, a_idx = a.topk(k_short, dim=-1)           # (B, k') short list 1
+    b_val, b_idx = b.topk(k_short, dim=-1)           # (B, k') short list 2
+    cand = a_val[:, :, None] + b_val[:, None, :]     # (B, k', k') outer sum
+    cand_id = a_idx[:, :, None] * n + b_idx[:, None, :]
+    top_val, top_pos = cand.flatten(1).topk(k, dim=-1)       # (B, k)
+    slot = cand_id.flatten(1).gather(1, top_pos)             # (B, k) ids in [0, n*n)
+    w = torch.softmax(top_val, dim=-1)                       # (B, k)
+    return torch.einsum("bk,bkd->bd", w, V[slot]), slot
+\end{lstlisting}
+
+\paragraph{Numerical check.} In our scratch space we compared this procedure (in NumPy) with brute
+force over the full grid in 2000 random problems with $n$ between 2 and 39, query widths up to 16
+and $k$ up to 16: the selected index sets and scores agreed every time, also with longer
+shortlists $k' \ge k$ as ExplicitLM uses. With $n = 30$, $k = 8$ and a shortlist of $k' = 3$
+(nine candidates), the result differed from brute force in 1929 of 2000 problems, which
+illustrates why $k' \ge k$ is required.
+
+\subsection{Hashing and \texorpdfstring{$N$}{N}-gram embeddings}\label{sec:c10-hashing}
+
+The input embedding table $\bm{E} \in \R^{\abs{\mathcal{V}} \times d}$ is the simplest lookup memory:
+the address is the token id $x_t$, the read is the row $\bm{E}[x_t]$, the cost is $\bigO(d)$ and does
+not depend on $\abs{\mathcal{V}}$. An \emph{$n$-gram embedding} extends the key to the suffix
+$g_{t,n} = (x_{t-n+1},\dots,x_t)$. The key space now has $\abs{\mathcal{V}}^n$ elements --- about
+$1.6 \times 10^{10}$ bigrams for a 128k vocabulary --- so a table with one row per possible key is
+impossible. \emph{Hashing} solves this: a function $\varphi : \mathcal{V}^n \to \{0,\dots,P-1\}$
+maps every $n$-gram to one of $P$ rows of a table $\bm{E}_n \in \R^{P \times d}$. Feature hashing
+\citep{c10-weinberger2009hashing}, hash embeddings \citep{c10-svenstrup2017hash} and the hashed
+character $n$-grams of fastText \citep{c10-bojanowski2017fasttext} all use this idea, and recent
+LLM work hashes token $n$-grams to scale input embeddings
+\citep{c10-huang2025overtokenized,c10-yu2025scone,c10-pagnoni2025blt}.
+
+\paragraph{Collisions.} Distinct $n$-grams that hash to the same row share their embedding.
+Model $\varphi$ as a uniformly random function (the guarantee that universal hash families give
+for pairs; \citealp{c10-carter1979universal}). Let $U$ distinct $n$-grams occur in the data. For a
+fixed $n$-gram, each of the other $U-1$ lands in its row independently with probability $1/P$,
+so
+\begin{equation}
+  \Pr[\text{the $n$-gram shares its row}] = 1 - \Bigl(1 - \frac{1}{P}\Bigr)^{U-1}
+  \approx 1 - e^{-U/P},
+  \qquad
+  \E[\#\text{colliding pairs}] = \binom{U}{2}\frac{1}{P} .
+  \label{eq:c10-collide}
+\end{equation}
+With as many rows as keys ($U = P$), about $1 - e^{-1} \approx 63\%$ of the $n$-grams share a row
+with some other $n$-gram. Collisions are therefore not rare events to be ignored; they are the
+normal state of a hashed table, and the model must be able to cope with them.
+
+\paragraph{Multi-head hashing.} Use $K$ independent hash functions $\varphi_1,\dots,\varphi_K$
+into $K$ tables of sizes $P_1,\dots,P_K$ and concatenate (or sum) the $K$ rows. Two $n$-grams are
+now indistinguishable only if they collide in \emph{every} head, which under the random-function
+model has probability $\prod_j 1/P_j$, so that even with $U \approx P_j$ almost every $n$-gram
+gets a unique \emph{combination} of rows although each individual row is shared.
+
+\paragraph{A multiplicative--XOR hash.} Engram (\cref{sec:c10-engram}) uses a cheap deterministic
+hash. With odd random multipliers $m_0, m_1, \dots$ (one per position in the $n$-gram), it forms
+\begin{equation}
+  \mathrm{mix}(g_{t,n}) = (x_t m_0) \oplus (x_{t-1} m_1) \oplus \dots \oplus (x_{t-n+1} m_{n-1}),
+  \qquad
+  z_{t,n,j} = \mathrm{mix}(g_{t,n}) \bmod P_{n,j},
+  \label{eq:c10-mixhash}
+\end{equation}
+where $\oplus$ is bitwise exclusive-or and the table sizes $P_{n,j}$ are distinct primes. Different
+multipliers per position make the hash order-sensitive ($(a,b)$ and $(b,a)$ mix differently);
+multiplying by a large odd number spreads the bits of a small token id over the whole word; the
+prime modulus spreads the result over the table. The same mixed value is reduced modulo $K$
+different primes, which has a consequence worth stating precisely.
+
+\begin{proposition}[All-head collisions reduce to collisions of the mix]\label{prop:c10-crt}
+Let $P_1,\dots,P_K$ be distinct primes and let $a, b$ be integers with $0 \le a, b < \prod_j P_j$.
+Then $a \bmod P_j = b \bmod P_j$ for all $j$ if and only if $a = b$.
+\end{proposition}
+\begin{proof}
+If $a \equiv b \pmod{P_j}$ for every $j$, each $P_j$ divides $a - b$. Distinct primes are pairwise
+coprime, so their product divides $a-b$ (this is the uniqueness part of the Chinese remainder
+theorem). Since $\abs{a - b} < \prod_j P_j$, the only multiple available is $a - b = 0$. The
+converse is trivial.
+\end{proof}
+
+In Engram's demo configuration the mixed values are non-negative 64-bit integers below $2^{63}$,
+while eight primes near $6.5 \times 10^5$ multiply to about $3 \times 10^{46}$. By
+\cref{prop:c10-crt}, two $n$-grams receive identical rows in all eight heads exactly when their
+mixed values coincide. The heads therefore do not reduce the rate of \emph{complete} collisions
+below that of the 63-bit mix (which is tiny anyway); what they buy is that the \emph{partial}
+collisions, where some rows are shared, are spread over different partners in different heads.
+
+\paragraph{Numerical check.} We re-implemented the hash of \cref{eq:c10-mixhash} in NumPy, both
+vectorized (shifting the token array, as the Engram demo does) and as a naive loop over positions,
+and found identical indices. On 200{,}000 random pairs of 62-bit values, ``same index in all eight
+heads'' coincided exactly with ``same value''; the single-head collision rate for a prime of 1009
+was $9.95 \times 10^{-4}$ against the predicted $1/1009 = 9.91 \times 10^{-4}$. With the small
+primes $3, 5, 7$ (product 105), values that differ by multiples of 105 collided in all heads, as
+the proposition predicts when its range condition fails.
+
+\paragraph{Why a lookup is $\bigO(1)$.} Computing $z_{t,n,j}$ costs $\bigO(n)$ integer operations
+and reading the row costs $\bigO(d)$ memory traffic. Neither depends on $P$, so the table can grow
+until it no longer fits in memory without changing the per-token compute. This is the property
+that makes hashed tables attractive as a place to put parameters.
+
+\subsection{Mixture-of-Experts as conditional parameter memory}\label{sec:c10-moe}
+
+The MoE layer (\cref{ch:foundations}) replaces one FFN by $E$ expert FFNs and a router. Given a
+hidden state $\vh$, the router computes logits $\vr = \mW_r \vh \in \R^{E}$, selects a small set
+$\mathcal{S}(\vh) = \TopK(\vr, k)$, and the layer outputs, in the survey's notation
+(\S IV-C, Eq.~(1)),
+\begin{equation}
+  \vy = \sum_{i \in \mathcal{S}(\vh)} g_i(\vh)\, \mathrm{Expert}_i(\vh),
+  \label{eq:c10-moe}
+\end{equation}
+with gating weights $g_i(\vh)$ such as a softmax over the selected logits
+\citep{c01-shazeer2017moe}. Switch Transformer \citep{fedus2022switch} routes each token to a
+single expert, GLaM \citep{du2022glam} scales the idea to very large total parameter counts,
+Mixtral \citep{jiang2024mixtral} uses top-2 routing over eight experts per layer, and DeepSeekMoE
+\citep{dai2024deepseekmoe} splits experts into many fine-grained ones and adds always-active shared
+experts.
+
+From the memory point of view, each expert is a persistent block of parameters and the router is
+a learned content-based address over $E$ ``slots'', each slot a whole function. Two parameter
+counts describe the trade-off. If every expert has $P_e$ parameters, the layer stores
+$P_{\mathrm{tot}} = E P_e$ parameters but activates only $P_{\mathrm{act}} = k P_e$ per token, so
+the per-token compute is that of a $k P_e$-parameter layer while the capacity is that of an
+$E P_e$-parameter layer. The survey therefore places MoE between parameterized and lookup memory:
+it ``transforms parameter space into an addressable memory system governed by learned routing''
+(\S IV-C). It is offline and long-term in the taxonomy.
+
+The contrast with a hashed table is the starting point of Engram. An MoE address depends on the
+hidden state $\vh$, so it is known only when the layer runs, and a selected slot is \emph{computed}
+(an MLP evaluation costing about $2 P_e$ floating-point operations). A hashed address depends only
+on token ids, so it is known before the forward pass, and a selected slot is \emph{copied} (a row
+read). Engram calls the first conditional computation and the second conditional memory.
+
+\subsection{Precursors: PlugLM and MEMORYLLM}\label{sec:c10-precursors}
+
+Two pre-2025 systems anticipate the designs of this chapter.
+
+\textbf{PlugLM} \citep{cheng2023pluglm} starts from \cref{eq:c10-ffn-kv}: if FFNs already behave
+like key--value stores, replace selected FFN layers by a differentiable plug-in key--value memory
+whose entries are retrieved by a ``knowledge attention'' step and can be updated without retraining
+the model (survey \S IV-B(d)). It sits between parameter memory and external lookup and is the
+direct ancestor of ExplicitLM's goal of editable knowledge.
+
+\textbf{MEMORYLLM} \citep{wang2024memoryllm} (2024; ``Towards Self-Updatable Large Language
+Models'') embeds a fixed-size pool of latent memory tokens in every Transformer layer and refreshes
+it with forward-only self-updates when new knowledge is read, rewriting dedicated memory tokens
+while the backbone stays unchanged (survey \S IV-A(b), (e)). The survey lists it as online and
+long-term. It must not be confused with the 2026 \emph{MemoryLLM} of \cref{sec:c10-memoryllm},
+which is an offline design that turns FFNs into token-indexed lookups.
+
+With these tools in hand, the four 2025--2026 systems can be read as different answers to the
+same questions: what is stored (slot vectors, $N$-gram embeddings, token sequences, FFN outputs),
+how it is addressed (attention, hashing, product keys, token id), and when it is written.
+
+% =====================================================================================
+\section{LM2: a gated memory bank in every decoder layer}\label{sec:c10-lm2}
+
+\subsection{Motivation}
+
+Large Memory Models (LM2) \citep{kang2025lm2} target a weakness that long-context benchmarks
+expose: standard Transformers struggle with multi-step reasoning, relational argumentation and the
+synthesis of facts that are spread across a long context. Two earlier families of memory-augmented
+models address this with a separate set of memory vectors. The Recurrent Memory Transformer
+\citep{c10-bulatov2022rmt} passes memory tokens from one segment to the next through the ordinary
+attention layers, and relational memory cores \citep{c10-santoro2018relational} update a matrix
+of memory slots with attention and LSTM-style gates \citep{hochreiter1997lstm}. LM2's own
+\code{MemoryModule} describes itself as a ``relational memory core with multi-head attention and
+gating''.
+
+LM2's design choice is to leave the Transformer's normal information flow untouched and add a
+\emph{complementary memory pathway} in every decoder layer: a bank of memory slots that the
+tokens read through cross-attention, whose contribution to the residual stream is gated, and that
+is rewritten through input and forget gates. Unlike retrieval systems the slots are trained as
+part of the model; unlike an implicit recurrent state they are designated memory variables with a
+separate storage role (survey \S IV-A(d)).
+
+\begin{taxonomy}
+\textbf{Representation:} explicit --- dedicated memory slots with their own read (cross-attention)
+and write (gates) interface \citep[\S IV-A(d)]{zhoubian2026memory}.
+\textbf{Update dynamics:} offline according to the survey's Table~I (the slot parameters and gates
+are learned in training). In the official code the bank is also rewritten by the gates in every
+forward pass and carried from one batch to the next, so it behaves like an online state during
+training.
+\textbf{Persistence:} long-term (Table~I).
+\textbf{Update rule:} gated slot writes; the survey groups LM2 with MEMORYLLM as ``slot-oriented
+or forward-update variants'' whose memory is structurally separated from the backbone
+(\S IV-A(e)). Table~I's paradigm label is ``Dedicated Memory Slots''.
+\end{taxonomy}
+
+\subsection{Formulation}
+
+\paragraph{Notation.} To avoid a clash with the causal mask $\mM$, we call the memory bank $\mB$.
+It has $N$ slots of width $d$, $\mB \in \R^{N \times d}$, with row $\vb_r$ for slot $r$. The
+token representations that enter the memory module of a layer are the rows of
+$\bm{E} \in \R^{T \times d}$ (in the code, the output of the layer's self-attention). The memory
+module has its own projections $\mU_Q, \mU_K, \mU_V, \mU_{\mathrm{out}}, \mU_{\mathrm{in}},
+\mU_{\mathrm{f}} \in \R^{d \times d}$. The equations below are our transcription of the paper's
+description, with the shapes made explicit; consult the paper for its exact parameterization, and
+see \cref{sec:c10-lm2-code} for what the code does.
+
+\paragraph{Initialization.} Every slot starts as a basis vector: $\mB^{(0)} = \mI$, which needs
+$N = d$. The slots are then orthonormal and equally distant from one another, so the first reads
+are not degenerate (with all-zero or identical slots every read would return the same vector).
+
+\paragraph{Read by cross-attention.} The tokens are the queries and the slots provide keys and
+values:
+\begin{equation}
+  \mQ = \bm{E}\mU_Q,\quad \mK = \mB\mU_K,\quad \mV = \mB\mU_V,\qquad
+  \bm{E}_{\mathrm{mem}} = \softmax\Bigl(\frac{\mQ\mK\T}{\sqrt{d}} + \mM_{\mathrm{mem}}\Bigr)\mV
+  \in \R^{T\times d},
+  \label{eq:c10-lm2-read}
+\end{equation}
+where $\mM_{\mathrm{mem}} \in \R^{T \times N}$ is a mask. The paper applies causal masking; the code
+uses $(\mM_{\mathrm{mem}})_{tr} = -\infty$ for $r > t$, so token $t$ may read slots $1,\dots,t$.
+Row $t$ of $\bm{E}_{\mathrm{mem}}$ is the memory read-out for token $t$.
+
+\paragraph{Gated output.} An output gate decides how much memory flows into the residual stream:
+\begin{equation}
+  \mG_{\mathrm{out}} = \sigmoid\bigl(\bm{E}_{\mathrm{mem}}\mU_{\mathrm{out}}\bigr),\qquad
+  \bm{E}_{\mathrm{gated}} = \mG_{\mathrm{out}} \had \mB ,
+  \label{eq:c10-lm2-out}
+\end{equation}
+and the decoder layer adds it next to the self-attention output, before the FFN:
+\begin{equation}
+  \mX' = \mX + \mathrm{Attn}\bigl(\LayerNorm(\mX)\bigr) + \bm{E}_{\mathrm{gated}}, \qquad
+  \mX_{\mathrm{next}} = \mX' + \mathrm{FFN}\bigl(\LayerNorm(\mX')\bigr).
+  \label{eq:c10-lm2-block}
+\end{equation}
+(The Llama backbone of the code uses RMSNorm; we write $\LayerNorm$ generically.) Note the shapes:
+$\mG_{\mathrm{out}}$ is $T \times d$ and $\mB$ is $N \times d$, so the elementwise product aligns
+token $t$ with slot $t$ and requires $N = T$. The official code enforces exactly this.
+
+\paragraph{Gated write.} Input and forget gates produce the next bank, in the form of an LSTM cell
+update with the read-out as the candidate:
+\begin{equation}
+  \mG_{\mathrm{in}} = \sigmoid\bigl(\bm{E}\mU_{\mathrm{in}}\bigr),\quad
+  \mG_{\mathrm{f}} = \sigmoid\bigl(\bm{E}_{\mathrm{mem}}\mU_{\mathrm{f}}\bigr),\qquad
+  \mB_{\mathrm{next}} = \mG_{\mathrm{in}} \had \tanh\bigl(\bm{E}_{\mathrm{mem}}\bigr)
+  + \mG_{\mathrm{f}} \had \mB .
+  \label{eq:c10-lm2-write}
+\end{equation}
+The comparison with an LSTM cell $\vs_t = \vg^{f}_t \had \vs_{t-1} + \vg^{i}_t \had \tanh(\cdot)$
+explains the roles: the forget gate keeps old slot content, the input gate admits new content, and
+$\tanh$ bounds each new contribution to $(-1,1)$.
+
+\begin{example}[One slot coordinate]
+Take $b = 1$ (an identity-initialized slot on its own axis), a read-out coordinate $0.4$, an input
+gate $0.5$ and a forget gate $\sigmoid(1) \approx 0.731$ (the code's forget-gate bias is
+initialized to $1$). Then $b_{\mathrm{next}} = 0.5\tanh(0.4) + 0.731 \cdot 1 = 0.5 \cdot 0.380 +
+0.731 \approx 0.921$: the slot decays slightly towards the new content.
+\end{example}
+
+\paragraph{How large can the bank grow?} Each entry is updated by
+$b' = g_{\mathrm{in}}\tanh(e) + g_{\mathrm{f}}\, b$ with $g_{\mathrm{in}}, g_{\mathrm{f}} \in (0,1)$.
+\begin{proposition}[Growth of the bank]\label{prop:c10-lm2-bound}
+Let $\beta_s = \max_{r,c} \abs{(\mB^{(s)})_{rc}}$ after $s$ writes. Then $\beta_{s+1} \le 1 +
+\beta_s$, so $\beta_s \le \beta_0 + s$. If in addition every forget gate satisfies
+$g_{\mathrm{f}} \le \gamma < 1$, then $\beta_s \le \max\bigl(\beta_0, 1/(1-\gamma)\bigr)$ for all $s$.
+\end{proposition}
+\begin{proof}
+$\abs{b'} \le g_{\mathrm{in}}\abs{\tanh e} + g_{\mathrm{f}}\abs{b} \le 1 + g_{\mathrm{f}}\,\beta_s$.
+With $g_{\mathrm{f}} < 1$ this gives the first bound. With $g_{\mathrm{f}} \le \gamma$, the map
+$\beta \mapsto 1 + \gamma\beta$ has fixed point $\beta^\star = 1/(1-\gamma)$; if $\beta_s \le
+\max(\beta_0,\beta^\star)$ then $\beta_{s+1} \le 1 + \gamma\max(\beta_0,\beta^\star) \le
+\max(\beta_0,\beta^\star)$, because $1 + \gamma\beta \le \beta$ whenever $\beta \ge \beta^\star$.
+Induction completes the proof.
+\end{proof}
+With the initial forget bias, $\gamma \approx 0.73$ gives $\beta^\star \approx 3.7$. Nothing in the
+architecture keeps the forget gate away from $1$, however, so over many writes (the bank is written
+$L$ times per forward pass and carried across batches) the only guaranteed bound is linear.
+
+\paragraph{Two clocks.} The bank is a recurrent state, but ``time'' has two meanings. Within one
+forward pass the bank is threaded through the depth of the network:
+$\mB^{(\ell)} = \mathrm{Write}_\ell\bigl(\mB^{(\ell-1)}, \bm{E}^{(\ell)}\bigr)$ for
+$\ell = 1,\dots,L$, so each layer reads what earlier layers wrote. Across forward passes, the code
+keeps the final bank $\mB^{(L)}$ of one batch as the initial bank of the next, with the gradient
+cut (\code{memory = self.memory.detach()}). This is the recurrent-memory-across-segments regime of
+RMT, trained with truncation after one segment.
+
+\paragraph{Parallel versus per-token view.} \Cref{eq:c10-lm2-read,eq:c10-lm2-out,eq:c10-lm2-write}
+process all $T$ tokens at once with a mask. Row $t$ of every output only involves row $t$ of
+$\bm{E}$, rows $1,\dots,t$ of $\mB$ (through the masked softmax) and row $t$ of $\mB$ (through the
+gates), so the same results come out of a loop over $t$ that reads only those rows. Our NumPy check
+below confirms that the masked parallel form and the loop agree to machine precision. The
+per-token view also gives the causality argument.
+
+\begin{proposition}[Causality of the per-token-gated layer]\label{prop:c10-lm2-causal}
+Assume the bank entering the first layer does not depend on the current segment. With the gates of
+\cref{eq:c10-lm2-write} computed row by row and the slot mask $(\mM_{\mathrm{mem}})_{tr} = -\infty$
+for $r > t$, row $t$ of every layer's output and rows $1,\dots,t$ of every layer's bank depend only
+on tokens $1,\dots,t$.
+\end{proposition}
+\begin{proof}
+By induction over layers. The claim holds for the input bank. Suppose rows $1,\dots,t$ of
+$\mB^{(\ell-1)}$ and of the layer input depend only on tokens $\le t$. Self-attention is causal.
+Row $t$ of $\bm{E}_{\mathrm{mem}}$ is computed from row $t$ of $\bm{E}$ and rows $\le t$ of
+$\mB^{(\ell-1)}$; rows $t$ of $\mG_{\mathrm{out}}, \mG_{\mathrm{in}}, \mG_{\mathrm{f}}$ are functions
+of rows $t$ of $\bm{E}$ and $\bm{E}_{\mathrm{mem}}$; row $t$ of the output and of
+$\mB^{(\ell)}$ combine these with row $t$ of $\mB^{(\ell-1)}$. All depend on tokens $\le t$ only.
+\end{proof}
+
+\begin{pitfall}[title={Pitfall: pooling over the sequence breaks causality}]
+A gate computed from a statistic of the whole sequence --- for example the mean of the layer input
+over all $T$ positions --- makes row $t$ of the bank, and therefore the output at position $t$,
+depend on tokens after $t$. In next-token training with teacher forcing this leaks the targets
+into the inputs. The official LM2 code computes its input-gate contribution from such a mean
+(\cref{sec:c10-lm2-code}). In a two-layer NumPy transcription with $T = N = d = 6$, perturbing only
+the last token changed the outputs at earlier positions by up to $0.18$; with per-token gates the
+change was exactly zero. The same issue appears in the query of the ExplicitLM code
+(\cref{sec:c10-explicitlm}).
+\end{pitfall}
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{One LM2 decoder layer (parallel form, per-token gates)}\label{alg:c10-lm2-layer}
+\begin{algorithmic}[1]
+\Require layer input $\mX \in \R^{T\times d}$, bank $\mB \in \R^{N\times d}$ with $N = T$
+\Ensure layer output $\mX_{\mathrm{next}}$, next bank $\mB_{\mathrm{next}}$
+\State $\mA \gets \mathrm{Attn}(\LayerNorm(\mX))$ \Comment{causal self-attention, unchanged}
+\State $\bm{E} \gets \mA$ \Comment{tokens that query the memory (as in the code)}
+\State $\mQ \gets \bm{E}\mU_Q$;\; $\mK \gets \mB\mU_K$;\; $\mV \gets \mB\mU_V$
+\State $\bm{E}_{\mathrm{mem}} \gets \softmax(\mQ\mK\T/\sqrt{d} + \mM_{\mathrm{mem}})\mV$
+\State $\mX' \gets \mX + \mA + \sigmoid(\bm{E}_{\mathrm{mem}}\mU_{\mathrm{out}}) \had \mB$
+\State $\mX_{\mathrm{next}} \gets \mX' + \mathrm{FFN}(\LayerNorm(\mX'))$
+\State $\mB_{\mathrm{next}} \gets \sigmoid(\bm{E}\mU_{\mathrm{in}}) \had \tanh(\bm{E}_{\mathrm{mem}})
+       + \sigmoid(\bm{E}_{\mathrm{mem}}\mU_{\mathrm{f}}) \had \mB$
+\State \Return $\mX_{\mathrm{next}}, \mB_{\mathrm{next}}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{LM2 training on a stream of segments (as organized in the official code)}\label{alg:c10-lm2-train}
+\begin{algorithmic}[1]
+\Require segments $\mX_1, \mX_2, \dots$ of length $T$, number of layers $L$
+\State $\mB \gets \mI_N$ \Comment{one identity bank per sequence in the batch}
+\For{$s = 1, 2, \dots$}
+  \State $\mB^{(0)} \gets \mathrm{stopgrad}(\mB)$;\; $\mH^{(0)} \gets \mathrm{Embed}(\mX_s)$
+  \For{$\ell = 1,\dots,L$}
+    \State $(\mH^{(\ell)}, \mB^{(\ell)}) \gets \mathrm{Layer}_\ell(\mH^{(\ell-1)}, \mB^{(\ell-1)})$
+    \Comment{\cref{alg:c10-lm2-layer}}
+  \EndFor
+  \State $\loss \gets$ next-token cross-entropy of $\mH^{(L)}$;\; update all weights by AdamW
+  \State $\mB \gets \mB^{(L)}$ \Comment{carried to the next segment, gradient cut}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.} Per layer, the projections cost $\bigO(T d^2 + N d^2)$ and the read
+\eqref{eq:c10-lm2-read} costs $\bigO(T N d)$ time and $\bigO(T N)$ memory for the attention weights.
+With $N = T$ the read is as expensive as self-attention itself, so LM2 roughly doubles the
+attention-like work of every layer. The state passed between layers and segments is the bank,
+$N d$ numbers per sequence. For autoregressive decoding the mirrored code has no incremental path
+(the sequence length must equal $N$). One natural option, which is our suggestion and not part of
+the paper or code, is to read a fixed bank during a segment at $\bigO(N d)$ per token and commit the
+gated write at the segment boundary.
+
+\subsection{Implementation walkthrough}\label{sec:c10-lm2-code}
+
+The official repository \repo{convergence-ai__lm2} (license CC BY-NC 4.0) is a compact PyTorch
+project. The memory module is in \repofile{repos/convergence-ai__lm2/src/memory.py};
+the file \repofile{repos/convergence-ai__lm2/src/model_memory_llama.py} wires it into the Hugging
+Face Llama model;
+\repofile{repos/convergence-ai__lm2/train.py} and
+\repofile{repos/convergence-ai__lm2/src/trainer.py} run distributed training, and
+\repofile{repos/convergence-ai__lm2/data_proc/smollm.py} prepares the data.
+
+\begin{implnote}[title={In the code: wiring into each decoder layer}]
+\code{LlamaMem} subclasses \code{LlamaForCausalLM} and replaces every decoder layer by a
+\code{CustomLlamaDecoderLayer}, so each layer has its own \code{MemoryAttention} and its own
+\code{MemoryModule} parameters. \code{MemoryAttention.forward} first runs the layer's ordinary
+self-attention, then passes the attention \emph{output} (not the layer input) to the memory module
+as $\bm{E}$. The module returns two tensors: the attention output plus the new bank, which goes to
+the residual stream, and the new bank, which is passed to the next layer
+(\cref{lst:c10-lm2-layer}). \code{LlamaMem.forward} threads the bank through the layer loop and
+stores the final one in \code{self.memory} (and in the buffer \code{memory_bank}, saved with
+checkpoints), so the next call starts from it.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/convergence-ai\_\_lm2/src/model\_memory\_llama.py} (\texttt{CustomLlamaDecoderLayer.forward}).},label={lst:c10-lm2-layer}]
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        if self.use_memory and memory is not None:
+            attn_output, memory = self.mem_attn(
+                hidden_states=hidden_states,
+                memory=memory,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+        else:
+            attn_output, _, _ = self.self_attn(
+                hidden_states,
+                attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, memory
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/convergence-ai\_\_lm2/src/memory.py} (\texttt{MemoryModule.forward}).},label={lst:c10-lm2-mem}]
+        inputs = inputs.view(inputs.shape[0], inputs.shape[1], -1)
+
+        # Attend over memory to obtain the next memory state
+        next_memory = self.attend_over_memory(inputs, memory, attention_mask)
+
+        # Create input and forget gates based on current inputs and memory
+        input_gate, forget_gate = self.create_gates(inputs, memory)
+        # Apply input gate with tanh activation
+        next_memory = input_gate * torch.tanh(next_memory)
+        # Apply forget gate to retain part of the previous memory
+        next_memory += forget_gate * memory
+
+        # Return the updated inputs and the next memory state
+        return inputs + next_memory, next_memory
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: shapes and the $N = T = d$ constraint}]
+The bank is created as \code{torch.stack([torch.eye(memory_slots) ...])}, one $M \times M$ identity
+per sequence in the batch, where $M$ is \code{memory_slots}. Inside \code{multi_head_attention},
+\code{query_proj} maps the width-$d$ tokens to width $M$, \code{key_proj} and \code{value_proj}
+are $M \times M$, the scores are scaled by $1/\sqrt{M/H_{\mathrm{mem}}}$ for
+$H_{\mathrm{mem}}$ = \code{num_mem_heads} heads, and a boolean mask \code{~torch.tril(...)} blocks
+slot $r > t$ for token $t$. The code raises an error unless the sequence length equals $M$, and
+\code{inputs + next_memory} adds a $(B, M, M)$ bank to $(B, T, d)$ token states, so in practice
+$M = T = d$. The configuration in \repofile{repos/convergence-ai__lm2/configs/model/llama3.2-1b.yaml}
+sets \code{memory_slots: 2048} and \code{num_mem_heads: 8}, and
+\repofile{repos/convergence-ai__lm2/scripts/train.sh} sets \code{sequence_length=2048}; the model
+width comes from the Llama-3.2-1B configuration, which must therefore also be 2048.
+\end{implnote}
+
+\begin{implnote}[title={In the code: the gates differ from the equations}]
+\code{create_gates(inputs, memory)} computes both gates from one sum. The input part is
+\code{RepeatLinear}: a learnable vector $\vw$ scales the tokens, $\ReLU(\vw \had \ve_t)$ is
+\emph{averaged over all $T$ positions}, and a linear map produces $2M$ gate logits shared by all
+slots. The memory part is a linear map of $\tanh(\mB)$ (\code{GroupLinearLayer}, uniform
+initialization), giving $2M$ logits per slot. Their sum is split into input and forget logits, and
+biases are added before the sigmoid (\code{input_bias} initialized to 0, \code{forget_bias} to 1).
+The candidate is not the raw read-out: \code{attend_over_memory} forms
+$\LayerNorm(\mB + \bm{E}_{\mathrm{mem}})$, applies a two-layer ReLU MLP with a residual connection
+and a second LayerNorm, and only then the gates are applied
+(\cref{lst:c10-lm2-mem}). Compared with \cref{eq:c10-lm2-out,eq:c10-lm2-write}: (i) there is no
+separate output gate --- the \emph{gated new bank} is added to the residual stream; (ii) the input
+gate depends on a sequence-wide mean, which is not causal (see the pitfall above); (iii) the MLP is
+built as \code{nn.ModuleList([nn.Linear(M, M)] * 2)}, which repeats the \emph{same} module twice,
+so its two layers share weights; (iv) the attention dropout defaults to \code{attn_drop=0.9} and
+\code{MemoryAttention} does not override it, so 90\% of the memory attention weights are dropped
+in training mode. Whether (ii)--(iv) are intended we cannot tell from the repository.
+\end{implnote}
+
+\begin{implnote}[title={In the code: training setup}]
+\code{train.py} reads Hydra configs (\repofile{repos/convergence-ai__lm2/configs/train.yaml} and
+its \code{model}, \code{train}, \code{pretrain} groups). The architecture is that of
+\code{AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")} extended by \code{CustomLlamaConfig}
+with \code{use_memory}, \code{memory_slots} and \code{num_mem_heads}; the model is built with
+\code{LlamaMem.from_config}, i.e.\ \emph{trained from scratch}, not fine-tuned from Llama weights
+(the YAML fields \code{n_layer}, \code{n_embd} are copied into an unused config object).
+\code{scripts/train.sh} launches \code{torchrun} with batch size 1 per GPU, sequence length 2048,
+bfloat16 autocast, learning rate $2\times10^{-4}$, 700 warm-up steps, \code{lr_decay_frac=0.0},
+600{,}000 iterations and \code{model.use_memory=true}. The trainer uses AdamW with betas
+$(0.9, 0.95)$, weight decay $0.1$ on linear weights only, and gradient clipping at $1.0$. The
+schedule is linear warm-up followed by cosine decay to
+\code{learning_rate * lr_decay_frac}; with \code{lr_decay_frac=0.0} it therefore decays to zero,
+although the README describes $0.0$ as ``no decay''. Data are the SmolLM corpus subsets
+(\code{cosmopedia-v2} by default) tokenized with the Llama-3 tokenizer into binary shards with a
+256-integer header (magic number 20240801), read by \code{DistributedDataLoader}. A validation
+pass on 100 batches runs every \code{log_freq} steps; note that it also overwrites the carried
+bank.
+\end{implnote}
+
+\paragraph{Parameter count.} From the module definitions, one \code{MemoryModule} with $M = d$
+has $3(M^2+M)$ parameters in the query/key/value projections, $M^2 + M$ in the (shared) MLP,
+$2(2M^2 + 2M)$ in the two gate projectors, $M$ in $\vw$, $4M$ in the two LayerNorms and two
+biases: $33{,}581{,}058$ parameters for $M = 2048$ (about 33.6M per decoder layer, our count), to
+be multiplied by the number of decoder layers of the base configuration.
+
+\begin{lstlisting}[caption={Reference implementation (ours): LM2 memory read, gated output and gated write with per-token gates.},label={lst:c10-lm2-ref}]
+import torch, torch.nn as nn
+
+class LM2Memory(nn.Module):
+    """Memory pathway of one decoder layer. E: (B, T, d) token states,
+    bank: (B, N, d) slots with N == T (slot t is aligned with token t)."""
+    def __init__(self, d):
+        super().__init__()
+        self.q, self.k, self.v = (nn.Linear(d, d, bias=False) for _ in range(3))
+        self.w_out = nn.Linear(d, d)
+        self.w_in = nn.Linear(d, d)
+        self.w_f = nn.Linear(d, d)
+        nn.init.constant_(self.w_f.bias, 1.0)          # start by remembering
+
+    def forward(self, E, bank):
+        B, T, d = E.shape
+        N = bank.shape[1]
+        assert N == T, "elementwise gates align slot t with token t"
+        q, k, v = self.q(E), self.k(bank), self.v(bank)
+        s = q @ k.transpose(1, 2) / d ** 0.5           # (B, T, N)
+        future = torch.ones(T, N, dtype=torch.bool, device=E.device).triu(1)
+        e_mem = s.masked_fill(future, float("-inf")).softmax(-1) @ v   # (B, T, d)
+        g_out = torch.sigmoid(self.w_out(e_mem))       # output gate
+        e_gated = g_out * bank                         # added to the residual stream
+        g_in = torch.sigmoid(self.w_in(E))             # per-token input gate
+        g_f = torch.sigmoid(self.w_f(e_mem))           # per-token forget gate
+        new_bank = g_in * torch.tanh(e_mem) + g_f * bank
+        return e_gated, new_bank
+
+def init_bank(batch, d):
+    return torch.eye(d).expand(batch, d, d).clone()   # N = d identity slots
+\end{lstlisting}
+
+\paragraph{Numerical checks.} In NumPy (scratch space) we verified that (a) the masked parallel
+form of \cref{lst:c10-lm2-ref} equals a per-token loop that reads only slots $\le t$ (outputs and
+new bank agree to machine precision); (b) with per-token gates, perturbing the last token leaves
+all earlier outputs of a two-layer stack unchanged, while a transcription of the code's
+sequence-pooled gate changes them (by up to $0.18$ in our toy setting); and (c) the parameter
+count above.
+
+\begin{results}
+\textbf{Source files:} \repofile{repos/convergence-ai__lm2/README.md}; survey PDF.
+The repository README reports no numbers, and the survey discusses LM2 only qualitatively. The
+paper's abstract reports that LM2 outperforms a memory-augmented baseline (RMT) and a Llama-3.2
+baseline on the BABILong long-context reasoning benchmark, with strong multi-hop inference,
+numerical reasoning and long-context question answering, and that it improves over a pre-trained
+vanilla model on MMLU, i.e.\ the memory pathway does not hurt general ability. See the paper for
+the numbers.
+\end{results}
+
+\subsection{Discussion}
+
+LM2 shows that explicit memory can be wired in at the level of every layer as a persistent
+representational workspace rather than bolted on as an external datastore (survey \S IV-A(d)).
+Its strengths are the untouched main pathway (memory is additive and gated, so the model can learn
+to ignore it) and a write rule with well-understood dynamics: \cref{eq:c10-lm2-write} is the gated
+state transition of an LSTM, and in the language of \cref{ch:linear} it is a recurrence with
+data-dependent decay $\mG_{\mathrm{f}}$ and write strength $\mG_{\mathrm{in}}$, applied to slots
+instead of a single matrix state.
+
+Its limitations are equally clear. The bank is small: $N d$ numbers per sequence, whereas the
+lookup memories below hold billions of parameters; LM2's memory is closer to working memory than
+to a knowledge store. Aligning slot $t$ with token $t$ ties $N$ to the sequence length, and the read
+is as expensive as attention. In the official code, carrying the bank from one training batch to
+the next means that unrelated documents write into the same state, and the gradient never crosses
+a batch boundary, so the model cannot learn \emph{what} to store for later segments beyond what
+helps the current one. Compared with test-time training (\cref{ch:ttt}), where Titans and TTT
+write memory by gradient steps on a self-supervised loss, LM2 writes by learned gates in a single
+forward pass; compared with MEMORYLLM (\cref{sec:c10-precursors}), it rewrites all slots softly
+instead of replacing a subset.
+
+% =====================================================================================
+\section{Engram: conditional memory via scalable lookup}\label{sec:c10-engram}
+
+\subsection{Motivation}
+
+Engram \citep{cheng2026engram} starts from an observation about language. Modeling text involves
+two qualitatively different sub-tasks: compositional reasoning, which needs deep and dynamic
+computation, and knowledge retrieval, much of which is \emph{local, static and stereotyped} ---
+named entities, idioms, formulaic phrases. Classical $N$-gram models capture such local regularities
+with cheap lookups, but a Transformer has no lookup primitive and must \emph{simulate} retrieval
+with computation. The Engram paper illustrates this with an entity-resolution trace reproduced
+from earlier interpretability work: to build the representation of ``Diana, Princess of Wales'' a
+model spends about six layers of attention and FFNs composing ``Wales'', ``Princess of Wales'' and
+finally the person. That is depth spent on reconstructing a static table at run time.
+
+MoE (\cref{sec:c10-moe}) already scales capacity by \emph{conditional computation}. Engram adds
+\emph{conditional memory}: a module, inserted at a few layers, that maps the last few tokens to
+rows of very large hashed $N$-gram embedding tables in $\bigO(1)$ time, and lets the current hidden
+state decide how much of the retrieved vector to use. The paper formulates how to split a fixed
+budget of sparse parameters between MoE experts and Engram tables, and designs the module so that
+the tables can live in host memory. The survey highlights it because it separates memory sparsity
+from expert sparsity: ``MoE layers sparsely activate parameterized transformations, whereas Engram
+sparsely addresses stored memory entries'' (\S IV-B(c)).
+
+\begin{taxonomy}
+\textbf{Representation:} explicit --- hashed lookup slots that persist and are individually
+addressed \citep[\S IV-B(c)]{zhoubian2026memory}; Table~I's paradigm label is ``Hashed Lookup Slots''.
+\textbf{Update dynamics:} offline --- tables are trained with the model and fixed at inference.
+\textbf{Persistence:} long-term.
+\textbf{Update rule:} objective-induced or structural (Table~II lists Engram there together with MoE
+models): memory content is shaped by the training objective and the offline construction of the
+tables, not by per-instance online writes.
+\end{taxonomy}
+
+\subsection{Formulation}
+
+Let $\vh_t \in \R^{d}$ be the hidden state at position $t$ entering an Engram layer and $x_t$ the
+token at position $t$. The module works in two phases, retrieval and fusion
+(\cref{fig:c10-engram}).
+
+\paragraph{Tokenizer compression.} Subword tokenizers give different ids to strings that are the
+same for the purpose of a lookup (\emph{Apple} and \emph{\textvisiblespace apple}). Engram first
+applies a precomputed surjection $\mathcal{P} : \mathcal{V} \to \mathcal{V}'$ that maps each raw id
+to a canonical id by normalizing its text (Unicode NFKC, lowercasing, and so on):
+$x'_t = \mathcal{P}(x_t)$. The paper reports a 23\% reduction of the effective vocabulary of its
+128k tokenizer. Fewer distinct ids means fewer distinct $n$-grams competing for table rows.
+
+\paragraph{Hashed retrieval.} Fix an order $n \in \{2,\dots,n_{\max}\}$ and form the suffix
+$n$-gram $g_{t,n} = (x'_{t-n+1},\dots,x'_t)$. For each of $K$ hash heads $j = 1,\dots,K$ compute an index
+into a table $\bm{E}_{n,j}$ with a prime number $P_{n,j}$ of rows, using the multiplicative--XOR hash
+of \cref{eq:c10-mixhash}, and read one row:
+\begin{equation}
+  z_{t,n,j} = \varphi_{n,j}(g_{t,n}) \in \{0,\dots,P_{n,j}-1\},\qquad
+  \ve_{t,n,j} = \bm{E}_{n,j}[z_{t,n,j}] \in \R^{d_h} .
+  \label{eq:c10-engram-lookup}
+\end{equation}
+The memory vector is the concatenation of all rows,
+\begin{equation}
+  \ve_t = \big\Vert_{n=2}^{n_{\max}} \big\Vert_{j=1}^{K} \ve_{t,n,j} \in \R^{d_{\mathrm{mem}}},
+  \qquad d_{\mathrm{mem}} = (n_{\max}-1) K d_h .
+  \label{eq:c10-engram-concat}
+\end{equation}
+Positions $t < n$ are padded with a pad id. Nothing here depends on $\vh_t$: the indices are a
+deterministic function of the token ids.
+
+\begin{example}[A tiny hash]
+Take multipliers $m_0 = 3$, $m_1 = 5$ and tables of $7$ and $11$ rows. The bigram $(x_{t-1}, x_t) =
+(2, 4)$ mixes to $(4 \cdot 3) \oplus (2 \cdot 5) = 12 \oplus 10 = 1100_2 \oplus 1010_2 = 0110_2 = 6$,
+so the two heads read rows $6 \bmod 7 = 6$ and $6 \bmod 11 = 6$. The reversed bigram $(4, 2)$ mixes
+to $(2\cdot 3) \oplus (4 \cdot 5) = 00110_2 \oplus 10100_2 = 10010_2 = 18$ and reads rows $4$ and
+$7$: order matters.
+\end{example}
+
+\paragraph{Context-aware gating.} The retrieved $\ve_t$ is a context-independent prior. It may be
+wrong for the current context, because of a hash collision or because the $n$-gram is ambiguous.
+Engram therefore uses the hidden state, which has already gathered context through the preceding
+attention layers, as a query, and the memory as key and value:
+\begin{equation}
+  \vk_t = \mW_K \ve_t,\quad \vv_t = \mW_V \ve_t,\qquad
+  g_t = \sigmoid\!\left(\frac{\RMSNorm(\vh_t)\T \RMSNorm(\vk_t)}{\sqrt{d}}\right),\qquad
+  \tilde{\vv}_t = g_t\, \vv_t ,
+  \label{eq:c10-engram-gate}
+\end{equation}
+with $\mW_K, \mW_V \in \R^{d \times d_{\mathrm{mem}}}$. (The paper writes $\alpha_t$ for the gate; we
+write $g_t$ because $\alpha_t$ denotes a decay gate in this book.) This is attention with a single
+candidate: instead of a softmax over many keys, a sigmoid decides between using the one retrieved
+value and ignoring it. If the memory contradicts the context, $g_t \to 0$ suppresses it.
+
+Why normalize both sides? Ignoring the learned scale and the small $\epsilon$,
+\begin{gather*}
+  \RMSNorm(\va) = \frac{\va}{\sqrt{\tfrac1d\sum_i a_i^2}}
+  \quad\Longrightarrow\quad \norm{\RMSNorm(\va)}_2^2 = \frac{\norm{\va}_2^2}{\tfrac1d\norm{\va}_2^2} = d,\\
+  \abs{\RMSNorm(\vh)\T\RMSNorm(\vk)} \le \norm{\RMSNorm(\vh)}_2\,\norm{\RMSNorm(\vk)}_2 = d
+\end{gather*}
+by the Cauchy--Schwarz inequality, so the gate logit lies in $[-\sqrt{d}, \sqrt{d}]$ whatever the
+scale of $\vh_t$ and $\vk_t$. Without normalization a
+large hidden state would saturate the sigmoid and stop the gradient; the paper cites gradient
+stability as the reason.
+
+\paragraph{Short convolution and residual.} Stack the gated values into
+$\tilde{\mV} \in \R^{T \times d}$. A depthwise causal convolution with kernel size $w = 4$ and
+dilation $\delta = n_{\max}$ widens the receptive field and adds nonlinearity:
+\begin{equation}
+  \mY = \SiLU\bigl(\mathrm{Conv1D}(\RMSNorm(\tilde{\mV}))\bigr) + \tilde{\mV},\qquad
+  \mH \gets \mH + \mY ,
+  \label{eq:c10-engram-conv}
+\end{equation}
+after which the block's attention and MoE run as usual. Row $t$ of the depthwise convolution is
+$\sum_{i=0}^{w-1} \vw_i \had \vu_{t - i\delta}$ (channel-wise weights $\vw_i$, zero for negative
+indices), so it sees positions $t, t-\delta, \dots, t-(w-1)\delta$. The paper initializes the
+convolution to zero, so that at the start of training $\mY = \tilde{\mV}$.
+
+\paragraph{Per-token and parallel views.} Everything in \crefrange{eq:c10-engram-lookup}{eq:c10-engram-gate}
+is position-wise, and the convolution is a fixed causal filter, so the parallel computation over a
+whole sequence and a token-by-token computation coincide; during decoding the module keeps only
+the last $n_{\max}-1$ token ids and the last $(w-1)\delta$ normalized gated values per branch, a
+state of constant size.
+
+\begin{proposition}[Receptive field of an Engram layer]\label{prop:c10-engram-rf}
+Hold the hidden states $\mH$ fixed. Then $\mY_t$ depends on the tokens
+$x_{t-(n_{\max}-1)-(w-1)\delta}, \dots, x_t$ only. In particular, changing token $x_s$ can change
+$\mY_t$ only for $s \le t \le s + (n_{\max}-1) + (w-1)\delta$.
+\end{proposition}
+\begin{proof}
+Token $x_s$ enters the $n$-grams $g_{t,n}$ with $t - n + 1 \le s \le t$, i.e.\ positions
+$t \in [s, s + n_{\max} - 1]$; these determine $\ve_t$, hence $\tilde{\vv}_t$. The convolution
+output at $t$ reads $\tilde{\vv}_{t - i\delta}$ for $i = 0,\dots,w-1$, which adds a lag of up to
+$(w-1)\delta$. The residual term only uses $\tilde{\vv}_t$.
+\end{proof}
+With $n_{\max} = 3$, $w = 4$, $\delta = 3$ this is a window of $1 + 2 + 9 = 12$ tokens. (The full
+model of course also sees the whole context through $\vh_t$ in the gate.)
+
+\paragraph{Multi-branch integration.} In the paper, the backbone uses manifold-constrained
+hyper-connections, mHC for short \citep{c10-xie2025mhc,c10-zhu2025hyperconnections}. They widen the
+residual stream into $R$ parallel branches ($R = 4$ in all experiments). Engram
+shares one table and one $\mW_V$ across branches but gives each branch its own key projection, so
+each branch has its own gate:
+\begin{equation}
+  g_t^{(r)} = \sigmoid\!\left(\frac{\RMSNorm(\vh^{(r)}_t)\T \RMSNorm(\mW^{(r)}_K \ve_t)}{\sqrt{d}}\right),
+  \qquad \vu^{(r)}_t = g_t^{(r)}\, \mW_V \ve_t, \qquad r = 1,\dots,R .
+  \label{eq:c10-engram-mhc}
+\end{equation}
+The $R+1$ projections can be fused into one dense matrix multiplication of shape
+$(R+1)d \times d_{\mathrm{mem}}$, which the paper runs in FP8.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small, node distance=4mm,
+  box/.style={draw,rounded corners=2pt,inner sep=3pt,align=center,minimum height=6mm},
+  mem/.style={box,fill=orange!15}, op/.style={box,fill=blue!6}]
+  \node[box] (ids) {token ids $x_{t-2}, x_{t-1}, x_t$};
+  \node[op, right=6mm of ids] (cmp) {compress\\ $x' = \mathcal{P}(x)$};
+  \node[op, right=6mm of cmp] (hash) {hash heads\\ $z_{t,n,j} = \varphi_{n,j}(g_{t,n})$};
+  \node[mem, below=6mm of hash] (tab) {tables $\bm{E}_{n,j}$\\ (host or HBM)};
+  \node[op, left=6mm of tab] (cat) {concat\\ $\ve_t \in \R^{d_{\mathrm{mem}}}$};
+  \node[op, below=6mm of cat] (kv) {$\vk_t = \mW_K\ve_t$, $\vv_t = \mW_V\ve_t$};
+  \node[box, left=6mm of kv] (h) {hidden $\vh_t$};
+  \node[op, below=6mm of kv] (gate) {$g_t = \sigmoid(\RMSNorm(\vh_t)\T\RMSNorm(\vk_t)/\sqrt{d})$};
+  \node[op, below=6mm of gate] (conv) {$\mY = \SiLU(\mathrm{Conv}(\RMSNorm(g\,\vv))) + g\,\vv$};
+  \node[box, right=6mm of conv] (res) {$\mH \gets \mH + \mY$};
+  \draw[-{Stealth}] (ids) -- (cmp); \draw[-{Stealth}] (cmp) -- (hash);
+  \draw[-{Stealth}] (hash) -- (tab); \draw[-{Stealth}] (tab) -- (cat);
+  \draw[-{Stealth}] (cat) -- (kv); \draw[-{Stealth}] (kv) -- (gate);
+  \draw[-{Stealth}] (h.south) |- ([yshift=0mm]gate.west); \draw[-{Stealth}] (gate) -- (conv);
+  \draw[-{Stealth}] (conv) -- (res);
+  \node[font=\footnotesize, right=2mm of tab, align=left] {indices known\\ before the forward pass};
+\end{tikzpicture}
+\caption{Data flow of one Engram layer (single residual branch). The retrieval phase (top) depends
+only on token ids; the fusion phase (bottom) uses the hidden state as the query of a scalar gate.}
+\label{fig:c10-engram}
+\end{figure}
+
+\subsection{A new axis of sparsity: allocating parameters between MoE and memory}
+
+The paper measures model size with three quantities: $P_{\mathrm{tot}}$, all trainable parameters
+except the vocabulary embedding and output head; $P_{\mathrm{act}}$, the parameters activated per
+token, which determines the training FLOPs; and the inactive budget
+$P_{\mathrm{sparse}} = P_{\mathrm{tot}} - P_{\mathrm{act}}$ --- parameters that add capacity but no
+compute, such as unselected experts or unretrieved table rows. An \emph{allocation ratio}
+$\rho \in [0,1]$ splits the inactive budget:
+\begin{equation}
+  P^{(\mathrm{sparse})}_{\mathrm{MoE}} = \rho\, P_{\mathrm{sparse}},\qquad
+  P_{\mathrm{Engram}} = (1-\rho)\, P_{\mathrm{sparse}} .
+  \label{eq:c10-rho}
+\end{equation}
+$\rho = 1$ is a pure MoE model; $\rho < 1$ removes routed experts and spends the freed parameters on
+table rows, keeping $P_{\mathrm{tot}}$ and $P_{\mathrm{act}}$ fixed. Engram rows are ``free'' in
+$P_{\mathrm{act}}$ because each token reads a constant number of rows regardless of table size; the
+small projections $\mW_K, \mW_V$ are counted as active.
+
+Two regimes are studied. Under a fixed budget, validation loss as a function of $\rho$ is
+\emph{U-shaped}: with $\rho \to 1$ the model has no dedicated store for static patterns and must
+rebuild them with computation; with $\rho \to 0$ it lacks conditional computation for
+context-dependent reasoning, and memory cannot replace it. The optimum lies at an intermediate
+$\rho$ and was stable across the two compute scales tried. In the ``infinite memory'' regime, a
+fixed MoE backbone receives ever larger tables, and the loss falls approximately linearly in the
+logarithm of the number of slots --- a predictable scaling knob that costs no extra FLOPs. The
+numbers are in the results box.
+
+\paragraph{Per-token cost (our arithmetic).} One Engram layer costs, per token, $(n_{\max}-1)K$ row
+reads, the fused projections ($2(R+1) d\, d_{\mathrm{mem}}$ floating-point operations), and
+$\bigO(R d w)$ for the convolution and norms. With the paper's Engram-27B settings
+($d = 2560$, $d_{\mathrm{mem}} = 1280$, $R = 4$) the projections are about $3.3 \times 10^7$ FLOPs
+per layer, so the two Engram layers add well under one percent to the roughly
+$2 \times 3.8 \times 10^9$ FLOPs per token of a model with $3.8$B activated parameters --- while the
+tables hold billions of parameters.
+
+\subsection{System design: offloading and prefetching}
+
+Because the indices depend only on token ids, Engram's memory traffic is predictable, unlike MoE
+routing, which needs the hidden state of the current layer. The paper exploits this in both phases
+of the model's life.
+\begin{itemize}
+  \item \textbf{Training.} The tables are sharded across GPUs like any model-parallel parameter. An
+        All-to-All exchange gathers the active rows in the forward pass and sends their gradients
+        back in the backward pass, so total table capacity grows linearly with the number of
+        accelerators. The embedding rows are optimized with Adam at a $5\times$ learning rate and no
+        weight decay, while the backbone uses Muon.
+  \item \textbf{Inference.} The tables live in host DRAM. As soon as the token ids are known, the
+        host gathers the needed rows and transfers them over PCIe \emph{asynchronously}, overlapping
+        the transfer with the computation of the Transformer blocks that precede the Engram layer.
+        Communication volume scales with the number of activated rows, not with the table size.
+  \item \textbf{Placement.} Putting Engram deeper gives more compute time to hide the transfer, but
+        modeling quality prefers early insertion, where static patterns can be offloaded before the
+        backbone spends depth on them. The paper's models use layers 2 and 15 of a 30-block network:
+        an early layer for modeling, a later one that also benefits from richer gating queries.
+  \item \textbf{Caching.} $N$-gram frequencies follow a Zipf distribution, so a small fraction of
+        rows receives most accesses. Frequent rows can be cached in HBM or DRAM and the long tail
+        kept on slower storage such as NVMe, a multi-level hierarchy proposed in the paper.
+\end{itemize}
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{Engram address computation (host side, before or during the forward pass)}\label{alg:c10-engram-hash}
+\begin{algorithmic}[1]
+\Require token ids $x_{1:T}$, compression table $\mathcal{P}$, multipliers $m^{(\ell)}_{0:n_{\max}-1}$ and primes $P^{(\ell)}_{n,j}$ for each Engram layer $\ell$
+\Ensure row indices $z^{(\ell)}_{t,n,j}$
+\State $x'_t \gets \mathcal{P}(x_t)$ for all $t$; pad positions $t \le 0$ with the compressed pad id
+\For{each Engram layer $\ell$, each order $n = 2,\dots,n_{\max}$}
+  \State $\mathrm{mix}_t \gets \bigoplus_{i=0}^{n-1} x'_{t-i}\, m^{(\ell)}_i$ for all $t$ \Comment{vectorized over $t$}
+  \For{$j = 1,\dots,K$}
+    \State $z^{(\ell)}_{t,n,j} \gets \mathrm{mix}_t \bmod P^{(\ell)}_{n,j}$; issue prefetch of $\bm{E}^{(\ell)}_{n,j}[z^{(\ell)}_{t,n,j}]$
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Engram layer forward (one residual branch; repeat the gate per branch for mHC)}\label{alg:c10-engram-layer}
+\begin{algorithmic}[1]
+\Require hidden states $\mH \in \R^{T \times d}$, fetched rows $\ve_{t,n,j}$
+\State $\ve_t \gets \Vert_{n,j}\, \ve_{t,n,j}$ \Comment{$\R^{d_{\mathrm{mem}}}$}
+\State $\vk_t \gets \mW_K\ve_t$;\; $\vv_t \gets \mW_V\ve_t$
+\State $g_t \gets \sigmoid\bigl(\RMSNorm(\vh_t)\T\RMSNorm(\vk_t)/\sqrt{d}\bigr)$;\; $\tilde{\vv}_t \gets g_t \vv_t$
+\State $\mY \gets \SiLU(\mathrm{CausalDepthwiseConv}_{w,\delta}(\RMSNorm(\tilde{\mV}))) + \tilde{\mV}$
+\State \Return $\mH + \mY$ \Comment{then attention and MoE of the same block}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Address computation is $\bigO(T n_{\max}^2 K)$ integer operations (or
+$\bigO(T n_{\max} K)$ reusing partial mixes), independent of the table sizes. The forward pass
+costs $\bigO(T (R+1) d\, d_{\mathrm{mem}})$ for the projections, $\bigO(T R d w)$ for the
+convolution and $\bigO(T d_{\mathrm{mem}})$ of memory traffic. The parameters of one Engram layer
+are $\sum_{n,j} P_{n,j}\, d_h$ table entries plus $(R+1) d\, d_{\mathrm{mem}}$ projection weights.
+In decoding, the per-token cost and the state are constant in the sequence length.
+
+\subsection{Implementation walkthrough}\label{sec:c10-engram-code}
+
+The official repository \repo{deepseek-ai__Engram} contains the paper
+(\repofile{repos/deepseek-ai__Engram/Engram_paper.pdf}), figures, a draw.io architecture diagram and
+a single script, \repofile{repos/deepseek-ai__Engram/engram_demo_v1.py}. Its README warns that the
+script is ``a demonstration version intended to illustrate the data flow'' that mocks attention,
+MoE and the hyper-connections. It is still the best place to see the exact hashing and fusion.
+
+\begin{implnote}[title={In the code: configuration}]
+Two dataclasses fix the sizes. \code{EngramConfig}: tokenizer \code{deepseek-ai/DeepSeek-V3};
+\code{engram_vocab_size = [129280*5, 129280*5]} (the requested table size per head for 2-grams and
+3-grams); \code{max_ngram_size = 3}; \code{n_embed_per_ngram = 512}; \code{n_head_per_ngram = 8};
+\code{layer_ids = [1, 15]}; \code{pad_id = 2}; \code{seed = 0}; \code{kernel_size = 4}.
+\code{BackBoneConfig}: \code{hidden_size = 1024}, \code{hc_mult = 4} (the $R = 4$ branches),
+\code{vocab_size = 129280}, \code{num_layers = 30}. So $d_h = 512/8 = 64$ and
+$d_{\mathrm{mem}} = 2 \cdot 512 = 1024$. In our arithmetic, the 16 prime-sized tables of one Engram
+layer have about $1.03 \times 10^7$ rows, i.e.\ about $6.6 \times 10^8$ parameters per layer at
+$d_h = 64$.
+\end{implnote}
+
+\begin{implnote}[title={In the code: tokenizer compression and hash parameters}]
+\code{CompressedTokenizer} decodes every token id of the base tokenizer to text, normalizes it
+with a Hugging Face \code{normalizers.Sequence} (NFKC, NFD, StripAccents, Lowercase, collapse of
+whitespace runs to one space, Strip, with a sentinel so that a pure-space token survives), and
+assigns one new id per distinct normalized string; tokens that decode to the Unicode replacement
+character keep their raw token string as key. The result is a NumPy array \code{lookup_table}
+mapping old to new ids. \code{NgramHashMapping} draws, for each Engram layer, multipliers
+\code{r * 2 + 1} (odd) from a generator seeded with \code{seed + 10007 * layer_id}, with
+\code{r} below \code{half_bound = (int64_max // V') // 2}. Then every product of a compressed id
+($< V'$) with a multiplier ($< 2\cdot$\code{half_bound}) stays below the \code{int64} maximum,
+so the mix never overflows. \code{calculate_vocab_size_across_layers} searches upwards from the
+requested size for primes, keeping a global \code{seen_primes} set so that \emph{every} head of
+every order in every layer gets a distinct prime size --- the condition of \cref{prop:c10-crt}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/deepseek-ai\_\_Engram/engram\_demo\_v1.py} (\texttt{NgramHashMapping.\_get\_ngram\_hashes}).},label={lst:c10-engram-hash}]
+        x = np.asarray(input_ids, dtype=np.int64)
+        B, T = x.shape
+
+        multipliers = self.layer_multipliers[layer_id]
+
+        def shift_k(k: int) -> np.ndarray:
+            if k == 0: return x
+            shifted = np.pad(x, ((0, 0), (k, 0)),
+                                mode='constant', constant_values=self.pad_id)[:, :T]
+            return shifted
+
+        base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
+
+        all_hashes = []
+
+        for n in range(2, self.max_ngram_size + 1):
+            n_gram_index = n - 2
+            tokens = base_shifts[:n]
+            mix = (tokens[0] * multipliers[0])
+            for k in range(1, n):
+                mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
+            num_heads_for_this_ngram = self.n_head_per_ngram
+            head_vocab_sizes = self.vocab_size_across_layers[layer_id][n_gram_index]
+
+            for j in range(num_heads_for_this_ngram):
+                mod = int(head_vocab_sizes[j])
+                head_hash = mix % mod
+                all_hashes.append(head_hash.astype(np.int64, copy=False))
+
+        return np.stack(all_hashes, axis=2)
+\end{lstlisting}
+
+The shifted copies \code{base_shifts[k]} hold $x'_{t-k}$ (left-padded with the pad id), so
+\code{mix} is exactly \cref{eq:c10-mixhash}, computed for all positions at once; the result has
+shape $(B, T, (n_{\max}-1)K) = (B, T, 16)$. \code{MultiHeadEmbedding} stores all 16 tables of a
+layer in a single \code{nn.Embedding} with $\sum_{n,j} P_{n,j}$ rows and adds per-head offsets to the
+indices before the lookup, a standard trick that turns 16 gathers into one.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/deepseek-ai\_\_Engram/engram\_demo\_v1.py} (\texttt{Engram.forward}).},label={lst:c10-engram-fwd}]
+    def forward(self,hidden_states,input_ids):
+        """
+        hidden_states: [B, L, HC_MULT, D]
+        input_ids: [B, L]
+        """
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        gates = []
+        for hc_idx in range(backbone_config.hc_mult):
+            key = self.key_projs[hc_idx](embeddings)
+            normed_key = self.norm1[hc_idx](key)
+            query = hidden_states[:,:,hc_idx,:]
+            normed_query = self.norm2[hc_idx](query)
+            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gate = gate.sigmoid().unsqueeze(-1)
+            gates.append(gate)
+        gates = torch.stack(gates,dim=2)
+        value = gates * self.value_proj(embeddings).unsqueeze(2)
+        output = value + self.short_conv(value)
+        return output
+\end{lstlisting}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Tensor shapes in \texttt{Engram.forward} of the demo ($B$ batch, $T$ length,
+$R = 4$ branches, $d = 1024$, $d_{\mathrm{mem}} = 1024$).}
+\label{tab:c10-engram-shapes}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Tensor & Shape & Meaning \\
+\midrule
+\code{input_ids} & $(B, T)$ & raw token ids (hashed on the CPU with NumPy) \\
+\code{hash_input_ids} & $(B, T, 16)$ & one row index per (order, head) \\
+\code{embeddings} & $(B, T, 16, 64) \to (B, T, 1024)$ & $\ve_t$ after flattening \\
+\code{key} (per branch) & $(B, T, 1024)$ & $\mW^{(r)}_K \ve_t$ \\
+\code{hidden_states} & $(B, T, 4, 1024)$ & $\vh^{(r)}_t$ for the 4 branches \\
+\code{gates} & $(B, T, 4, 1)$ & $g^{(r)}_t$ \\
+\code{value} & $(B, T, 4, 1024)$ & $g^{(r)}_t \mW_V \ve_t$ (shared $\mW_V$ broadcast) \\
+\code{output} & $(B, T, 4, 1024)$ & $\mY$, added to every branch by the caller \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{implnote}[title={In the code: differences between the demo and the paper}]
+(i) The gate has an extra step: after the scaled dot product, line
+\code{gate.abs().clamp_min(1e-6).sqrt() * gate.sign()} takes a signed square root before the
+sigmoid. This does not appear in the paper's equation. Since the logit lies in
+$[-\sqrt{d}, \sqrt{d}]$, the signed square root compresses it to $[-d^{1/4}, d^{1/4}]$ ($\pm 5.7$
+for $d = 1024$), which keeps the sigmoid away from saturation; this reading is ours.
+(ii) \code{ShortConv} applies a per-branch \code{nn.RMSNorm}, concatenates the branches into
+$R d$ channels, runs \code{nn.Conv1d} with \code{groups} equal to the channel count (depthwise),
+\code{padding=(kernel_size - 1) * dilation} and truncation to the first $T$ outputs (which makes it
+causal), and SiLU; the dilation is \code{max_ngram_size} $= 3$, as in the paper. The demo does not
+zero-initialize the convolution, which the paper does.
+(iii) \code{TransformerBlock} applies Engram as a residual \emph{before} attention and MoE, which
+are identity lambdas here; the hyper-connections are mocked by copying the embedding into four
+branches and reading branch 0 at the end. (iv) The hashes are recomputed with NumPy on the CPU
+inside every Engram layer's forward pass; a production system would compute them once, ahead of
+time, and prefetch the rows (\cref{alg:c10-engram-hash}). (v) The demo's \code{layer_ids = [1, 15]}
+are 0-based indices; the paper's Engram-27B uses layers 2 and 15.
+\end{implnote}
+
+\begin{lstlisting}[caption={Reference implementation (ours): hashed $N$-gram lookup with context-aware gated fusion (one branch).},label={lst:c10-engram-ref}]
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class EngramLayer(nn.Module):
+    def __init__(self, d, primes, mults, d_head, pad_id, w=4):
+        """primes[n][j]: rows of table (n, j); mults: odd ints, one per n-gram position."""
+        super().__init__()
+        self.primes, self.mults, self.pad = primes, mults, pad_id
+        sizes = [p for n in sorted(primes) for p in primes[n]]
+        self.register_buffer("offsets", torch.tensor([0] + sizes[:-1]).cumsum(0))
+        self.table = nn.Embedding(sum(sizes), d_head)          # all heads in one table
+        d_mem = len(sizes) * d_head
+        self.w_k, self.w_v = nn.Linear(d_mem, d, bias=False), nn.Linear(d_mem, d, bias=False)
+        self.n_h, self.n_k, self.n_y = nn.RMSNorm(d), nn.RMSNorm(d), nn.RMSNorm(d)
+        self.delta = max(primes)                                # dilation = max order
+        self.conv = nn.Conv1d(d, d, w, groups=d, bias=False, dilation=self.delta,
+                              padding=(w - 1) * self.delta)
+        nn.init.zeros_(self.conv.weight)                        # Y = gated value at init
+
+    def indices(self, ids):                                     # ids: (B, T) compressed
+        T, cols = ids.shape[1], []
+        shift = lambda k: F.pad(ids, (k, 0), value=self.pad)[:, :T]
+        for n in sorted(self.primes):
+            mix = shift(0) * self.mults[0]
+            for k in range(1, n):
+                mix = torch.bitwise_xor(mix, shift(k) * self.mults[k])
+            cols += [mix % p for p in self.primes[n]]
+        return torch.stack(cols, -1) + self.offsets             # (B, T, heads)
+
+    def forward(self, h, ids):                                  # h: (B, T, d)
+        e = self.table(self.indices(ids)).flatten(-2)           # (B, T, d_mem)
+        k, v = self.w_k(e), self.w_v(e)
+        g = torch.sigmoid((self.n_h(h) * self.n_k(k)).sum(-1, keepdim=True) / h.shape[-1] ** 0.5)
+        vt = g * v                                              # gated value
+        u = self.conv(self.n_y(vt).transpose(1, 2))[..., : h.shape[1]].transpose(1, 2)
+        return h + F.silu(u) + vt                               # residual update
+\end{lstlisting}
+
+\paragraph{Numerical checks.} In NumPy (scratch space) we checked that (a) a vectorized
+multiplicative--XOR hash over shifted id arrays, as in \cref{lst:c10-engram-hash}, equals a naive
+loop over positions and yields only non-negative indices; (b) the all-head collision property of
+\cref{prop:c10-crt}, with the demo-sized primes; (c) the receptive field of
+\cref{prop:c10-engram-rf}: with $n_{\max} = 3$, $w = 4$, $\delta = 3$, changing token 20 of a
+40-token sequence changed the outputs at positions 20 to 31 and nowhere else; and (d) parameter
+arithmetic. Reading Table~5 of the paper, ``Engram Vocab Size'' $2{,}262{,}400$ (Engram-27B) and
+$7{,}239{,}680$ (Engram-40B) with $d_{\mathrm{mem}} = 1280$, 16 heads of width 80 and two Engram
+layers, the interpretation ``rows per head'' gives $2 \times 2{,}262{,}400 \times 1280 \approx
+5.79 \times 10^9$ and $18.53 \times 10^9$ table parameters, close to the reported 5.7B and 18.5B.
+This interpretation is ours; the paper does not spell out the formula.
+
+\begin{results}
+\textbf{Source file:} \repofile{repos/deepseek-ai__Engram/Engram_paper.pdf} (the README shows the
+same figures as images).
+\begin{itemize}
+  \item \textbf{Iso-parameter, iso-FLOPs pre-training} (Table~1; 262B tokens, 3.8B activated
+        parameters, MoE-27B with 72 routed experts versus Engram-27B with 55 routed experts and a
+        5.7B-parameter Engram): validation loss $1.634 \to 1.622$; MMLU $57.4 \to 60.4$; CMMLU
+        $57.9 \to 61.9$; BBH $50.9 \to 55.9$; ARC-Challenge $70.1 \to 73.8$; DROP $55.7 \to 59.0$;
+        HumanEval $37.8 \to 40.8$; GSM8K $58.4 \to 60.6$; MATH $28.3 \to 30.7$. Engram-40B (18.5B
+        Engram parameters, same activated budget) reaches validation loss $1.610$.
+  \item \textbf{Allocation} (Section~3.1): at $6\times10^{20}$ FLOPs, validation loss improves from
+        $1.7248$ at $\rho = 100\%$ to $1.7109$ near $\rho \approx 80\%$; the optimum stays at
+        $\rho \approx 75$--$80\%$ across the two compute regimes.
+  \item \textbf{Ablation} (Section~6.2; 12-layer 3B MoE, 100B tokens): baseline validation loss
+        $1.808$; with a 1.6B-parameter Engram at layers 2 and 6, $1.768$; the best single
+        insertion layer is layer 2 ($1.770$).
+  \item \textbf{Long context} (Table~2, iso-loss comparison of Engram-27B at 46k steps with MoE-27B
+        at 50k): RULER multi-query needle-in-a-haystack $84.2 \to 97.0$, variable tracking
+        $77.0 \to 87.2$.
+  \item \textbf{Offloading} (Table~4, NVIDIA H800, a 100B-parameter table in host memory):
+        throughput 9{,}031.62 $\to$ 8{,}858.28 tokens/s on a 4B dense backbone and 6{,}315.52 $\to$
+        6{,}140.02 tokens/s on an 8B dense backbone.
+  \item \textbf{Sensitivity} (Section~6.3): with the Engram output suppressed at inference,
+        factual-knowledge benchmarks retain only 29--44\% of their scores (TriviaQA 29\%) while
+        reading comprehension retains 81--93\% (C3 93\%).
+\end{itemize}
+\end{results}
+
+\subsection{Discussion}
+
+Engram makes three points that go beyond $N$-gram embeddings. First, a lookup memory is not a
+replacement for computation but a complement to it: the allocation curve is U-shaped, so neither
+pure MoE nor a memory-heavy model is best. Second, the benefit is not confined to knowledge-heavy
+tasks: the paper's LogitLens and CKA analyses suggest that Engram relieves early layers from
+reconstructing static patterns, which acts like extra effective depth, and that delegating local
+dependencies frees attention for long-range context. Third, deterministic addressing turns a
+modeling choice into a systems advantage: tables can be sharded in training and offloaded with
+prefetching in inference, which is impossible for hidden-state-dependent routing.
+
+The limitations follow from the same design. The memory is static at inference: there is no write
+path, and editing a fact would mean editing hashed rows shared by colliding $n$-grams. The key is a
+short window of at most $n_{\max}$ tokens, so anything that needs longer context must come from
+$\vh_t$ through the gate. Collisions are absorbed by multi-head hashing and gating rather than
+avoided. The public code is a demonstration, not the training system. Relative to the other systems
+here, Engram is the hashed, sparse cousin of the embedding table, and MemoryLLM
+(\cref{sec:c10-memoryllm}) is its unigram, every-layer cousin. Hybrid models that combine several
+memory types are discussed in \cref{ch:hybrid}; the survey mentions Engram-inspired lookup
+augmentations among them.
+
+% =====================================================================================
+\section{ExplicitLM: a bank of human-readable memories}\label{sec:c10-explicitlm}
+
+\subsection{Motivation}
+
+Knowledge stored in weights is entangled and not addressable: one cannot point at the parameters
+that hold a fact, check them, or replace them when the fact changes. ExplicitLM
+\citep{yu2025explicitlm} takes the editable-memory direction of PlugLM (\cref{sec:c10-precursors})
+to its literal end. According to its abstract, the model has a million-scale memory bank in which
+\emph{each entry is a human-readable token sequence}, so the knowledge base can be inspected and
+modified directly. To make such a bank usable inside a network it needs (i) an address step that is
+cheap for a million entries --- product keys --- and (ii) a selection step that is discrete (one
+entry, readable) yet trainable end to end --- the Gumbel-Softmax with a straight-through
+estimator. The abstract also describes a knowledge partition inspired by dual-system cognitive
+theory: a frozen part holding explicit facts and a learnable part holding implicit patterns
+(the abstract gives a 20\%/80\% split), maintained with exponential-moving-average (EMA) updates.
+
+The survey stresses that such systems are not retrieval-augmented generation: the memory banks are
+trained and invoked as architectural components rather than appended through an external
+orchestration pipeline, and their significance is that they make knowledge more inspectable and
+expose targeted update operations (\S IV-B(d), (f)).
+
+\begin{taxonomy}
+\textbf{Representation:} explicit --- layer-wise memory banks whose entries are token sequences
+\citep[\S IV-B(d)]{zhoubian2026memory}; Table~I's paradigm label is ``Interpretable Memory Banks''.
+\textbf{Update dynamics:} offline (Table~I). The repository version additionally rewrites entries at
+inference time (see the implementation notes).
+\textbf{Persistence:} long-term.
+\textbf{Update rule:} not listed in Table~II. In our reading the paper's EMA maintenance of
+learnable entries is objective-induced, and the repository's inference-time rewriting is an
+admission/eviction rule (FIFO, LRU and similar policies).
+\end{taxonomy}
+
+\subsection{Formulation}
+
+The abstract fixes the ingredients; the repository fixes many details. Where they may differ, we
+follow the code and say so.
+
+\paragraph{The bank.} The memory holds $N = n^2$ entries. Entry $i$ is a sequence of $\ell_m$ token
+ids, $m_i = (m_{i,1},\dots,m_{i,\ell_m}) \in \mathcal{V}^{\ell_m}$, padded or truncated to a fixed
+length ($N = 2^{20}$ and $\ell_m = 16$ by default in the code). To use an entry inside the network
+it needs a vector. The code embeds each token with the model's own embedding table and averages:
+\begin{equation}
+  \bar{\ve}_i = \frac{1}{\ell_m}\sum_{j=1}^{\ell_m} \mathrm{Emb}(m_{i,j}) \in \R^{d} .
+  \label{eq:c10-entry}
+\end{equation}
+So the memory's contents are \emph{not} free parameters: they are fully determined by token ids,
+which is exactly what makes them readable (decode the ids) and editable (overwrite the ids).
+
+\paragraph{Stage 1: coarse filtering with product keys.} A query network $f_{\vtheta}$ maps a hidden
+state to $\vq \in \R^{d_k}$. The two halves of the query are compared with two sets of
+$n = \sqrt{N}$ sub-keys by cosine similarity with a learned temperature $\tau$:
+\begin{equation}
+  a_i = \tau\, \cos\bigl(\vq^{(1)}, \bm{c}^{(1)}_i\bigr),\qquad
+  b_j = \tau\, \cos\bigl(\vq^{(2)}, \bm{c}^{(2)}_j\bigr),\qquad s_{ij} = a_i + b_j ,
+  \label{eq:c10-explicit-coarse}
+\end{equation}
+and the top-$c$ pairs over the $n\times n$ grid form the candidate set $\mathcal{C}$, found exactly
+from shortlists of length $k' \ge c$ (\cref{prop:c10-pkm}). The abstract describes this, in its own notation, as reducing
+the cost from $\bigO(N \cdot \abs{I})$ to $\bigO(\sqrt{N}\cdot\abs{I})$.
+
+\paragraph{Stage 2: fine selection with Gumbel-Softmax.} For each token $t$ the model scores the
+candidates by cosine similarity with its (normalized) hidden state,
+$u_{t,i} = \cos(\vh_t, \bar{\ve}_i)$ for $i \in \mathcal{C}$, and selects one of them. A hard
+$\argmax$ has no useful gradient, so ExplicitLM uses the Gumbel-Softmax relaxation
+\citep{c10-jang2017gumbel,c10-maddison2017concrete}: draw independent $G_i \sim \mathrm{Gumbel}(0,1)$,
+\begin{equation}
+\begin{gathered}
+  \vy^{\mathrm{soft}}_t = \softmax\bigl((\vu_t + \vg)/\tau_g\bigr),\qquad
+  \vy^{\mathrm{hard}}_t = \mathrm{onehot}\bigl(\argmax_i (u_{t,i} + G_i)\bigr),\\
+  \vy_t = \vy^{\mathrm{hard}}_t - \mathrm{sg}\bigl(\vy^{\mathrm{soft}}_t\bigr) + \vy^{\mathrm{soft}}_t ,
+\end{gathered}
+  \label{eq:c10-gumbel}
+\end{equation}
+where $\mathrm{sg}$ stops the gradient. In the forward pass $\vy_t$ equals the one-hot vector, so
+exactly one readable entry is used; in the backward pass the gradient is that of the soft weights
+--- the straight-through estimator \citep{c10-bengio2013ste}. The selected memory is
+$\vm_t = \sum_{i\in\mathcal{C}} y_{t,i}\, \bar{\ve}_i$.
+
+Why does adding Gumbel noise and taking the $\argmax$ produce a sample from the softmax? The
+derivation is short and worth doing once.
+
+\begin{proposition}[Gumbel-max trick]\label{prop:c10-gumbel}
+Let $G_1,\dots,G_C$ be i.i.d.\ with CDF $F(g) = \exp(-e^{-g})$. Then
+$\Pr\bigl[\argmax_i (u_i + G_i) = k\bigr] = e^{u_k}/\sum_i e^{u_i}$.
+\end{proposition}
+\begin{proof}
+The density is $f(g) = e^{-g}\exp(-e^{-g})$. Index $k$ wins when $G_i < u_k + G_k - u_i$ for all
+$i \ne k$. Conditioning on $G_k = g$ and using independence,
+\[
+  \Pr[k \text{ wins}] = \int_{-\infty}^{\infty} f(g) \prod_{i\ne k} F(u_k + g - u_i)\, dg
+  = \int_{-\infty}^{\infty} e^{-g} \exp\Bigl(-e^{-g}\Bigl[1 + \sum_{i \ne k} e^{u_i - u_k}\Bigr]\Bigr) dg .
+\]
+The bracket equals $Z e^{-u_k}$ with $Z = \sum_i e^{u_i}$. Substitute $v = e^{-g}$, so
+$dv = -e^{-g}dg$ and the limits $g = -\infty, \infty$ become $v = \infty, 0$:
+$\Pr[k \text{ wins}] = \int_0^\infty \exp(-v Z e^{-u_k})\, dv = e^{u_k}/Z$.
+\end{proof}
+
+As $\tau_g \to 0$, $\vy^{\mathrm{soft}}_t$ approaches the one-hot sample, so the soft weights used
+for the gradient become more faithful to the forward choice but also higher-variance. In our NumPy
+check (scratch space), 400{,}000 Gumbel-max draws with logits $(1.0, 0.2, -0.5, 2.0, 0.0)$ matched
+the softmax probabilities within $1.3$ standard errors in every coordinate, the straight-through
+weights equalled the one-hot vector in the forward pass, and the mean largest relaxed weight rose
+from $0.62$ at $\tau_g = 1$ to $0.99$ at $\tau_g = 0.03$.
+
+\paragraph{Fusion.} The code fuses the selected memory with a SwiGLU-style gated MLP on the
+concatenation $[\vh_t; \vm_t]$ and scales the result by a learned, similarity-dependent scalar:
+\begin{equation}
+  \vo_t = \mW_{\mathrm{down}}\Bigl(\SiLU\bigl(\mW_{\mathrm{gate}}[\vh_t;\vm_t]\bigr) \had
+  \mW_{\mathrm{up}}[\vh_t;\vm_t]\Bigr),\qquad
+  \vx_t \gets \vx_t + \lambda\, \vo_t ,
+  \label{eq:c10-explicit-fuse}
+\end{equation}
+where $\lambda \in [0,1]$ is a clamped small MLP of the mean selected similarity plus a learned
+bias (initialized to zero) --- one scalar per sequence. Because the update is additive, the
+backbone still works if the memory contributes nothing (the code calls this a ``shortcut''
+mechanism).
+
+\paragraph{Auxiliary losses (code).} Besides the language-modeling loss, every memory layer
+contributes a similarity loss $\loss_{\mathrm{sim}} = -\mathrm{mean}_t \sum_i y_{t,i} u_{t,i}$,
+which rewards selecting candidates that match the hidden state, and a diversity loss
+$\loss_{\mathrm{div}}$, the mean off-diagonal cosine similarity among the candidates' vectors,
+which discourages redundant candidate sets. They are averaged over layers and weighted
+$0.1$ and $0.05$ by default.
+
+\paragraph{Updating the memory.} Two mechanisms are described, and they are different.
+\begin{itemize}
+  \item \textbf{Paper (abstract).} Entries are partitioned into frozen explicit facts and learnable
+        implicit patterns, the latter maintained by EMA updates for stability. One way to formalize
+        an EMA update of a learnable entry $i$ is
+        $\tilde{\ve}_i \gets (1-\gamma)\tilde{\ve}_i + \gamma\, \bar{\vh}_i$, where $\bar{\vh}_i$ is the
+        mean hidden state of the tokens that selected entry $i$ in the current batch and $\gamma$ a
+        small rate; to keep the entry human-readable, the updated vector must then be mapped back to
+        token ids (for example by nearest-neighbour decoding against the embedding table). The
+        paper's exact parameterization may differ, and the mirrored code contains no EMA path.
+  \item \textbf{Repository.} The bank is a buffer of token ids that is fixed during training and
+        rewritten at inference: a fact extractor compresses incoming text with an LLMLingua-2
+        model, splits it into sentences, tokenizes and pads them to $\ell_m$ tokens, and writes them
+        into slots chosen by a replacement policy (FIFO, LRU, random or importance-based).
+\end{itemize}
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{ExplicitLM memory layer (two-stage retrieval and fusion)}\label{alg:c10-explicit}
+\begin{algorithmic}[1]
+\Require block output $\mX \in \R^{T\times d}$, bank $\{m_i\}_{i=1}^{N}$, sub-keys $\mC^{(1)},\mC^{(2)}$, shortlist $k'$, candidates $c$
+\State $\mH \gets \RMSNorm(\mX)$
+\State $\vq \gets f_{\vtheta}(\cdot)$ \Comment{per token (ours) or one per sequence (code: mean of $\mH$)}
+\State $\va, \vb \gets$ scaled cosine scores of $\vq^{(1)}, \vq^{(2)}$ with the sub-keys
+\State $\mathcal{C} \gets$ top-$c$ of $\{a_i + b_j\}$ over $\TopK(\va,k') \times \TopK(\vb,k')$ \Comment{\cref{prop:c10-pkm}}
+\State $\bar{\ve}_i \gets \frac{1}{\ell_m}\sum_j \mathrm{Emb}(m_{i,j})$ for $i \in \mathcal{C}$ \Comment{gather $c\,\ell_m$ token rows}
+\For{each token $t$}
+  \State $u_{t,i} \gets \cos(\vh_t, \bar{\ve}_i)$ for $i \in \mathcal{C}$;\; $\vy_t \gets$ straight-through Gumbel-Softmax of $\vu_t$
+  \State $\vm_t \gets \sum_i y_{t,i}\bar{\ve}_i$;\; $\vx_t \gets \vx_t + \lambda\,\mathrm{SwiGLU}([\vh_t;\vm_t])$
+\EndFor
+\State \Return $\mX$, auxiliary losses $\loss_{\mathrm{sim}}, \loss_{\mathrm{div}}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.} Per query, stage 1 costs the query network plus $\bigO(\sqrt{N} d_k)$ for the
+sub-key scores and $\bigO(k'^2)$ to merge the shortlists; stage 2 costs $\bigO(c\,\ell_m d)$ to build
+the candidate vectors and $\bigO(T c\, d)$ for the similarities; fusion is $\bigO(T d^2)$. With the
+code's defaults ($N = 2^{20}$, so $\sqrt{N} = 1024$, $k' = 128$, $c$ between 16 and 32) the coarse
+stage scores 2048 sub-keys and merges $16{,}384$ pairs instead of scoring a million entries. The
+bank itself is only token ids, $N \ell_m$ integers ($2^{24}$ of them by default), and the
+``values'' share the model's embedding table, so a million-entry memory adds no value parameters
+at all; the trainable parameters are the query networks, sub-keys (frozen in the code) and fusion
+modules.
+
+\subsection{Implementation walkthrough}\label{sec:c10-explicit-code}
+
+\begin{implnote}[title={In the code: which version is this?}]
+The mirror \repo{SCUT-HCC__ExplicitLM} comes from the GitHub organization of the senior author's
+lab. Its README (in Chinese) never cites the paper, and it describes a system built on a
+\emph{frozen Qwen3-4B} backbone in which only the memory components (\code{MemoryGate},
+\code{GatedMemoryFusion}, \code{MemoryNorm}) are trained --- about 0.208B trainable parameters
+according to the README. \repofile{repos/SCUT-HCC__ExplicitLM/CLEANUP_SUMMARY.md} records that an
+older small-model version (width 512, 8 layers, a 6400-token vocabulary, a \code{1_pretrain.py}
+pre-training script) was moved to an archive directory that is not in the mirror. The repository
+may therefore describe a later version than the paper, and we treat it as ``probably official''.
+Dataset files over 20\,MB were left out of the mirror.
+\end{implnote}
+
+The model is \code{ExplicitLM} in \repofile{repos/SCUT-HCC__ExplicitLM/models/core/ExplicitLM.py}.
+It builds the Qwen3 embedding, rotary embedding and final norm, and replaces every decoder layer by
+a \code{Qwen3ExplicitLMBlock} (\repofile{repos/SCUT-HCC__ExplicitLM/models/core/Qwen3ExplicitLMBlock.py}):
+a standard \code{Qwen3DecoderLayer} followed by its own memory norm, memory gate and fusion. All 36
+layers of Qwen3-4B (\repofile{repos/SCUT-HCC__ExplicitLM/config/qwen3_4b_params.py}) therefore
+retrieve independently from the same bank. The bank is a persistent buffer of shape
+$(N, \ell_m)$ holding token ids, initialized randomly and then filled from a knowledge base of
+sentences (\code{sentence_trex_data.json}, i.e.\ T-REx-derived facts) by
+\code{MemoryBankProcessor} in \repofile{repos/SCUT-HCC__ExplicitLM/utils/model_initializer.py}
+(each sentence tokenized and padded or truncated to $\ell_m$ tokens, the result cached as a
+\code{.pt} file). In the mirrored file, the call that builds the bank is indented inside the branch
+that creates a missing cache directory, which looks like an indentation slip. The bank is kept on
+the CPU and moved to the GPU when used.
+
+\begin{implnote}[title={In the code: stage 1 (\texttt{MemoryGate})}]
+\repofile{repos/SCUT-HCC__ExplicitLM/models/memory_bank/MemoryGate.py} implements the query network
+as a linear layer, two pre-norm residual GELU blocks, a LayerNorm and a projection to
+\code{knowledge_dim} $= 1536$. The sub-keys \code{keys} have shape $(2, \sqrt{N}, d_k/2)$; when
+\code{keys_path} exists they are loaded and \emph{frozen}. Scores are cosine similarities times
+\code{logit_scale.exp()}, a CLIP-style learnable temperature initialized to $1/0.07$ and clamped at
+100. \code{generate_candidates} (\cref{lst:c10-explicit-cand}) is the product-key search of
+\cref{lst:c10-pkm} with \code{num_candidates_internal} $= 128$ and \code{num_candidates} $= 32$ by
+default (the training configuration uses 16). The LoRA variant
+\repofile{repos/SCUT-HCC__ExplicitLM/models/memory_bank/MemoryGateLoRA.py} factorizes the linear
+layers with rank \code{gate_rank} $= 128$ and keeps one residual block.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/SCUT-HCC\_\_ExplicitLM/models/memory\_bank/MemoryGate.py} (\texttt{generate\_candidates}; comment lines in Chinese elided).},label={lst:c10-explicit-cand}]
+        bsz, seq_len, _ = scores_1.shape
+        # ...
+        topk_scores_1, topk_indices_1 = scores_1.topk(self.num_candidates_internal, dim=-1)
+        topk_scores_2, topk_indices_2 = scores_2.topk(self.num_candidates_internal, dim=-1)
+        # ...
+        combined_scores = topk_scores_1.unsqueeze(-1) + topk_scores_2.unsqueeze(-2)
+        # ...
+        combined_indices = (
+            topk_indices_1.unsqueeze(-1) * self.num_keys + topk_indices_2.unsqueeze(-2)
+        )
+        # ...
+        combined_scores = combined_scores.view(bsz, seq_len, -1)
+        combined_indices = combined_indices.view(bsz, seq_len, -1)
+        # ...
+        candidate_scores, candidate_pk_indices = combined_scores.topk(
+            self.num_candidates, dim=-1
+        )
+        candidate_indices = combined_indices.gather(-1, candidate_pk_indices)
+        # ...
+        candidate_scores = F.softmax(candidate_scores, dim=-1)
+        candidate_scores = self.dropout(candidate_scores)
+
+        return candidate_indices, candidate_scores
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: where the sub-keys come from}]
+\repofile{repos/SCUT-HCC__ExplicitLM/convert_conversations_to_labeled.py} embeds every knowledge
+sentence with a sentence encoder (\code{BAAI/bge-base-en-v1.5}, normalized), then performs a
+two-level \emph{residual quantization}: MiniBatch $k$-means with $\sqrt{N}$ clusters gives the row
+sub-keys; $k$-means on the residuals (embedding minus its row centroid) gives the column
+sub-keys. Entry $i$ is mapped to the grid cell (row cluster, residual cluster), and for each training
+query the 32 nearest knowledge sentences (by exact inner-product search with FAISS) are stored as
+targets. \code{knowledge_dim} $= 1536$ is twice the encoder's width, one half per sub-key set.
+\code{train_router.py} then trains the query network with \code{compute_loss_soft}: the product-key
+log-probability of a target, $\log p_1(u) + \log p_2(v)$ for grid cell $(u,v)$, weighted by a
+softmax of the target similarities at temperature $0.1$ --- a soft-label cross-entropy.
+\end{implnote}
+
+\begin{implnote}[title={In the code: stage 2, fusion and gradients}]
+In \code{Qwen3ExplicitLMBlock.forward} the query is the masked \emph{mean} of the normalized hidden
+states over the sequence, so there is one candidate set per sequence and layer, broadcast to all
+positions. The candidates' token ids are gathered from the bank and embedded with the tied
+embedding table in chunks of 32, averaged over the $\ell_m$ tokens, and compared with each
+position's normalized hidden state by cosine similarity. \code{gumbel_softmax_selection}
+(\cref{lst:c10-explicit-gumbel}) implements \cref{eq:c10-gumbel} with $\tau_g$ =
+\code{gumbel_temperature} $= 1.0$. \code{GatedMemoryFusion} implements \cref{eq:c10-explicit-fuse}.
+Two consequences are worth knowing. First, the sequence mean contains future tokens, so the same
+causality caveat as for LM2 applies in teacher-forced training, while generation (\code{_stream})
+recomputes the whole prefix at each step and sees only the past. Second, after
+\code{generate_candidates} the block uses only the candidate \emph{indices}; the candidate scores
+are expanded but not used, so in \code{train_memory.py} the language-modeling loss does not reach
+the query network through this path, even though its parameters are marked trainable. The coarse
+stage is trained by the separate router objective above.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/SCUT-HCC\_\_ExplicitLM/models/core/Qwen3ExplicitLMBlock.py} (body of \texttt{gumbel\_softmax\_selection}).},label={lst:c10-explicit-gumbel}]
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(similarity_scores) + 1e-20) + 1e-20)
+        logits = (similarity_scores + gumbel_noise) / temperature
+        soft_weights = F.softmax(logits, dim=-1)
+        if hard:
+            _, max_indices = soft_weights.max(dim=-1, keepdim=True)
+            hard_weights = torch.zeros_like(soft_weights).scatter_(-1, max_indices, 1.0)
+            selection_weights = hard_weights - soft_weights.detach() + soft_weights
+            selected_indices = max_indices.squeeze(-1)
+        else:
+            selection_weights = soft_weights
+            selected_indices = torch.argmax(soft_weights, dim=-1)
+        return selection_weights, selected_indices
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: updating the bank at inference}]
+\code{MemoryBankUpdater} (\repofile{repos/SCUT-HCC__ExplicitLM/utils/memory_bank_updater.py})
+takes facts from \code{FactExtractor} (\repofile{repos/SCUT-HCC__ExplicitLM/utils/fact_extractor.py},
+which wraps an LLMLingua-2 prompt compressor with compression rate $0.4$), splits the compressed
+text at sentence boundaries, drops fragments of 10 characters or fewer, tokenizes and pads each
+fact to $\ell_m$ tokens, and overwrites slots chosen by the configured strategy (\code{"fifo"} by
+default; \code{"similarity"} currently falls back to random). The model also registers a
+\code{freeze_mask} buffer (all \code{False}), and
+\repofile{repos/SCUT-HCC__ExplicitLM/utils/dataset_processor/dataset_processor.py} keeps a
+\code{FREEZE_RATIO = 0.2} that restricts evaluation questions to the first 20\% of database
+entries --- remnants consistent with the paper's frozen/learnable partition. Note that overwriting
+a slot's token ids changes its vector $\bar{\ve}_i$ but not the sub-keys of its grid cell, which
+were derived from the \emph{old} content; a newly written fact is therefore reached through the
+address of the slot it replaced, unless the keys are rebuilt.
+\end{implnote}
+
+\begin{lstlisting}[caption={Reference implementation (ours): two-stage retrieval with product keys and a straight-through Gumbel-Softmax (per-token queries).},label={lst:c10-explicit-ref}]
+import torch, torch.nn.functional as F
+
+def two_stage_retrieve(h, f_q, C1, C2, bank_ids, emb, k_short=128, c=16, tau_g=1.0):
+    """h: (B, T, d) normalized hidden states; f_q: query network d -> dk;
+    C1, C2: (n, dk/2) sub-keys; bank_ids: (n*n, l_m) token ids; emb: nn.Embedding."""
+    n = C1.shape[0]
+    q = f_q(h)                                               # (B, T, dk), one query per token
+    q1, q2 = q.chunk(2, dim=-1)
+    a = F.normalize(q1, dim=-1) @ F.normalize(C1, dim=-1).T  # (B, T, n) cosine scores
+    b = F.normalize(q2, dim=-1) @ F.normalize(C2, dim=-1).T
+    av, ai = a.topk(k_short, -1)
+    bv, bi = b.topk(k_short, -1)
+    grid = (av[..., :, None] + bv[..., None, :]).flatten(-2)
+    gid = (ai[..., :, None] * n + bi[..., None, :]).flatten(-2)
+    cand = gid.gather(-1, grid.topk(c, -1).indices)          # (B, T, c) entry ids
+    e_bar = emb(bank_ids[cand]).mean(-2)                     # (B, T, c, d): mean token embedding
+    u = F.cosine_similarity(h[..., None, :], e_bar, dim=-1)  # (B, T, c) fine scores
+    g = -torch.log(-torch.log(torch.rand_like(u).clamp_min(1e-20)))
+    soft = torch.softmax((u + g) / tau_g, dim=-1)
+    hard = F.one_hot(soft.argmax(-1), c).to(soft.dtype)
+    y = hard - soft.detach() + soft                          # straight-through weights
+    m = (y[..., None] * e_bar).sum(-2)                       # (B, T, d) selected memory
+    sim_loss = -(y * u).sum(-1).mean()                       # auxiliary similarity loss
+    return m, cand.gather(-1, hard.argmax(-1, keepdim=True)), sim_loss
+\end{lstlisting}
+
+\begin{results}
+\textbf{Source files:} \repofile{repos/SCUT-HCC__ExplicitLM/README.md}; survey PDF. The repository
+reports no evaluation numbers, and the survey describes ExplicitLM qualitatively. The paper's
+abstract reports substantial improvements on knowledge-intensive tasks over a standard Transformer,
+larger gains in low-data regimes, and a strong correlation between memory retrieval and
+performance (correct predictions retrieve relevant entries more often). See the paper for the
+numbers.
+\end{results}
+
+\subsection{Discussion}
+
+ExplicitLM's distinctive property is that the memory's content is text. A reader can decode which
+entry a layer selected for a token, and an operator can correct a fact by writing new token ids ---
+an operation that is hard to perform on entangled parametric memory and that the survey singles
+out as the significance of editable memory banks. The product-key stage makes a million entries
+affordable, and the straight-through Gumbel-Softmax keeps the selection discrete without giving up
+gradients for the fine stage.
+
+The price is representational. An entry's vector is the mean of its token embeddings, which
+discards word order (``A founded B'' and ``B founded A'' coincide) and limits how much a 16-token
+entry can say; one entry is selected per token and layer; and the address structure (sub-keys built
+by clustering sentence embeddings) is separate from the content, so edits and keys can drift
+apart. In the repository version the backbone is frozen and the coarse router is trained against a
+sentence-encoder teacher, which turns the system into a learned retriever with fusion rather than
+a jointly trained memory; whether the paper's version differs in these respects requires the paper.
+Compared with Engram (\cref{sec:c10-engram}), ExplicitLM trades a static, collision-prone but
+$\bigO(1)$ address for a content-based, readable but more expensive one; compared with kNN-LM
+(\cref{sec:c10-knnlm}), its memory is consumed inside every layer rather than mixed into the output
+distribution.
+
+% =====================================================================================
+\section{MemoryLLM: feed-forward layers as plug-and-play token memory}\label{sec:c10-memoryllm}
+
+\paragraph{Which MemoryLLM?} Two different systems share the name. \emph{MEMORYLLM}
+\citep{wang2024memoryllm} (2024) is the self-updatable model with a latent memory pool described in
+\cref{sec:c10-precursors}; it is online and its code is public. \emph{MemoryLLM: Plug-n-Play
+Interpretable Feed-Forward Memory for Transformers} \citep{jaiswal2026memoryllm} (Apple, ICML 2026)
+is the offline design of this section. No public code for it was found, so we explain it from the
+survey's description and the authors' public summary, and we mark our own formalization.
+
+\subsection{Motivation}
+
+\Cref{eq:c10-ffn-kv} says that an FFN is a key--value memory, and FFNs hold most of a Transformer's
+parameters: with attention projections $\mW_Q,\mW_K,\mW_V,\mW_O \in \R^{d\times d}$ ($4d^2$
+parameters) and an FFN with $d_{\mathrm{ff}} = 4d$ and two matrices ($8d^2$) --- or a SwiGLU FFN
+with $d_{\mathrm{ff}} = \tfrac{8}{3}d$ and three matrices, again $8d^2$ --- the FFN is two thirds of
+each block. Yet this memory is hard to study, because its input is the residual stream: a mixture
+of the token, its context and everything earlier layers computed. One cannot say which ``memory
+locations'' a given token reads, because the answer depends on the whole context.
+
+MemoryLLM removes that dependence. According to the survey (\S IV-B(e)), it ``trains decoupled FFN
+memories directly from token embeddings, enabling their outputs to be precomputed as token-level
+lookups''. The FFNs become context-free, token-wise retrieval modules; the attention layers keep
+all the context processing. Two benefits follow: interpretability (the memory accessed by each
+vocabulary item can be enumerated) and efficiency (FFN outputs can be precomputed, stored outside
+GPU memory and fetched on demand). A ``flexible'' variant sits between this design and a
+conventional Transformer.
+
+\begin{taxonomy}
+\textbf{Representation:} explicit --- the survey places it under lookup-based memory, as feed-forward
+layers reinterpreted as context-free token-wise retrieval modules \citep[\S IV-B(e)]{zhoubian2026memory};
+Table~I's paradigm label is ``Context-Free Feed-Forward Lookup''.
+\textbf{Update dynamics:} offline. \textbf{Persistence:} long-term.
+\textbf{Update rule:} not listed in Table~II; in our reading objective-induced/structural (the
+memory is fixed by training and by an offline precomputation).
+\end{taxonomy}
+
+\subsection{Formulation}
+
+\paragraph{Decoupling the FFN from the residual stream.} A standard pre-norm block computes
+\begin{equation}
+  \mX' = \mX^{(\ell)} + \mathrm{Attn}^{(\ell)}\bigl(\RMSNorm(\mX^{(\ell)})\bigr),\qquad
+  \mX^{(\ell+1)} = \mX' + \mathrm{FFN}^{(\ell)}\bigl(\RMSNorm(\mX')\bigr).
+\end{equation}
+Public summaries of MemoryLLM describe the block as
+$\mX^{(\ell+1)} = \mX^{(\ell)} + \mathrm{Attn}(\mX^{(\ell)}) + \mathrm{FFN}(\mX^{(0)})$, where
+$\mX^{(0)}$ holds the token embeddings $\mathrm{Emb}(x_t)$. One way to formalize this, with the
+normalizations written out, is
+\begin{equation}
+  \mX^{(\ell+1)} = \mX^{(\ell)} + \mathrm{Attn}^{(\ell)}\bigl(\RMSNorm(\mX^{(\ell)})\bigr)
+  + \mathrm{FFN}^{(\ell)}\bigl(\RMSNorm(\mX^{(0)})\bigr),
+  \label{eq:c10-memoryllm}
+\end{equation}
+so attention and FFN act in parallel on different inputs: attention on the contextual stream, the
+FFN on the context-free token embedding. The paper's exact parameterization (placement of norms,
+embedding scaling, whether FFN inputs are shared across layers) may differ.
+
+\paragraph{Token-wise lookups.} Both $\RMSNorm$ and the FFN act on each row separately, so row $t$
+of $\mathrm{FFN}^{(\ell)}(\RMSNorm(\mX^{(0)}))$ is $\mathrm{FFN}^{(\ell)}(\RMSNorm(\mathrm{Emb}(x_t)))$,
+a function of the token id $x_t$ and the layer index alone. Define the table of token-wise lookups
+(ToLs)
+\begin{equation}
+  \mathcal{T}[v, \ell] = \mathrm{FFN}^{(\ell)}\bigl(\RMSNorm(\mathrm{Emb}(v))\bigr) \in \R^{d},
+  \qquad v \in \mathcal{V},\; \ell = 1,\dots,L .
+  \label{eq:c10-tol}
+\end{equation}
+
+\begin{proposition}[ToLs are exact]\label{prop:c10-tol}
+For every input sequence, replacing the FFN term of \cref{eq:c10-memoryllm} by the row
+$\mathcal{T}[x_t, \ell]$ at every position $t$ and layer $\ell$ leaves all hidden states and logits
+unchanged.
+\end{proposition}
+\begin{proof}
+At every layer the two computations add the same vector to row $t$, because
+\[
+  \bigl[\mathrm{FFN}^{(\ell)}(\RMSNorm(\mX^{(0)}))\bigr]_t
+  = \mathrm{FFN}^{(\ell)}(\RMSNorm(\mathrm{Emb}(x_t))) = \mathcal{T}[x_t,\ell];
+\]
+everything else in the recursion is identical. Induction over $\ell$ gives equality of all hidden states.
+\end{proof}
+
+The proposition fails for a conventional block, whose FFN input $\RMSNorm(\mX')$ depends on the
+context; this is the whole point of the decoupling. Our NumPy check (scratch space) built a small
+random model of the form \eqref{eq:c10-memoryllm}, precomputed the table, and obtained logits
+identical to the online computation (maximum difference exactly 0).
+
+\paragraph{The price in storage.} The table has $\abs{\mathcal{V}}\, L\, d$ entries, against
+$L \cdot 3 d\, d_{\mathrm{ff}}$ parameters for SwiGLU FFNs, a ratio of
+$\abs{\mathcal{V}}/(3 d_{\mathrm{ff}})$. For illustrative values $\abs{\mathcal{V}} = 131{,}072$,
+$d = 4096$, $d_{\mathrm{ff}} = 8192$ and $L = 32$ (our numbers, not the paper's), the table holds
+$1.7 \times 10^{10}$ numbers --- about five times the FFN parameters --- and each token needs a
+$L d$-vector, $256$\,KB in 16-bit precision. ToLs therefore trade FLOPs for capacity in slower
+memory: they are worth it when the table lives off the GPU (host memory or flash) and is fetched by
+token id, which, as for Engram, is known before the forward pass and highly skewed (frequent
+tokens can be cached). The abstract describes exactly this on-demand transfer between VRAM and
+storage.
+
+\paragraph{Interpretability.} With a context-free input, key $i$ of layer $\ell$ responds to token
+$v$ with activation $\phi(\vk_i\T\RMSNorm(\mathrm{Emb}(v)))$, a finite list that can be computed
+for the whole vocabulary. The set of memory locations a token reads is fixed, so one can ask
+directly which tokens share keys and what each value writes --- the analysis the paper's title
+promises. In a conventional Transformer the same question has a different answer in every context.
+
+\paragraph{Flex-MemoryLLM.} Removing context from every FFN costs quality, and the authors propose
+Flex-MemoryLLM to bridge the gap. Public summaries describe a split of the FFN parameter budget into
+a small context-aware module FFN-C that acts on the residual stream and a larger context-free
+module FFN-M that acts on the token embeddings and can be offloaded. One way to formalize this is
+\begin{equation}
+\begin{aligned}
+  \mX^{(\ell+1)} = \mX^{(\ell)} &+ \mathrm{Attn}^{(\ell)}\bigl(\RMSNorm(\mX^{(\ell)})\bigr)
+  + \mathrm{FFN}^{(\ell)}_{\mathrm{C}}\bigl(\RMSNorm(\mX^{(\ell)})\bigr)\\
+  &+ \mathrm{FFN}^{(\ell)}_{\mathrm{M}}\bigl(\RMSNorm(\mX^{(0)})\bigr),
+\end{aligned}
+  \label{eq:c10-flex}
+\end{equation}
+with a fraction $\beta$ of the FFN parameters in FFN-C. $\beta = 0$ recovers
+\cref{eq:c10-memoryllm} and $\beta = 1$ a conventional parallel block; only FFN-M can be tabulated,
+and \cref{prop:c10-tol} applies to it unchanged (our NumPy check covered this case as well). The
+paper's exact parameterization may differ.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{Building and using token-wise lookups (our formalization)}\label{alg:c10-tol}
+\begin{algorithmic}[1]
+\Require trained model of the form \eqref{eq:c10-memoryllm} or \eqref{eq:c10-flex}
+\For{$v \in \mathcal{V}$ and $\ell = 1,\dots,L$} \Comment{offline, once}
+  \State $\mathcal{T}[v,\ell] \gets \mathrm{FFN}^{(\ell)}_{(\mathrm{M})}(\RMSNorm(\mathrm{Emb}(v)))$
+\EndFor
+\State store $\mathcal{T}$ in host memory or on flash; optionally cache rows of frequent tokens on the GPU
+\Statex \textit{Inference on tokens $x_{1:T}$:}
+\State prefetch rows $\mathcal{T}[x_t, 1{:}L]$ as soon as $x_t$ is known
+\For{$\ell = 1,\dots,L$}
+  \State $\mX \gets \mX + \mathrm{Attn}^{(\ell)}(\RMSNorm(\mX)) \;[+\, \mathrm{FFN}^{(\ell)}_{\mathrm{C}}(\RMSNorm(\mX))] + \mathcal{T}[x_{1:T}, \ell]$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Precomputation costs $\abs{\mathcal{V}} L$ FFN evaluations, once. At inference the FFN-M FLOPs
+vanish and are replaced by $L d$ numbers of memory traffic per token; attention (and FFN-C) are
+unchanged, so the KV cache and the context-dependent cost are those of the backbone.
+
+\begin{lstlisting}[caption={Reference implementation (ours): a MemoryLLM-style block and the token-wise lookup table.},label={lst:c10-memllm-ref}]
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class SwiGLU(nn.Module):
+    def __init__(self, d, d_ff):
+        super().__init__()
+        self.w1, self.w3 = nn.Linear(d, d_ff, bias=False), nn.Linear(d, d_ff, bias=False)
+        self.w2 = nn.Linear(d_ff, d, bias=False)
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+class MemoryBlock(nn.Module):
+    """x_next = x + Attn(norm(x)) [+ FFN_C(norm(x))] + FFN_M(norm(x0))."""
+    def __init__(self, d, n_heads, d_ff_mem, d_ff_ctx=0):
+        super().__init__()
+        self.n_a, self.n_m = nn.RMSNorm(d), nn.RMSNorm(d)
+        self.attn = nn.MultiheadAttention(d, n_heads, bias=False, batch_first=True)
+        self.ffn_m = SwiGLU(d, d_ff_mem)                       # context-free memory
+        self.ffn_c = SwiGLU(d, d_ff_ctx) if d_ff_ctx else None  # Flex variant
+    def forward(self, x, x0=None, tol_rows=None):
+        T = x.shape[1]
+        causal = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
+        z = self.n_a(x)
+        out = x + self.attn(z, z, z, attn_mask=causal, need_weights=False)[0]
+        if self.ffn_c is not None:
+            out = out + self.ffn_c(z)
+        mem = tol_rows if tol_rows is not None else self.ffn_m(self.n_m(x0))
+        return out + mem
+
+@torch.no_grad()
+def build_tol(blocks, emb):                  # emb: nn.Embedding(|V|, d)
+    e = emb.weight                           # (|V|, d), every token once
+    return torch.stack([b.ffn_m(b.n_m(e)) for b in blocks], dim=1)   # (|V|, L, d)
+
+def forward_with_tol(blocks, emb, tol, ids):
+    x = emb(ids)
+    for l, b in enumerate(blocks):
+        x = b(x, tol_rows=tol[ids, l])       # a gather replaces the FFN-M compute
+    return x
+\end{lstlisting}
+
+\begin{results}
+\textbf{Source files:} survey PDF (no repository exists for this paper). The survey reports no
+numbers; it describes MemoryLLM as weakening the dependence of FFN memory access on the attention
+context and turning part of the Transformer into an explicit storage-and-lookup substrate
+(\S IV-B(e)). The paper's abstract states that the context-free FFNs can be precomputed as
+token-wise lookups that are transferred on demand between VRAM and storage, improving inference
+efficiency, and that Flex-MemoryLLM narrows the performance gap caused by training FFNs on
+context-free token embeddings. See the paper for the numbers.
+\end{results}
+
+\subsection{Discussion}
+
+MemoryLLM is the most radical of the four designs: it does not add a memory to the Transformer,
+it reinterprets an existing component. The survey calls it a bridge between parameter memory and
+retrieval memory --- the knowledge is still in neural parameters, but its access pattern is that of
+a structured lookup table (\S IV-B(e)). Its relation to Engram is instructive. Both make part of
+the network token-indexed, deterministic and offloadable. Engram keys on short $n$-grams, inserts
+memory at a few layers, adds it to a full Transformer and gates it by the hidden state; MemoryLLM
+keys on single tokens, puts a memory in every layer, and replaces the contextual FFN by it, with
+no gate in the base design. A MemoryLLM layer is in this sense a ``unigram Engram without gating''
+--- a comparison that is ours, not the authors'.
+
+The cost of the design is expressiveness: in \cref{eq:c10-memoryllm} the only context-dependent
+nonlinearities are those of attention and normalization, so contextual feature computation that a
+conventional FFN performs must move into attention or into FFN-C. Flex-MemoryLLM exposes this
+trade-off as a single knob. Updates remain offline: changing what a token ``knows'' means editing
+its ToL rows, which is easy mechanically (the rows are addressed by token id) but has no learning
+rule attached.
+
+% =====================================================================================
+\section{Comparison and discussion}\label{sec:c10-comparison}
+
+\Cref{tab:c10-comparison} places the four systems next to the three reference designs of the
+background section. Read it along three questions, followed by a lesson about the code.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Slot and lookup memories compared. $N$: entries; $d$: model width; $k$: entries read; $T$:
+sequence length; $L$: layers. ``Read cost'' is per token and per memory layer.}
+\label{tab:c10-comparison}
+\setlength{\tabcolsep}{3pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{1.85cm}
+  >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X
+  >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X
+  >{\raggedright\arraybackslash}p{2.1cm}@{}}
+\toprule
+System & What is stored & Addressing & Capacity scales with & Update mode & Read cost \\
+\midrule
+kNN-LM & (context vector, next token) pairs from a corpus & nearest neighbours of the final hidden state & corpus size & offline, append/edit without training & ANN search, sublinear in $N$ \\
+PKM & $N$ value vectors, factorized keys & product-key top-$k$ of a query from $\vh_t$ & $N = n^2$ values & offline (gradient, sparse) & $\bigO(\sqrt{N} d_k + k^2 + k d)$ \\
+MoE & $E$ expert MLPs & learned router on $\vh_t$ & number of experts & offline (gradient) & $k$ expert MLPs \\
+\midrule
+LM2 & $N$ slot vectors per sequence (bank) & cross-attention from tokens & $N d$, tied to $N = T$ in code & gated rewrite every forward pass; offline in survey & $\bigO(N d)$ ($\bigO(TNd)$ per layer) \\
+Engram & hashed $n$-gram embeddings & hash of last $\le n_{\max}$ token ids; scalar gate on $\vh_t$ & table rows (billions of parameters), no FLOP increase & offline (gradient; tables sharded) & $(n_{\max}{-}1)K$ row reads $+\,\bigO(R d\, d_{\mathrm{mem}})$ \\
+ExplicitLM & $N$ token sequences (readable ids) & product keys (coarse) + cosine/Gumbel (fine) & $N$ entries; values share the embedding table & offline; repo rewrites entries at inference & $\bigO(\sqrt{N}d_k + k'^2 + c\,\ell_m d)$ \\
+MemoryLLM & FFN outputs per token and layer (ToLs) & token id & $\abs{\mathcal{V}} L d$ table & offline (training + precomputation) & $L d$ memory reads, no FFN FLOPs \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Content addressing versus id addressing.} LM2, ExplicitLM, PKM and MoE address memory
+with a vector computed from the hidden state. That makes the address context-sensitive but serial:
+nothing can be fetched before the layer runs. Engram and MemoryLLM address memory with token ids.
+That makes the address blind to context but \emph{static}, so it can be computed ahead of time,
+prefetched across PCIe, sharded, cached by frequency and moved down the memory hierarchy. Engram
+reintroduces context after the lookup with its gate; MemoryLLM's base design does not, and its
+flexible variant reintroduces context through a separate FFN. Hybrid designs that route between
+memories adaptively are the subject of \cref{ch:routing}.
+
+\paragraph{Where capacity lives and what it costs.} LM2's memory is per-sequence working memory
+whose size is tied to the sequence and whose read is as expensive as attention. The three lookup
+memories put capacity into persistent tables whose size is decoupled from compute: hundreds of
+millions to billions of rows for Engram, a million readable entries for ExplicitLM (with no value
+parameters at all), $\abs{\mathcal{V}} L$ rows for MemoryLLM. Engram's allocation study
+quantifies how such capacity should be traded against MoE capacity under a fixed budget.
+
+\paragraph{Writing and editing.} Only LM2 writes during the forward pass, and its writes are soft,
+dense and opaque. ExplicitLM is the only design whose entries can be read and rewritten by a human;
+its repository even implements inference-time rewriting, at the price of keys that do not follow
+the new content. Engram's and MemoryLLM's memories are fixed after training; they are long-term
+stores, not working memories. None of the four uses the optimization-based writes of the
+test-time-training family (\cref{ch:ttt}), and none addresses the stability--plasticity questions
+that the multi-timescale methods of \cref{ch:multiscale} take up.
+
+\paragraph{Implementation lessons.} Two of the official code bases pool a statistic over the whole
+sequence (LM2's input gate, ExplicitLM's retrieval query), which breaks causality under teacher
+forcing; and the public Engram code is a demonstration that differs from the paper in small but
+real ways (signed square root in the gate, no zero-initialized convolution). Reading the code
+closely is part of understanding these systems. \Cref{ch:synthesis} returns to how slot and lookup
+memories combine with the recurrent and attention memories of the earlier chapters.
+
+\begin{summarybox}
+\begin{itemize}
+  \item Explicit, addressable memory stores knowledge in entries that persist, are individually
+        addressed, and scale in number independently of the hidden size. The address step decides
+        the cost: dense attention $\bigO(Nd)$, product keys $\bigO(\sqrt{N}d + k^2)$ (exact by
+        \cref{prop:c10-pkm}), hashing and token ids $\bigO(1)$.
+  \item FFNs are key--value memories with dense, context-dependent addresses; MoE sparsifies the
+        address of whole functions (conditional computation); hashed tables sparsify the address of
+        stored vectors (conditional memory).
+  \item \textbf{LM2} adds to every decoder layer a bank of slots, read by cross-attention and
+        rewritten by LSTM-style input/forget gates, with gated output into the residual stream; in
+        the code the bank is threaded through the layers and carried across batches.
+  \item \textbf{Engram} retrieves hashed $2$- and $3$-gram embeddings in $\bigO(1)$, gates them with
+        the hidden state and fuses them through a short causal convolution. Under fixed parameters
+        and FLOPs, splitting the sparse budget between MoE and Engram beats pure MoE (U-shaped
+        allocation curve), and deterministic addresses allow tables in host memory with small
+        throughput loss.
+  \item \textbf{ExplicitLM} keeps a million human-readable token sequences, finds candidates with
+        product keys and selects one with a straight-through Gumbel-Softmax; its entries can be
+        inspected and rewritten.
+  \item \textbf{MemoryLLM} feeds FFNs with token embeddings only, so their outputs become
+        token-wise lookup tables that can be precomputed and offloaded; Flex-MemoryLLM keeps a small
+        contextual FFN.
+  \item Pitfall: any gate or query pooled over the whole sequence breaks causality in
+        autoregressive training.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Product keys with short lists]\label{exr:c10-pkm}
+(a) Extend \cref{prop:c10-pkm} to scores with ties: show that \emph{some} global top-$k$ set lies
+in $\mathcal{I}_1 \times \mathcal{I}_2$ when ties are broken consistently. (b) Find the smallest
+example ($n = 2$, $k = 2$, shortlist $k' = 1$) in which the shortlist misses a global top-$k$ pair,
+for instance $\va = (1, 0)$, $\vb = (1, 0.9)$. (c) Write the cost of a two-level ``product of
+three'' key (three sub-key sets of size $N^{1/3}$) and explain why the candidate merge becomes the
+bottleneck.
+\end{exercise}
+
+\begin{exercise}[Collisions under multi-head hashing]\label{exr:c10-hash}
+Assume a random-function model for $K$ independent heads, each with $P$ rows, and $U$ distinct
+$n$-grams. (a) Show that the expected fraction of $n$-grams sharing their row in a given head is
+$1 - (1-1/P)^{U-1}$, and evaluate it for $U/P = 4$. (b) Show that the probability that a fixed
+$n$-gram has the \emph{same partner} in all $K$ heads is at most $(U-1)/P^K$. (c) Now use
+\cref{prop:c10-crt} to explain why, for Engram's deterministic hash with distinct primes whose
+product exceeds $2^{63}$, the answer to (b) is governed by collisions of the 63-bit mixed value and
+not by $P^K$.
+\end{exercise}
+
+\begin{exercise}[A causal LM2]\label{exr:c10-lm2}
+(a) Take $T = N = d = 1$ and write the code's gate (mean over positions of $\ReLU(w e_t)$, here of a
+two-token sequence) explicitly; show that the output at position 1 depends on the token at
+position 2. (b) Modify \cref{lst:c10-lm2-ref} so that the bank written during segment $s$ is read
+only by segment $s+1$ (segment-level recurrence) and prove the result is causal for any $N$ (no
+longer tied to $T$). (c) Give the time per generated token and the state size of your design in
+decoding.
+\end{exercise}
+
+\begin{exercise}[Gumbel maxima]\label{exr:c10-gumbel}
+(a) Show that $\max_i (u_i + G_i)$, with $G_i$ i.i.d.\ standard Gumbel, is Gumbel-distributed with
+location $\log\sum_i e^{u_i}$. (b) Deduce $\E[\max_i(u_i + G_i)] = \log\sum_i e^{u_i} + \gamma_{\mathrm{E}}$,
+where $\gamma_{\mathrm{E}} \approx 0.5772$ is the Euler--Mascheroni constant (the mean of a standard
+Gumbel). (c) Check both statements by simulation in NumPy, and explain why
+\cref{lst:c10-explicit-ref} clamps the uniform sample before taking logarithms.
+\end{exercise}
+
+\begin{exercise}[Engram's sparsity budget]\label{exr:c10-alloc}
+Use the numbers of \repofile{repos/deepseek-ai__Engram/Engram_paper.pdf} (Section~4.1 and Table~1):
+MoE-27B has 72 routed experts (top-6) and 2 shared experts; Engram-27B has 55 routed experts and a
+5.7B-parameter Engram at $\rho = 74.3\%$; both have the same $P_{\mathrm{tot}}$ and
+$P_{\mathrm{act}}$. (a) From \cref{eq:c10-rho} compute $P_{\mathrm{sparse}}$ and the parameter
+count of one routed expert summed over all MoE layers. (b) Check that removing 17 experts frees about
+5.7B parameters, and that the inactive experts of MoE-27B account for $P_{\mathrm{sparse}}$.
+(c) Estimate the per-token FLOPs of the two Engram layers from the configuration in Appendix~A and
+compare them with $2 P_{\mathrm{act}}$.
+\end{exercise}
+
+\begin{exercise}[Token-wise lookups in practice]\label{exr:c10-tol}
+For a MemoryLLM-style model with $\abs{\mathcal{V}} = 151{,}936$, $L = 36$, $d = 2560$ and SwiGLU
+FFNs with $d_{\mathrm{ff}} = 9728$: (a) compute the ToL size in bytes at 16-bit precision and compare
+it with the FFN parameter count; (b) compute the bytes fetched per token and the PCIe bandwidth
+needed at 50 tokens per second without caching; (c) assuming token frequencies follow a Zipf law
+with exponent 1, estimate what fraction of fetches a GPU cache of the 10{,}000 most frequent tokens
+absorbs; (d) implement \cref{lst:c10-memllm-ref} and verify \cref{prop:c10-tol} numerically,
+including the Flex variant.
+\end{exercise}

@@ -1,3 +1,1909 @@
 \chapter{Probabilistic and Objective-Shaped Memory: Kalman Attention, Gated KalmaNet, Next-Latent Prediction}\label{ch:probabilistic}
+\chaptermark{Probabilistic and Objective-Shaped Memory}% short running header
 
-(Chapter in preparation.)
+Every recurrent memory in the previous chapters answers the same question. A stream of
+key--value pairs $(\vk_1,\vv_1),(\vk_2,\vv_2),\dots$ arrives; which single matrix
+$\mS_t \in \R^{d_v \times d_k}$ should the layer keep so that $\mS_t\vq$ answers later queries?
+Linear attention (\cref{ch:linear}) adds outer products. The delta rule (\cref{ch:delta}) takes
+one gradient step on the squared error $\tfrac12\norm{\mS\vk_t-\vv_t}^2$ of the newest pair.
+Both are \emph{heuristic estimators}: they move the memory toward something, but nobody asked
+what the best memory would be given everything seen so far, or how sure the memory is of what it
+stores.
+
+This chapter takes the question literally and treats memory as \emph{estimation}. Two
+consequences follow. First, the best estimate of $\mS$ given all past pairs is a classical object
+(the recursive-least-squares solution, or the posterior mean of a Kalman filter), and it can be
+computed exactly or to any accuracy we like, instead of being approximated by one gradient step.
+Second, an estimator knows how uncertain it is, and that uncertainty can decide how strongly new
+evidence is written. We study three 2026 systems that use these ideas in different ways.
+\emph{Kalman Linear Attention} (KLA, \citet{shaj2026kalman}; in this chapter KLA always means
+the Kalman layer, not the Kaczmarz layer of \cref{ch:delta}) runs an exact Kalman filter inside
+every state cell and shows that, written in information form, the filter becomes a parallel
+scan. \emph{Gated KalmaNet} (GKA, \citet{peng2026gka}) makes the state the solution of a ridge
+regression over the gated, fading past and solves it at every token with Chebyshev iteration.
+\emph{Next-Latent Prediction} (NextLat, \citet{teoh2026nextlat}) changes no write rule at all: it
+adds a training objective that makes a Transformer's own hidden states behave like the belief
+state of a filter, so the memory is shaped offline by the loss.
+
+\Cref{sec:c08-background} builds the estimation toolkit from scratch: Gaussian conditioning, the
+Kalman filter and its information form, associative scans, recursive least squares and its link
+to the delta rule, ridge regression with forgetting, iterative linear solvers and belief states.
+\Cref{sec:c08-kla,sec:c08-gka,sec:c08-nextlat} treat the three systems.
+\Cref{sec:c08-comparison} compares them and \cref{sec:c08-estimation} closes with the unifying
+``memory as estimation'' view, in which the delta rule, RLS, the Kalman filter and GKA are points
+on one line from a single first-order step to an exact second-order solve.
+
+% ===========================================================================================
+\section{Background: memory as estimation}\label{sec:c08-background}
+
+\subsection{Recap: linear attention and the delta rule}\label{sec:c08-recap}
+
+We use the notation of \cref{ch:linear,ch:delta}. A head receives per-token keys
+$\vk_t\in\R^{d_k}$, values $\vv_t\in\R^{d_v}$ and queries $\vq_t\in\R^{d_k}$, keeps a matrix state
+$\mS_t\in\R^{d_v\times d_k}$ and reads $\vo_t=\mS_t\vq_t$. Linear attention writes
+\begin{equation}\label{eq:c08-la}
+  \mS_t = \mS_{t-1} + \vv_t\vk_t\T ,
+\end{equation}
+and gated linear attention (GLA, \citet{yang2024gla}) multiplies the old state by a decay first,
+$\mS_t = \alpha_t\mS_{t-1}+\vv_t\vk_t\T$. The delta rule \citep{c02-schlag2021linear,yang2025gdn}
+writes
+\begin{equation}\label{eq:c08-delta}
+  \mS_t = \mS_{t-1} - \beta_t(\mS_{t-1}\vk_t-\vv_t)\vk_t\T
+        = \mS_{t-1}(\mI-\beta_t\vk_t\vk_t\T)+\beta_t\vv_t\vk_t\T .
+\end{equation}
+The gradient of $\ell_t(\mS)=\tfrac12\norm{\mS\vk_t-\vv_t}^2$ with respect to $\mS$ is
+$(\mS\vk_t-\vv_t)\vk_t\T$, so \eqref{eq:c08-delta} is exactly one gradient-descent step with
+learning rate $\beta_t$ on the loss of the newest pair, started from $\mS_{t-1}$. Linear attention
+\eqref{eq:c08-la} is likewise one unit step on the ``correlation'' loss $-\inner{\mS\vk_t}{\vv_t}$,
+whose gradient is $-\vv_t\vk_t\T$.
+
+The regression problem a key--value memory is really trying to solve involves \emph{all} pairs:
+\begin{equation}\label{eq:c08-ls}
+  \loss_t(\mS) = \frac12\sum_{i=1}^{t}\norm{\mS\vk_i-\vv_i}^2 + \frac{\lambda}{2}\norm{\mS}_F^2 .
+\end{equation}
+One gradient step on the newest term $\ell_t$ does not minimize $\loss_t$; it can even undo what
+earlier steps stored. The rest of this section builds the tools to minimize \eqref{eq:c08-ls}
+exactly, recursively and in parallel, and to reason about uncertainty while doing so.
+
+\subsection{Two Gaussian facts}\label{sec:c08-gauss}
+
+A Gaussian $\vz\sim\mathcal{N}(\vm,\mP)$ in $\R^n$ has density proportional to
+$\exp\bigl(-\tfrac12(\vz-\vm)\T\mP^{-1}(\vz-\vm)\bigr)$. The inverse covariance
+$\mLambda=\mP^{-1}$ is the \emph{precision}. Two facts carry the whole chapter.
+
+\paragraph{Fact 1 (linear maps).} If $\vz\sim\mathcal{N}(\vm,\mP)$ and $\vw\sim\mathcal{N}(\bm{0},
+\mSigma_w)$ is independent of $\vz$, then $\mA\vz+\vw\sim\mathcal{N}(\mA\vm,\mA\mP\mA\T+\mSigma_w)$.
+The mean follows from linearity of expectation; the covariance from
+$\E[(\mA(\vz-\vm)+\vw)(\mA(\vz-\vm)+\vw)\T]=\mA\mP\mA\T+\mSigma_w$, the cross terms vanishing by
+independence. A linear function of jointly Gaussian variables is Gaussian.
+
+\paragraph{Fact 2 (conditioning).} Let the prior be $\vz\sim\mathcal{N}(\vm^-,\mP^-)$ and let the
+observation be $\vy=\mC\vz+\ve$ with $\ve\sim\mathcal{N}(\bm{0},\mSigma_e)$. By Bayes' rule the
+log-posterior is, up to a constant,
+\begin{align*}
+  \log p(\vz\mid\vy) &= -\tfrac12(\vz-\vm^-)\T(\mP^-)^{-1}(\vz-\vm^-)
+                         -\tfrac12(\vy-\mC\vz)\T\mSigma_e^{-1}(\vy-\mC\vz) \\
+  &= -\tfrac12\vz\T\Bigl[(\mP^-)^{-1}+\mC\T\mSigma_e^{-1}\mC\Bigr]\vz
+     + \vz\T\Bigl[(\mP^-)^{-1}\vm^-+\mC\T\mSigma_e^{-1}\vy\Bigr] + \text{const}.
+\end{align*}
+A log-density that is quadratic in $\vz$ belongs to a Gaussian, and comparing with
+$-\tfrac12\vz\T\mP^{-1}\vz+\vz\T\mP^{-1}\vm$ (the expansion of the Gaussian exponent) gives the
+posterior $\mathcal{N}(\vm,\mP)$ with
+\begin{equation}\label{eq:c08-cond-info}
+  \mP^{-1} = (\mP^-)^{-1} + \mC\T\mSigma_e^{-1}\mC, \qquad
+  \mP^{-1}\vm = (\mP^-)^{-1}\vm^- + \mC\T\mSigma_e^{-1}\vy .
+\end{equation}
+Notice what happened: \emph{precisions add}, and so do the vectors $\mP^{-1}\vm$. We will exploit
+this additivity repeatedly.
+
+\subsection{Linear-Gaussian state-space models and the Kalman filter}\label{sec:c08-kf}
+
+A linear-Gaussian state-space model has a hidden state $\vz_t\in\R^n$ and observations
+$\vy_t$:
+\begin{equation}\label{eq:c08-lgssm}
+  \vz_t = \mA\vz_{t-1}+\vw_t,\quad \vw_t\sim\mathcal{N}(\bm{0},\mSigma_w);\qquad
+  \vy_t = \mC_t\vz_t+\ve_t,\quad \ve_t\sim\mathcal{N}(\bm{0},\mSigma_{e,t}),
+\end{equation}
+with $\vz_0\sim\mathcal{N}(\vm_0,\mP_0)$ and all noises independent. $\mA$ is the transition,
+$\mSigma_w$ the \emph{process noise} (how much the state drifts per step) and $\mSigma_{e,t}$ the
+\emph{observation noise} (how unreliable each measurement is). The \emph{filtering} problem asks
+for $p(\vz_t\mid\vy_{1:t})$. Because $\vz_t$ is Markov and $\vy_t$ depends only on $\vz_t$, the
+filtering distribution obeys a two-step recursion: \emph{predict}
+$p(\vz_t\mid\vy_{1:t-1})=\int p(\vz_t\mid\vz_{t-1})\,p(\vz_{t-1}\mid\vy_{1:t-1})\,d\vz_{t-1}$, then
+\emph{update} $p(\vz_t\mid\vy_{1:t})\propto p(\vy_t\mid\vz_t)\,p(\vz_t\mid\vy_{1:t-1})$. If the
+filtering distribution at $t-1$ is Gaussian, Fact 1 makes the prediction Gaussian and Fact 2 makes
+the update Gaussian, so by induction everything stays Gaussian and we only need to track a mean
+and a covariance. This recursion is the Kalman filter \citep{c08-kalman1960,c08-sarkka2013bayesian}.
+
+\paragraph{Predict.} By Fact 1, with $\vm_t^-$, $\mP_t^-$ the predicted (prior) moments,
+\begin{equation}\label{eq:c08-kf-predict}
+  \vm_t^- = \mA\vm_{t-1}, \qquad \mP_t^- = \mA\mP_{t-1}\mA\T+\mSigma_w .
+\end{equation}
+
+\paragraph{Update.} Fact 2 gives the update in the precision form \eqref{eq:c08-cond-info}. The
+textbook \emph{covariance form} avoids inverting state-sized $n\times n$ matrices; it inverts only
+an observation-sized one. Define the innovation
+$\vy_t-\mC_t\vm_t^-$, its covariance $\bm{E}_t=\mC_t\mP_t^-\mC_t\T+\mSigma_{e,t}$ and the
+\emph{Kalman gain} (we write $\mG$ because $\mK$ already denotes stacked keys)
+\begin{equation}\label{eq:c08-gain}
+  \mG_t = \mP_t^-\mC_t\T\bm{E}_t^{-1}.
+\end{equation}
+Then
+\begin{equation}\label{eq:c08-kf-update}
+  \vm_t = \vm_t^- + \mG_t(\vy_t-\mC_t\vm_t^-), \qquad \mP_t = (\mI-\mG_t\mC_t)\mP_t^- .
+\end{equation}
+\emph{Derivation from \eqref{eq:c08-cond-info}.} The Woodbury identity
+$(\mP_-^{-1}+\mC\T\mSigma_e^{-1}\mC)^{-1}=\mP^- -\mP^-\mC\T(\mC\mP^-\mC\T+\mSigma_e)^{-1}\mC\mP^-$
+(verify by multiplying out; we write $\mP_-^{-1}$ for $(\mP^-)^{-1}$) gives $\mP=\mP^- - \mG\mC\mP^-$, the covariance update. For the mean
+we first show the \emph{gain identity} $\mP\mC\T\mSigma_e^{-1}=\mG$:
+\[
+  \mP\mC\T\mSigma_e^{-1}
+  = \mP^-\mC\T\bigl(\mI-\bm{E}^{-1}\mC\mP^-\mC\T\bigr)\mSigma_e^{-1}
+  = \mP^-\mC\T\bm{E}^{-1}\bigl(\bm{E}-\mC\mP^-\mC\T\bigr)\mSigma_e^{-1}
+  = \mP^-\mC\T\bm{E}^{-1} .
+\]
+Multiplying the second equation of \eqref{eq:c08-cond-info} by $\mP$ and using
+$\mP\mP_-^{-1}=\mI-\mP\mC\T\mSigma_e^{-1}\mC$ (rearrange the first equation) gives
+$\vm=\vm^-+\mP\mC\T\mSigma_e^{-1}(\vy-\mC\vm^-)=\vm^-+\mG(\vy-\mC\vm^-)$.
+
+\paragraph{What the gain means.} Take a scalar state with $a=1$, no process noise, $c=1$ and
+observation variance $\sigma^2$. The gain is $G_t=P_t^-/(P_t^-+\sigma^2)$: if the memory is very
+uncertain ($P^-\gg\sigma^2$) it copies the observation; if it is very sure ($P^-\ll\sigma^2$) it
+barely moves. With $P_0=\sigma^2=1$ the recursion gives $P_t=1/(t+1)$ and $G_t=1/(t+1)$, so
+$m_t=\frac{1}{t+1}\sum_{i\le t}y_i$: the filter computes a running mean whose \emph{learning rate
+decays as evidence accumulates}. A delta rule with fixed $\beta$ would instead keep forgetting old
+observations at a constant rate. This contrast, an adaptive, uncertainty-driven step size versus a
+fixed one, is the theme of the chapter.
+
+\subsection{The information form}\label{sec:c08-info}
+
+Write the filter in terms of the precision $\mLambda_t=\mP_t^{-1}$ and the \emph{information
+vector} $\vu_t=\mLambda_t\vm_t$. By \eqref{eq:c08-cond-info} the update becomes
+\begin{equation}\label{eq:c08-info-update}
+  \mLambda_t = \mLambda_t^- + \mC_t\T\mSigma_{e,t}^{-1}\mC_t,\qquad
+  \vu_t = \vu_t^- + \mC_t\T\mSigma_{e,t}^{-1}\vy_t .
+\end{equation}
+Each observation contributes a fixed packet of information, a matrix and a vector that depend only
+on that observation, and the packets simply \emph{add}. The price is paid in the predict step,
+which in information form reads
+\begin{equation}\label{eq:c08-info-predict}
+  \mLambda_t^- = \bigl(\mA\mLambda_{t-1}^{-1}\mA\T+\mSigma_w\bigr)^{-1},\qquad
+  \vu_t^- = \mLambda_t^-\mA\mLambda_{t-1}^{-1}\vu_{t-1} .
+\end{equation}
+The covariance and information forms are dual: one has an easy predict and a hard update, the
+other the reverse. Two special cases matter for this chapter.
+\begin{itemize}
+  \item \textbf{No process noise} ($\mSigma_w=\bm{0}$, $\mA$ invertible). Then
+  $\mLambda_t^-=\mA^{-\top}\mLambda_{t-1}\mA^{-1}$ and $\vu_t^-=\mA^{-\top}\vu_{t-1}$, both linear.
+  With a static state ($\mA=\mI$) the precision is just a running sum of information packets,
+  exactly like the linear-attention state \eqref{eq:c08-la}.
+  \item \textbf{Scalar state with process noise.} With $\mA=a$, $\mSigma_w=p$ and precision
+  $\Lambda$, \eqref{eq:c08-info-predict} becomes
+  $\Lambda_t^-=\bigl(a^2/\Lambda_{t-1}+p\bigr)^{-1}=\Lambda_{t-1}/(a^2+p\Lambda_{t-1})$, a
+  \emph{linear-fractional} (M\"obius) function of $\Lambda_{t-1}$. It is not linear, but, as we
+  show next, linear-fractional maps compose as easily as linear ones.
+\end{itemize}
+Why does additivity matter? A recurrence whose step is ``apply a fixed map, then add a fixed
+term'' can be evaluated for all $t$ at once with a parallel scan, which is how linear attention is
+trained (\cref{ch:linear}). The covariance-form gain \eqref{eq:c08-gain} hides this structure
+behind a matrix inverse that depends on the running state.
+
+\subsection{Associative scans}\label{sec:c08-scan}
+
+Given elements $e_1,\dots,e_T$ and an associative operation $\oplus$, the \emph{inclusive scan}
+returns all prefixes $s_t=e_1\oplus e_2\oplus\dots\oplus e_t$. Associativity lets us bracket the
+products as a balanced tree, so all prefixes can be computed in $\bigO(\log T)$ parallel steps.
+The Hillis--Steele scheme \citep{c08-hillis1986data} does $\bigO(T\log T)$ work: at round
+$r=0,1,\dots$ every position $t$ with $t>2^r$ combines its value with the value $2^r$ positions to
+its left. The Blelloch scheme \citep{c03-blelloch1990prefix} does $\bigO(T)$ work with an up-sweep and
+a down-sweep. Both need only the combine rule. Two combine rules appear in this chapter.
+
+\paragraph{Affine maps.} The recurrence $z_t=a_tz_{t-1}+b_t$ applies the map
+$f_t(z)=a_tz+b_t$. Composition of affine maps is affine:
+\[
+  f_2\circ f_1(z) = a_2(a_1z+b_1)+b_2 = (a_2a_1)z+(a_2b_1+b_2),
+\]
+so the pairs combine as $(a_1,b_1)\oplus(a_2,b_2)=(a_2a_1,\;a_2b_1+b_2)$, and $z_t$ is the second
+component of the prefix applied to $z_0=0$. Gated linear attention is this recurrence with
+matrix-valued $b_t=\vv_t\vk_t\T$.
+
+\paragraph{M\"obius maps.} A map $g(\lambda)=(A\lambda+B)/(C\lambda+D)$ is identified with the
+matrix $\left[\begin{smallmatrix}A&B\\C&D\end{smallmatrix}\right]$. Substituting one into another,
+\[
+  g_2(g_1(\lambda)) = \frac{A_2\frac{A_1\lambda+B_1}{C_1\lambda+D_1}+B_2}
+                           {C_2\frac{A_1\lambda+B_1}{C_1\lambda+D_1}+D_2}
+  = \frac{(A_2A_1+B_2C_1)\lambda+(A_2B_1+B_2D_1)}{(C_2A_1+D_2C_1)\lambda+(C_2B_1+D_2D_1)} ,
+\]
+whose coefficients are exactly the entries of the matrix product
+$\left[\begin{smallmatrix}A_2&B_2\\C_2&D_2\end{smallmatrix}\right]
+\left[\begin{smallmatrix}A_1&B_1\\C_1&D_1\end{smallmatrix}\right]$. Matrix multiplication is
+associative, so M\"obius recurrences are scans over $2\times2$ matrices. Multiplying a matrix by
+any nonzero scalar does not change the map (numerator and denominator scale together), a freedom
+we will use for numerical stability. \Citet{c08-sarkka2021temporal} used scans of this kind to
+parallelize general Bayesian filters and smoothers over time; KLA brings the idea into a
+language-model layer.
+
+\subsection{Recursive least squares}\label{sec:c08-rls}
+
+Minimize the ridge objective \eqref{eq:c08-ls}. Setting its gradient
+$\sum_i(\mS\vk_i-\vv_i)\vk_i\T+\lambda\mS$ to zero gives
+\begin{equation}\label{eq:c08-ridge}
+  \mS_t = \mU_t(\mH_t+\lambda\mI)^{-1},\qquad
+  \mH_t=\sum_{i\le t}\vk_i\vk_i\T,\quad \mU_t=\sum_{i\le t}\vv_i\vk_i\T .
+\end{equation}
+$\mH_t$ is the (uncentred) key covariance and $\mU_t$ is precisely the linear-attention state
+\eqref{eq:c08-la}. Solving \eqref{eq:c08-ridge} from scratch costs $\bigO(d_k^3)$ per token.
+\emph{Recursive least squares} (RLS) instead propagates $\mP_t=(\mH_t+\lambda\mI)^{-1}$. Since
+$\mP_t^{-1}=\mP_{t-1}^{-1}+\vk_t\vk_t\T$ is a rank-one change, the Sherman--Morrison formula gives
+\begin{equation}\label{eq:c08-rls-P}
+  \mP_t = \mP_{t-1}-\frac{\mP_{t-1}\vk_t\vk_t\T\mP_{t-1}}{1+\vk_t\T\mP_{t-1}\vk_t},
+\end{equation}
+which costs $\bigO(d_k^2)$. For the state, write $\mU_{t-1}=\mS_{t-1}\mP_{t-1}^{-1}=
+\mS_{t-1}(\mP_t^{-1}-\vk_t\vk_t\T)$, so
+\begin{equation}\label{eq:c08-rls-S}
+  \mS_t = (\mU_{t-1}+\vv_t\vk_t\T)\mP_t
+        = \mS_{t-1} + (\vv_t-\mS_{t-1}\vk_t)\,\vk_t\T\mP_t .
+\end{equation}
+
+\paragraph{RLS is a Kalman filter.} Treat each row $\vs_j\T$ of $\mS$ as a state vector that never
+changes ($\mA=\mI$, $\mSigma_w=\bm{0}$), give it the prior $\mathcal{N}(\bm{0},\lambda^{-1}\mI)$, and
+observe $v_t[j]=\vk_t\T\vs_j+e$ with unit noise. The information form
+\eqref{eq:c08-info-update} gives $\mLambda_t=\lambda\mI+\sum_i\vk_i\vk_i\T=\mH_t+\lambda\mI$ and,
+stacking the rows, the information matrix $\mU_t$; the posterior mean is
+$\mU_t\mLambda_t^{-1}$, which is \eqref{eq:c08-ridge}. The Kalman gain for this model is
+$\mP_t^-\vk_t/(\vk_t\T\mP_t^-\vk_t+1)=\mP_t\vk_t$ (the gain identity), and \eqref{eq:c08-kf-update}
+reproduces \eqref{eq:c08-rls-S}. So the ridge memory, the RLS memory and the posterior mean of a
+static Kalman filter are the same object.
+
+\paragraph{RLS is a Newton step.} The Hessian of $\loss_t$ in \eqref{eq:c08-ls} (acting on rows of
+$\mS$) is $\mH_t+\lambda\mI=\mP_t^{-1}$. Since $\mS_{t-1}$ minimizes $\loss_{t-1}$, the gradient of
+$\loss_t=\loss_{t-1}+\ell_t$ at $\mS_{t-1}$ is just $\nabla\ell_t(\mS_{t-1})=(\mS_{t-1}\vk_t-\vv_t)
+\vk_t\T$. A Newton step from $\mS_{t-1}$ is therefore
+$\mS_{t-1}-(\mS_{t-1}\vk_t-\vv_t)\vk_t\T\mP_t$, which is \eqref{eq:c08-rls-S}; because $\loss_t$ is
+quadratic, one Newton step lands exactly on its minimizer.
+
+\begin{keyidea}[title={Key idea: the delta rule is RLS with an identity covariance}]
+Compare the RLS update \eqref{eq:c08-rls-S} with the delta rule \eqref{eq:c08-delta}:
+\[
+  \text{RLS: }\ \mS_t=\mS_{t-1}+(\vv_t-\mS_{t-1}\vk_t)\vk_t\T\,\mP_t, \qquad
+  \text{delta: }\ \mS_t=\mS_{t-1}+(\vv_t-\mS_{t-1}\vk_t)\vk_t\T\,\beta_t\mI .
+\]
+The delta rule is RLS in which the inverse Hessian $\mP_t$ (the posterior covariance) is replaced
+by the isotropic, constant $\beta_t\mI$. RLS gives each key direction its own learning rate:
+directions seen often have small posterior variance and are updated gently; rare directions are
+updated strongly. The delta rule forgets this bookkeeping and pays for it with interference.
+\end{keyidea}
+
+\subsection{Ridge regression with exponential forgetting}\label{sec:c08-ewridge}
+
+A memory for language must forget. Weight pair $i$ at time $t$ by $w_{t,i}=\prod_{j=i+1}^{t}
+\alpha_j$ with gates $\alpha_j\in(0,1]$ (a constant $\gamma$ gives $w_{t,i}=\gamma^{t-i}$):
+\begin{equation}\label{eq:c08-ewls}
+  \loss_t(\mS)=\frac12\sum_{i\le t}w_{t,i}\norm{\mS\vk_i-\vv_i}^2+\frac{\lambda}{2}\norm{\mS}_F^2 ,
+  \qquad
+  \mS_t=\mU_t(\mH_t+\lambda\mI)^{-1},
+\end{equation}
+where now $\mH_t=\alpha_t\mH_{t-1}+\vk_t\vk_t\T$ and $\mU_t=\alpha_t\mU_{t-1}+\vv_t\vk_t\T$. Both
+are gated-linear-attention states: $\mU_t$ with values $\vv$, $\mH_t$ with values $\vk$. A ridge
+memory is therefore ``two GLA memories plus a linear solve at read time''.
+
+There are two ways to place the regularizer. Classical RLS with a forgetting factor $\gamma$ decays
+the prior together with the data, which keeps the rank-one recursion
+\eqref{eq:c08-rls-P} (use $\mP_{t-1}/\gamma$ in place of $\mP_{t-1}$) but makes the effective
+regularizer $\lambda\gamma^t$ vanish. When keys stop exciting some direction, $\mH_t$ loses rank
+in that direction and $\mP_t$ grows without bound, a failure known as covariance wind-up. Keeping
+$\lambda$ fixed, as in \eqref{eq:c08-ewls}, prevents this, but then
+$\mP_t^{-1}=\alpha_t\mP_{t-1}^{-1}+\vk_t\vk_t\T+(1-\alpha_t)\lambda\mI$ is no longer a rank-one
+update and Sherman--Morrison no longer applies. This is one reason Gated KalmaNet solves the linear
+system iteratively instead of propagating $\mP_t$.
+
+\subsection{Iterative solvers: gradient descent, Chebyshev, conjugate gradient}\label{sec:c08-solvers}
+
+We need to solve $\mA\vx=\vb$ with $\mA$ symmetric positive definite and eigenvalues in a known
+interval $[\mu_{\min},\mu_{\max}]$; $\kappa=\mu_{\max}/\mu_{\min}$ is the condition number.
+
+\paragraph{Gradient descent (Richardson iteration).} $\vx_{n+1}=\vx_n-\tau(\mA\vx_n-\vb)$ is
+gradient descent on $\tfrac12\vx\T\mA\vx-\vb\T\vx$. The error $\ve_n=\vx_n-\vx^\star$ obeys
+$\ve_{n+1}=(\mI-\tau\mA)\ve_n$, so each eigencomponent is multiplied by $1-\tau\mu$. The step
+$\tau=2/(\mu_{\min}+\mu_{\max})$ balances the two ends of the spectrum and gives the contraction
+factor $\rho=(\mu_{\max}-\mu_{\min})/(\mu_{\max}+\mu_{\min})=(\kappa-1)/(\kappa+1)$; reaching
+relative error $\epsilon$ takes about $\tfrac{\kappa}{2}\ln(1/\epsilon)$ iterations.
+
+\paragraph{The polynomial view.} Any method whose iterate $\vx_n$ lies in
+$\mathrm{span}\{\vb,\mA\vb,\dots,\mA^{n-1}\vb\}$ (started at $\vx_0=\bm{0}$) has error
+$\ve_n=p_n(\mA)\ve_0$ for a polynomial $p_n$ of degree $n$ with $p_n(0)=1$. Richardson uses
+$p_n(\mu)=(1-\tau\mu)^n$. The best worst-case choice minimizes $\max_{\mu\in[\mu_{\min},\mu_{\max}]}
+\abs{p_n(\mu)}$, and the answer is a rescaled Chebyshev polynomial. The Chebyshev polynomials are
+defined by $T_0(\xi)=1$, $T_1(\xi)=\xi$ and
+\begin{equation}\label{eq:c08-cheb-rec}
+  T_{n+1}(\xi)=2\xi T_n(\xi)-T_{n-1}(\xi);
+\end{equation}
+they satisfy $\abs{T_n(\xi)}\le1$ on $[-1,1]$ and grow as fast as possible outside it, with
+$T_n(\xi)=\tfrac12\bigl[(\xi+\sqrt{\xi^2-1})^n+(\xi-\sqrt{\xi^2-1})^n\bigr]$ for $\xi\ge1$. Map the
+spectrum to $[-1,1]$ with $\xi(\mu)=(1-\tau\mu)/\rho$ and set
+\begin{equation}\label{eq:c08-cheb-poly}
+  p_n(\mu)=\frac{T_n(\xi(\mu))}{T_n(1/\rho)},\qquad\text{so}\qquad
+  \max_{\mu}\abs{p_n(\mu)}=\frac{1}{T_n(1/\rho)}\le 2\sigma^n,\quad
+  \sigma=\frac{\sqrt\kappa-1}{\sqrt\kappa+1}.
+\end{equation}
+The bound follows from $T_n(1/\rho)\ge\tfrac12(1/\rho+\sqrt{1/\rho^2-1})^n$ and, with
+$1/\rho=(\kappa+1)/(\kappa-1)$, from
+$1/\rho+\sqrt{1/\rho^2-1}=(\kappa+1+2\sqrt\kappa)/(\kappa-1)=(\sqrt\kappa+1)/(\sqrt\kappa-1)=1/\sigma$.
+Chebyshev needs about $\tfrac{\sqrt\kappa}{2}\ln(2/\epsilon)$ iterations: the square root of what
+gradient descent needs.
+
+\paragraph{The three-term recurrence.} We never form $p_n$. Let $c_n=T_n(1/\rho)$ and substitute
+$\xi=(1-\tau\mu)/\rho$ into \eqref{eq:c08-cheb-rec}: $c_{n+1}p_{n+1}=\tfrac{2}{\rho}(1-\tau\mu)c_np_n
+-c_{n-1}p_{n-1}$. Dividing by $c_{n+1}$ and defining $\omega_{n+1}=2c_n/(\rho c_{n+1})$, the
+recurrence $c_{n+1}=\tfrac2\rho c_n-c_{n-1}$ gives $c_{n-1}/c_{n+1}=\omega_{n+1}-1$ and
+\[
+  \frac{1}{\omega_{n+1}}=\frac{\rho c_{n+1}}{2c_n}=1-\frac{\rho c_{n-1}}{2c_n}
+  =1-\frac{\rho^2}{4}\,\omega_n .
+\]
+Hence $p_{n+1}=\omega_{n+1}(1-\tau\mu)p_n+(1-\omega_{n+1})p_{n-1}$, which, applied to the error,
+is the iteration \citep{c08-golub1961chebyshev}
+\begin{equation}\label{eq:c08-cheb-iter}
+  \vx_{n+1}=\omega_{n+1}\bigl(\vx_n-\tau(\mA\vx_n-\vb)\bigr)+(1-\omega_{n+1})\vx_{n-1},\qquad
+  \omega_{n+1}=\Bigl(1-\tfrac{\rho^2}{4}\omega_n\Bigr)^{-1},
+\end{equation}
+started from $\vx_0=\bm{0}$, $\vx_1=\tau\vb$ (one Richardson step, $p_1(\mu)=1-\tau\mu$) and
+$\omega_1=2c_0/(\rho c_1)=2$. Each iteration costs one matrix--vector product, like gradient
+descent; the weights $\omega_n$ depend only on the interval, never on the data.
+
+\paragraph{Conjugate gradient.} CG \citep{c08-hestenes1952cg} picks the best polynomial for the
+actual spectrum (it minimizes the $\mA$-norm error over the same Krylov space), so it satisfies the
+same $2\sigma^n$ bound (in the $\mA$-norm) and is often much faster. But its step sizes are ratios of inner products of
+computed residuals. That has three costs on accelerators: two global reductions per iteration;
+coefficients that drift when residuals lose orthogonality in low precision; and an output that is a
+\emph{nonlinear} function of $\vb$. Chebyshev's output $\vx_n=q_n(\mA)\vb$ is a fixed polynomial
+in $\mA$ applied to $\vb$: linear in $\vb$, with a symmetric Jacobian $q_n(\mA)$, so its backward
+pass is the same solver applied to the incoming gradient. GKA exploits exactly this.
+
+\begin{example}[Solver race]\label{ex:c08-race}
+In our NumPy check we built $\mH$ as a decayed sum of 500 unit-norm keys in $d=64$ dimensions and
+solved $(\mH+\lambda\mI)\vx=\vq$ with $\lambda=0.02\norm{\mH}_F$ (the GKA recipe of
+\cref{sec:c08-gka}); the true condition number was 33.7. After 30 iterations the relative error was
+$1.1\times10^{-1}$ for optimally tuned gradient descent, $2.4\times10^{-4}$ for Chebyshev (the
+bound $2\sigma^{30}$ with $\kappa\le51$ is $4.2\times10^{-4}$) and at machine precision for CG in
+float64. When we rounded every operation to float16, both Chebyshev and CG stalled at the float16
+floor of about $10^{-3}$, so this small experiment does not reproduce the low-precision instability
+that motivates GKA; the paper reports that comparison at scale.
+\end{example}
+
+\subsection{Belief states and world models}\label{sec:c08-belief}
+
+Consider a hidden Markov model: a hidden state $s_t$ evolves by $P(s_{t+1}\mid s_t)$ and emits a
+token $x_t\sim P(x_t\mid s_t)$. The \emph{belief} $\vb_t(s)=P(s_{t+1}=s\mid x_{1:t})$ is the
+predictive distribution of the next hidden state given the history. It obeys a recursion: condition
+on the new token, then predict,
+\begin{equation}\label{eq:c08-bayes-filter}
+  \vb_t = f(\vb_{t-1},x_t),\qquad
+  f(\vb,x)(s') = \sum_{s}P(s'\mid s)\,\frac{\vb(s)P(x\mid s)}{\sum_{\tilde s}\vb(\tilde s)P(x\mid\tilde s)} .
+\end{equation}
+The Kalman filter is this \emph{Bayes filter} for linear-Gaussian models, where the belief is the
+pair $(\vm_t,\mP_t)$. The crucial property is \emph{sufficiency}: for every horizon $k$,
+\[
+  P(x_{t+1:t+k}\mid x_{1:t}) = \prod_{j=1}^{k}\Bigl(\sum_s \vb_{t+j-1}(s)P(x_{t+j}\mid s)\Bigr),
+  \qquad \vb_{t+j}=f(\vb_{t+j-1},x_{t+j}),
+\]
+so the future depends on the past only through $\vb_t$. A belief state is the ideal memory: as
+small as the task allows, yet sufficient, and updatable by a fixed rule. In POMDP terms
+\citep{c08-kaelbling1998pomdp} it is the state on which optimal decisions depend. A pair
+(transition rule $f$, read-out from $\vb$ to the next-token distribution) is a \emph{world model}.
+In our NumPy check, rolling the belief of a random 4-state HMM forward with its own update predicted
+the joint probability of every 1-, 2- and 3-token continuation to within $6\times10^{-17}$ of a
+brute-force computation over the full history.
+
+Different architectures relate to belief states differently. An RNN or SSM must compress the
+history into a fixed state, but nothing forces that state to be sufficient. A Transformer keeps the
+whole history in its KV cache and can look anything up later, so it has no incentive to compress at
+all. KLA computes an exact belief for a simple factorized model; GKA computes the posterior mean of
+a static regression model; NextLat trains a Transformer so that its hidden state behaves like a
+belief state of the data.
+
+% ===========================================================================================
+\section{Kalman Linear Attention}\label{sec:c08-kla}
+
+\subsection{Motivation}
+
+In Mamba and gated linear attention the state is a \emph{point estimate}. The decay gate
+$\alpha_t$ is computed from the current token alone; it never asks how much the memory already
+knows. In a Kalman filter, by contrast, the amount of new evidence written into the state, the
+gain, is a function of the state's own uncertainty: an uncertain memory listens, a confident one
+does not. \Citet{shaj2026kalman} propose to make this mechanism the sequence mixer of a language
+model. Kalman Linear Attention keeps a Gaussian \emph{belief} for every state cell, derives the
+write gate from that belief, and keeps parallel training by working in the information form of
+\cref{sec:c08-info}, where the filter becomes an associative scan. The repository README
+summarizes the pitch: ``Unlike other linear attention layers which model the current state as a
+single point in the state space, KLA models the current state as a belief over the state space,
+and updates it in closed form as the sequence arrives''
+(\repofile{repos/vaisakh-shaj__kalman-linear-attention/readme.md}).
+
+\begin{taxonomy}
+Following \citet{zhoubian2026memory}, KLA is \textbf{implicit} memory: the belief lives inside the
+layer and is read and written only by the forward computation. Its \textbf{update dynamics} are
+\textbf{online} (the belief is revised at every token, at inference as well as in training) and its
+\textbf{persistence} is \textbf{long-term} within a sequence (survey Table~I lists Kalman Linear
+Attention and Gated KalmaNet together as ``Online, Long-Term, Probabilistic Recurrent State
+Estimation''). Its \textbf{update rule} (survey Table~II) is a \emph{state-transition update} given
+by a filtering equation; the survey names Kalman Linear Attention as a representative example and
+describes Kalman-style variants as introducing ``uncertainty-aware filtering''.
+\end{taxonomy}
+
+\subsection{Formulation: a Kalman filter in every cell}\label{sec:c08-kla-form}
+
+KLA's layout follows Mamba (\cref{ch:linear}). The layer has $d_v$ channels (the code's
+\code{d_inner}, $M$) and $d_k$ states per channel (the code's \code{d_state}, $S$, default 16); the
+state is a $d_v\times d_k$ array of cells $(m,s)$. Each token supplies a value $\vv_t\in\R^{d_v}$, a
+positive \emph{value precision} $\bm{\pi}_t\in\R^{d_v}$ (how reliable the token's value is), and a
+key $\vk_t\in\R^{d_k}$ and query $\vq_t\in\R^{d_k}$ shared by all channels, like Mamba's $B_t$ and
+$C_t$. Every cell also has a learned decay $a^{ms}\in(0,1)$ and process noise $p^{ms}>0$, both
+time-invariant.
+
+The docstring of the ops module,
+\repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/kla_ops.py}, describes the core
+operation as ``a parallel Kalman filter in information form, factorized per (channel m, state s)
+pair''.
+Reading the update off the code, each cell runs the scalar filter of the model
+\begin{equation}\label{eq:c08-kla-model}
+  z_t^{ms} = a^{ms}z_{t-1}^{ms}+w_t,\quad w_t\sim\mathcal{N}(0,p^{ms});\qquad
+  v_t[m] = k_t[s]\,z_t^{ms}+e_t,\quad e_t\sim\mathcal{N}\bigl(0,1/\pi_t[m]\bigr),
+\end{equation}
+in which every cell of channel $m$ treats the token's value $v_t[m]$ as its own noisy measurement,
+seen through the scalar observation coefficient $k_t[s]$. The cells are filtered independently (a
+mean-field factorization), which is what keeps the cost at $\bigO(d_vd_k)$ per token. This is our
+reading of the implementation; the paper's own derivation may organize it differently.
+
+\paragraph{One cell, step by step.} Drop the superscripts and let $\Lambda$ be the cell's
+precision and $u=\Lambda m$ its information. The predict step \eqref{eq:c08-info-predict} for a
+scalar state gives $\Lambda_t^-=\Lambda_{t-1}/(a^2+p\Lambda_{t-1})$ and
+$u_t^-=\Lambda_t^-\,a\,(u_{t-1}/\Lambda_{t-1})=a\,u_{t-1}/(a^2+p\Lambda_{t-1})$. The update
+\eqref{eq:c08-info-update} with $c=k_t[s]$, noise variance $1/\pi_t[m]$ and measurement $v_t[m]$
+adds the information packet
+\begin{equation}\label{eq:c08-kla-stats}
+  \phi_t = \pi_t[m]\,k_t[s]^2,\qquad r_t=\pi_t[m]\,v_t[m]\,k_t[s].
+\end{equation}
+Altogether,
+\begin{align}
+  \Lambda_t &= \frac{\Lambda_{t-1}}{a^2+p\Lambda_{t-1}}+\phi_t, \label{eq:c08-kla-prec}\\
+  u_t &= \alpha_t\,u_{t-1}+r_t,\qquad \alpha_t=\frac{a}{a^2+p\Lambda_{t-1}}, \label{eq:c08-kla-info}\\
+  \text{mean } &= u_t/\Lambda_t,\qquad \text{variance } = 1/\Lambda_t . \nonumber
+\end{align}
+Stacking the cells into matrices $\mLambda_t,\mU_t\in\R^{d_v\times d_k}$ and the gates into
+$\bm{\alpha}_t$, and writing $\oslash$ for element-wise division, the layer is
+\begin{equation}\label{eq:c08-kla-matrix}
+  \mU_t=\bm{\alpha}_t\had\mU_{t-1}+(\bm{\pi}_t\had\vv_t)\vk_t\T,\qquad
+  \vo_t=(\mU_t\oslash\mLambda_t)\,\vq_t,\qquad
+  \vo^{\mathrm{var}}_t=(\bm{1}\oslash\mLambda_t)(\vq_t\had\vq_t).
+\end{equation}
+The first equation is a gated-linear-attention write with value $\bm{\pi}_t\had\vv_t$; the read-out
+is $\vo_t=\mS_t\vq_t$ with the posterior mean $\mS_t=\mU_t\oslash\mLambda_t$ playing the role of the
+memory matrix. Three things distinguish KLA from GLA:
+\begin{enumerate}
+  \item the gate $\bm{\alpha}_t$ is computed from the precision, i.e.\ from how much information the
+  cell has accumulated, rather than from the current token;
+  \item the read-out divides each cell by its precision, a per-cell normalizer that plays the role
+  linear attention's denominator $\sum_i\vk_i\T\vq$ plays for the whole state;
+  \item each token's write is weighted by its learned precision $\bm{\pi}_t$, so the model can
+  declare some tokens unreliable.
+\end{enumerate}
+The second output $\vo^{\mathrm{var}}_t$ is the variance of $\vo_t$ under the factorized posterior.
+This is the ``uncertainty carried in the state'': it costs nothing extra because $1/\Lambda_t$ is
+already needed for the mean.
+
+\paragraph{How the gate behaves.} Write the posterior mean of one cell as
+\[
+  \text{mean}_t=\frac{\Lambda_t^-\,(a\,\text{mean}_{t-1})+\phi_t\,(v_t[m]/k_t[s])}{\Lambda_t^-+\phi_t}
+  \qquad(k_t[s]\neq0),
+\]
+a precision-weighted average of the predicted mean and the ``pseudo-observation''
+$v_t[m]/k_t[s]$. Because $\Lambda_t^-=\Lambda_{t-1}/(a^2+p\Lambda_{t-1})<1/p$, process noise caps
+the memory's confidence: however much evidence it has seen, the weight on new evidence stays above
+$\phi_t/(1/p+\phi_t)$, so the cell never stops listening. Process noise is therefore KLA's
+forgetting mechanism. Without it ($p=0$), \eqref{eq:c08-kla-prec} becomes
+$\Lambda_t=\Lambda_{t-1}/a^2+\phi_t$, which grows like $a^{-2t}$: in our check, with $a=0.95$ and
+$\phi=0.5$ the precision passed $4\times10^{9}$ after 200 steps, and the cell effectively stopped
+writing. With constant information $\phi$ and $p>0$, the precision converges to the positive root
+of $p\Lambda^2+(a^2-1-p\phi)\Lambda-a^2\phi=0$ (set $\Lambda_t=\Lambda_{t-1}$ in
+\eqref{eq:c08-kla-prec} and clear the denominator). For $a=0.95$, $p=0.05$, $\phi=0.5$ this gives
+$\Lambda^\star\approx4.47$ and a steady gate $\alpha^\star=a/(a^2+p\Lambda^\star)\approx0.844$.
+In general the fixed-point equation $\Lambda^\star(1-1/(a^2+p\Lambda^\star))=\phi>0$ forces
+$a^2+p\Lambda^\star>1$, hence $\alpha^\star<a$: in steady state the information decays faster than
+the dynamics alone would suggest, because process noise keeps eroding old evidence. In
+this regime KLA behaves like GLA with constant decay $0.844$ and a read-out scaled by
+$1/\Lambda^\star$; away from it, the gate tracks the information actually received.
+
+\subsection{Parallel form: a M\"obius scan and an affine scan}\label{sec:c08-kla-scan}
+
+The precision recurrence \eqref{eq:c08-kla-prec} is linear-fractional. Clearing the denominator,
+$\Lambda_t=\bigl((1+p\phi_t)\Lambda_{t-1}+a^2\phi_t\bigr)/\bigl(p\Lambda_{t-1}+a^2\bigr)$, and
+dividing numerator and denominator by $a^2$ gives the leaf matrix
+\begin{equation}\label{eq:c08-kla-leaf}
+  \Lambda_t = \mathcal{M}_t(\Lambda_{t-1}),\qquad
+  \mathcal{M}_t=\begin{bmatrix}(1+p\phi_t)/a^2 & \phi_t\\ p/a^2 & 1\end{bmatrix}.
+\end{equation}
+By \cref{sec:c08-scan}, $\Lambda_t$ is the M\"obius map of the product
+$\mathcal{P}_t=\mathcal{M}_t\mathcal{M}_{t-1}\cdots\mathcal{M}_1$ applied to $\Lambda_0$, and all
+products come out of one associative scan over $2\times2$ matrices. Once every $\Lambda_t$ is known,
+the gates $\alpha_t=a/(a^2+p\Lambda_{t-1})$ are known too, and the information recurrence
+\eqref{eq:c08-kla-info} is an affine scan (\cref{sec:c08-scan}). So the exact filter costs two scans.
+
+\begin{proposition}[Parallel equals sequential]\label{prop:c08-kla-par}
+For any inputs, the two-scan procedure returns the same $\Lambda_t$, $u_t$ and outputs as running
+\eqref{eq:c08-kla-prec}--\eqref{eq:c08-kla-info} token by token, even when every scan node is
+rescaled by an arbitrary positive factor.
+\end{proposition}
+\begin{proof}
+By induction, $\Lambda_t=\mathcal{M}_t\circ\dots\circ\mathcal{M}_1(\Lambda_0)$, and composition of
+M\"obius maps is the matrix product (\cref{sec:c08-scan}), which is associative, so any bracketing
+the scan uses yields the same matrix $\mathcal{P}_t$. A positive rescaling of any intermediate
+matrix multiplies the final numerator and denominator by the same factor and cancels. The same
+argument with affine composition gives $u_t$.
+\end{proof}
+
+\paragraph{Why trace normalization is safe.} Products of many leaves overflow or underflow in
+float32, so the implementations divide each combined matrix by its trace $A+D$. Every leaf is
+entrywise nonnegative with positive diagonal (as $p,\phi\ge0$), products of such matrices stay so,
+and therefore the trace never vanishes. The leaf determinant is
+$\frac{1+p\phi}{a^2}-\frac{p\phi}{a^2}=a^{-2}>0$ and determinants multiply, so every node stays
+invertible. In our NumPy check the parallel form (Hillis--Steele scans, trace normalization)
+matched sequential filtering to $10^{-15}$, and the per-cell information-form filter matched the
+textbook covariance-form Kalman filter \eqref{eq:c08-kf-predict}--\eqref{eq:c08-kf-update} to
+$10^{-15}$ as well.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners=2pt,align=center,font=\small,minimum height=8mm,inner sep=3pt},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (in) {tokens\\$\vv_t,\bm{\pi}_t,\vk_t$};
+\node[box,right=6mm of in] (stats) {packets\\$\phi_t,\ r_t$};
+\node[box,right=6mm of stats,fill=blue!6] (mob) {M\"obius scan\\$2\times2$ products};
+\node[box,right=6mm of mob] (lam) {$\Lambda_t$, and\\$\alpha_t$ from $\Lambda_{t-1}$};
+\node[box,below=10mm of mob,fill=blue!6] (aff) {affine scan\\$u_t=\alpha_tu_{t-1}+r_t$};
+\node[box,below=10mm of lam,xshift=8mm] (out) {$\vo_t=(\mU_t\oslash\mLambda_t)\vq_t$\\and $\vo^{\mathrm{var}}_t$};
+\draw[arr] (in) -- (stats);
+\draw[arr] (stats) -- node[above,font=\scriptsize] {$\phi_t$} (mob);
+\draw[arr] (mob) -- (lam);
+\draw[arr] (stats.south east) -- node[below left,font=\scriptsize] {$r_t$} (aff.north west);
+\draw[arr] (lam.south west) -- node[above left,font=\scriptsize] {$\alpha_t$} (aff.north east);
+\draw[arr] (aff) -- (out);
+\draw[arr] (lam) -- node[right,font=\scriptsize] {$\Lambda_t$} (out);
+\end{tikzpicture}
+\caption{KLA computes an exact (factorized) Kalman filter with two parallel scans. The precision
+recurrence is a scan over $2\times2$ M\"obius matrices; given the precisions, the gates are known
+and the information recurrence is an ordinary affine (GLA-like) scan.}
+\label{fig:c08-kla}
+\end{figure}
+
+\paragraph{Discretization.} The decay and process noise come from a continuous-time
+Ornstein--Uhlenbeck process $dz=-\abs{a_c}z\,dt+\sqrt{p_c}\,dW$ observed every $\Delta$ time units.
+Solving it over one interval gives $a=e^{-\abs{a_c}\Delta}$ and
+$p=\frac{p_c}{2\abs{a_c}}(1-e^{-2\abs{a_c}\Delta})$ (the stationary variance $p_c/(2\abs{a_c})$
+times the fraction not yet reached). In KLA $\Delta$ is a learned \emph{static} parameter per cell,
+unlike Mamba's input-dependent $\Delta_t$; the input-dependence of the write enters only through
+$\bm{\pi}_t$, $\vk_t$ and $\vv_t$, and through the gate's dependence on the accumulated precision.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{KLA prefill / training (parallel)}\label{alg:c08-kla-prefill}
+\begin{algorithmic}[1]
+\Require $\vv_t,\bm{\pi}_t\in\R^{d_v}$, $\vk_t,\vq_t\in\R^{d_k}$ for $t=1..T$; decay $a$, noise $p$
+  $\in\R^{d_v\times d_k}$; prior $(\mLambda_0,\mU_0)$
+\Ensure outputs $\vo_t$, variances $\vo^{\mathrm{var}}_t$, final state $(\mLambda_T,\mU_T)$
+\State $\phi_t\gets\bm{\pi}_t(\vk_t\had\vk_t)\T$, \ $r_t\gets(\bm{\pi}_t\had\vv_t)\vk_t\T$ \Comment{all $t$, element-wise per cell}
+\State leaves $\mathcal{M}_t\gets\bigl[\begin{smallmatrix}(1+p\phi_t)/a^2&\phi_t\\p/a^2&1\end{smallmatrix}\bigr]$
+\State $\mathcal{P}_{1..T}\gets$ \Call{Scan}{$\mathcal{M}_{1..T}$, $2\times2$ product, divide by trace}
+\State $\mLambda_t\gets(\mathcal{P}^{11}_t\mLambda_0+\mathcal{P}^{12}_t)\oslash(\mathcal{P}^{21}_t\mLambda_0+\mathcal{P}^{22}_t)$
+\State $\bm{\alpha}_t\gets a\oslash(a^2+p\had\mLambda_{t-1})$ \Comment{shifted precisions}
+\State $\mU_{1..T}\gets$ \Call{Scan}{$(\bm{\alpha}_t,r_t)_{1..T}$, affine composition} applied to $\mU_0$
+\State $\vo_t\gets(\mU_t\oslash\mLambda_t)\vq_t$, \ $\vo^{\mathrm{var}}_t\gets(\bm{1}\oslash\mLambda_t)(\vq_t\had\vq_t)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{KLA decode (one token)}\label{alg:c08-kla-decode}
+\begin{algorithmic}[1]
+\Require state $(\mLambda,\mU)$; new $\vv,\bm{\pi},\vk,\vq$
+\State $\bm{D}\gets a^2+p\had\mLambda$
+\State $\mLambda\gets\mLambda\oslash\bm{D}+\bm{\pi}(\vk\had\vk)\T$
+\State $\mU\gets(a\oslash\bm{D})\had\mU+(\bm{\pi}\had\vv)\vk\T$
+\State \Return $\vo=(\mU\oslash\mLambda)\vq$ and the new state
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c08-kla-prefill,alg:c08-kla-decode} summarize the layer. The state is two
+$d_v\times d_k$ arrays, $2d_vd_k$ numbers, twice that of GLA or Mamba with the same dimensions.
+Decoding costs $\bigO(d_vd_k)$ per token, independent of position. Prefill does $\bigO(Td_vd_k)$
+element-wise work with a work-efficient scan (or $\bigO(Td_vd_k\log T)$ with the Hillis--Steele
+doubling scan the PyTorch backend uses) in $\bigO(\log T)$ depth. Like Mamba's selective scan, and
+unlike the chunkwise matrix-multiply form of GLA (\cref{ch:linear}), every operation is
+element-wise per cell, so the kernels cannot use tensor-core matrix multiplications; they follow
+Mamba's fused-scan design instead (keep the expanded state on chip, recompute it in the backward
+pass).
+
+\subsection{Implementation walkthrough}
+
+\begin{implnote}[title={In the code: the KLA layer}]
+The layer is \code{KLALayer} in \repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/layers/kla_layer.py},
+configured by \code{KLAConfig} in \repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/configs.py}.
+For input $[B,L,D]$ the forward pass is: \code{in_proj} to $(z,\text{gate})$, each
+$[B,L,d_\text{inner}]$ with $d_\text{inner}=\text{\code{expand}}\cdot D$ (default \code{expand=2}); a
+depthwise causal convolution (kernel 4, SiLU); \code{_project_sensors}, which splits
+\code{sensor_proj(z)} into the value, $\log\sigma_v^2$, key and query; the scan; a learned skip
+$y+\lambda_\text{skip}z$ (scalar, initialized to $-1$); SiLU output gating; and \code{out_proj}.
+\begin{itemize}
+  \item \textbf{Two published blocks.} The default ``Mamba-style'' block sets \code{value_rank="conv"},
+  i.e.\ $\vv_t=z_t$ with no value projection, and produces $\log\sigma_v^2$ through a low-rank
+  bottleneck of width $\lceil D/8\rceil$ (\code{var_rank="auto"}). The ``plain'' block used for
+  the MAD synthetic tasks uses full projections (\code{value_rank="full"}, \code{var_rank="full"}).
+  \item \textbf{Precision.} $\sigma_v^2=\mathrm{softplus}(\cdot)+\text{\code{obs_var_min}}$ ($10^{-4}$) and
+  $\bm{\pi}_t=1/\sigma_v^2$; the variance head starts at the constant $1/d_\text{state}$ with zero
+  output weights.
+  \item \textbf{Keys and queries} are $\ell_2$-normalized (\code{qk_norm=True}) and have shape
+  $[B,L,S]$, shared by all $M=d_\text{inner}$ channels.
+  \item \textbf{Dynamics.} \code{_continuous_params} sets $a_c=-\exp(\text{\code{lambda_log}})$
+  (initialized to $-1$); \code{_discretize} applies the Ornstein--Uhlenbeck formulas above
+  (\code{discretization="ou"}, described in the config as ``critical for stacking layers''), with
+  $\Delta=\mathrm{softplus}(\text{\code{delta}})$ initialized log-uniformly in $[10^{-3},10^{-1}]$ and process
+  noise initialized to $3\abs{a_c}\Delta$.
+  \item \textbf{Variance output.} With \code{return_variance=True} the layer propagates
+  $\vo^{\mathrm{var}}$ through the gate (times $g^2$) and through \code{out_proj} with squared
+  weights, a diagonal approximation.
+\end{itemize}
+\end{implnote}
+
+\begin{implnote}[title={In the code: the reference scan}]
+\code{kla_scan_torch} in \repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/kla_ops.py}
+is the readable reference that every backend is validated against (together with the sequential
+\code{kla_scan_reference}). Inputs are $v$, $\Lambda^v$ ($=\bm{\pi}$) of shape $[B,L,M]$, $k$,
+$q$ of shape $[B,L,S]$, and $a$, $p$ of shape $[M,S]$; the state is \texttt{KLAState(lam,~eta)},
+each $[B,M,S]$, initialized to the standard-normal prior (precision 1, information 0). The code
+calls our information $u$ \code{eta}. \code{_sufficient_stats} forms $\phi$ and $r$
+\eqref{eq:c08-kla-stats} as outer products over $(m,s)$. \Cref{lst:c08-kla-ops} shows the two scans.
+Two numerical details are worth knowing. The docstring of \code{_sufficient_stats} explains that a
+floor on $\phi$ is unnecessary in the linear, trace-normalized scan (a zero-information leaf is a
+valid pure-prediction step) and harmful because a clamp kills the gradient to small keys; the
+optional log-space combine (\code{mobius_impl="log"}) needs the floor because it takes $\log\phi$.
+The generic scans live in \repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/scan.py}:
+\code{associative} (PyTorch's higher-order \code{associative_scan}), \code{doubling} (vectorized
+Hillis--Steele) and \code{sequential}; without gradients the reference switches to \code{doubling}
+to avoid recompiling for every sequence length.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak vaisakh-shaj\_\_kalman-linear-attention/\allowbreak src/\allowbreak kla/\allowbreak ops/\allowbreak kla\_ops.py} (function \texttt{kla\_scan\_torch}).},label={lst:c08-kla-ops}]
+    if mobius_impl == "linear":
+        A = ((1.0 + p_ * phi) / a2).expand_as(phi)
+        C = (p_ / a2).expand_as(phi)
+        D = torch.ones_like(phi)
+        pA, pB, pC, pD = scan(_mobius_combine_tracenorm, (A, phi, C, D), dim=1)
+        lam0_ = lam0.unsqueeze(1)
+        lam = (pA * lam0_ + pB) / (pC * lam0_ + pD).clamp_min(EPS)
+        var = 1.0 / lam.clamp_min(EPS)
+    # ...
+    lam_prev = torch.cat((lam0.unsqueeze(1), lam[:, :-1]), dim=1)
+    denom = (a2 + p_ * lam_prev).clamp_min(EPS)
+    alpha = a_ / denom
+
+    pAlpha, pR = scan(_affine_combine, (alpha, r), dim=1)
+    eta = pAlpha * eta0.unsqueeze(1) + pR
+
+    mean = eta * var
+
+    if decode_from_prior:
+        mean = a_ * mean
+        var = a2 * var + p_
+
+    y = torch.einsum("blms,bls->blm", mean, q)
+    y_var = torch.einsum("blms,bls->blm", var, q * q)
+    return y, y_var, KLAState(lam=lam[:, -1], eta=eta[:, -1])
+\end{lstlisting}
+
+The optional \code{decode_from_prior} branch emits the one-step-ahead prediction (mean $a\cdot$mean,
+variance $a^2\cdot$var$+p$) instead of the filtered posterior, i.e.\ the belief about the
+\emph{next} step before its token is seen.
+
+\begin{implnote}[title={In the code: fused GPU kernels}]
+The Triton backend (\repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/triton_backend.py})
+uses a single fused forward kernel when no gradient is needed and two tiled scans
+(\code{tiled_mobius_scan}, \code{tiled_affine_scan}) with an exact scalar-adjoint backward otherwise.
+In the fused kernel (\repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/kernels/triton/fused_kla_scan.py})
+one program owns one (batch, channel) pair, streams the sequence in chunks of \code{BLOCK_L}$=64$
+tokens, keeps all $S$ states of the channel in the second axis of a $[\text{\code{BLOCK_L}},S]$ tile and
+carries the running $2\times2$ matrix and the information across chunks (\cref{lst:c08-kla-fused}).
+Note that inside the kernel \code{q_ptr}/\code{q_t} is the process noise $p$, not the query (the
+query is \code{w}), and \code{h} is the key. The ``key trick'' named in its docstring recovers
+$\Lambda_{t-1}$ locally by inverting the leaf: from $\Lambda_t=(A\Lambda_{t-1}+\phi)/(C\Lambda_{t-1}+1)$
+we get $\Lambda_{t-1}=(\Lambda_t-\phi)/(A-C\Lambda_t)$, so the gate needs no shift across chunk
+boundaries. The CUDA backend (\code{backend="cuda"}, sources under
+\repofile{repos/vaisakh-shaj__kalman-linear-attention/src/kla/ops/kernels/cuda/v3/}) uses CUB block
+primitives with the same trace-normalized operator, saves only chunk-boundary checkpoints and recomputes
+inside each chunk in the backward pass, avoiding a $[B,L,M,S]$ state history in memory; it supports
+static dynamics with $d_\text{state}\le64$ and does not return the filter state, so stateful decoding
+uses the Triton or PyTorch path. An Apple-silicon backend (\code{mps}) uses fused Metal kernels.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak vaisakh-shaj\_\_kalman-linear-attention/\allowbreak src/\allowbreak kla/\allowbreak ops/\allowbreak kernels/\allowbreak triton/\allowbreak fused\_kla\_scan.py} (inside the chunk loop of \texttt{\_fused\_fwd\_kernel}). One non-ASCII comment line is elided.},label={lst:c08-kla-fused}]
+        A = (1.0 + q_t * phi) / a2_t
+        C = q_t / a2_t
+        D = zero + 1.0
+
+        sA, sB, sC, sD = tl.associative_scan(
+            (A, phi, C, D), axis=0, combine_fn=_tn_combine
+        )
+        fA = sA * cA[None, :] + sB * cC[None, :]
+        fB = sA * cB[None, :] + sB * cD[None, :]
+        fC = sC * cA[None, :] + sD * cC[None, :]
+        fD = sC * cB[None, :] + sD * cD[None, :]
+        inv = 1.0 / tl.maximum(fA + fD, 1e-12)
+        fA, fB, fC, fD = fA * inv, fB * inv, fC * inv, fD * inv
+
+        lam = (fA * lam0[None, :] + fB) / tl.maximum(fC * lam0[None, :] + fD, 1e-12)
+        # ...
+        lam_prev = (lam - phi) / tl.maximum(A - C * lam, 1e-12)
+        alpha = a_t / tl.maximum(a2_t + q_t * lam_prev, 1e-12)
+
+        ga, gb = tl.associative_scan((alpha, rr), axis=0, combine_fn=_aff_combine)
+        eta = ga * c_eta[None, :] + gb
+\end{lstlisting}
+
+Lines 8--13 compose the in-chunk prefix (variables \code{sA} to \code{sD}) with the matrix
+carried from earlier chunks (\code{cA} to \code{cD}): the carried matrix is applied first, so it multiplies from the right, exactly the
+order of $\mathcal{M}_t\cdots\mathcal{M}_1$. The repository's documentation (\repofile{repos/vaisakh-shaj__kalman-linear-attention/docs/backends.md})
+states the shared accuracy test for every backend: maximum absolute error at most
+$2\times10^{-5}+2\times10^{-4}\cdot\max\abs{\text{reference}}$ against the sequential reference, for
+outputs and input gradients.
+
+\subsection{Reference implementation}
+
+\Cref{lst:c08-kla-ours} is a minimal version of the whole mechanism: the two combine rules, a
+Hillis--Steele scan, the parallel layer core and the decode step. We ran it through a small NumPy
+stand-in for the few \code{torch} calls it uses: the parallel output and the token-by-token decode
+agreed to $10^{-15}$, as did the final states.
+
+\begin{lstlisting}[caption={Reference implementation (ours): the KLA core as two scans, plus the decode step.},label={lst:c08-kla-ours}]
+import torch
+
+def mobius(l, r):                       # compose 2x2 maps (r after l), trace-normalised
+    A = r[0] * l[0] + r[1] * l[2]; B = r[0] * l[1] + r[1] * l[3]
+    C = r[2] * l[0] + r[3] * l[2]; D = r[2] * l[1] + r[3] * l[3]
+    s = A + D
+    return A / s, B / s, C / s, D / s
+
+def affine(l, r):                       # compose maps z -> a z + b (r after l)
+    return r[0] * l[0], r[0] * l[1] + r[1]
+
+def scan(combine, xs):                  # inclusive Hillis-Steele scan over dim 1
+    xs, n, off = list(xs), xs[0].shape[1], 1
+    while off < n:
+        new = combine([x[:, :-off] for x in xs], [x[:, off:] for x in xs])
+        xs = [torch.cat([x[:, :off], y], 1) for x, y in zip(xs, new)]
+        off *= 2
+    return xs
+
+def kla(v, pv, k, q, a, p, lam0, u0):
+    """v, pv: [B,T,M] values and value precisions; k, q: [B,T,S] keys, queries;
+    a, p: [M,S] decay and process noise; lam0, u0: [B,M,S] prior precision, information."""
+    phi = pv[..., None] * (k * k)[:, :, None]          # information added   [B,T,M,S]
+    r = (pv * v)[..., None] * k[:, :, None]             # information-vector input
+    a2 = a * a
+    A = (1 + p * phi) / a2                              # leaf [[A, phi], [C, 1]]
+    C = (p / a2).expand_as(phi)
+    pA, pB, pC, pD = scan(mobius, (A, phi, C, torch.ones_like(phi)))
+    lam = (pA * lam0[:, None] + pB) / (pC * lam0[:, None] + pD)      # precision
+    lam_prev = torch.cat([lam0[:, None], lam[:, :-1]], 1)
+    alpha = a / (a2 + p * lam_prev)                     # uncertainty-dependent gate
+    gA, gB = scan(affine, (alpha, r))
+    u = gA * u0[:, None] + gB                           # information vector
+    y = torch.einsum('btms,bts->btm', u / lam, q)       # read posterior mean
+    y_var = torch.einsum('btms,bts->btm', 1 / lam, q * q)
+    return y, y_var, (lam[:, -1], u[:, -1])
+
+def kla_step(v, pv, k, q, a, p, lam, u):              # one decode step: O(MS)
+    den = a * a + p * lam
+    lam = lam / den + pv[..., None] * (k * k)[:, None]
+    u = (a / den) * u + (pv * v)[..., None] * k[:, None]
+    return torch.einsum('bms,bs->bm', u / lam, q), (lam, u)
+\end{lstlisting}
+
+\subsection{Reported results}
+
+\begin{results}
+The repository contains no benchmark tables, so we report only what its files state and refer to
+\citet{shaj2026kalman} for numbers.
+\begin{itemize}
+  \item \repofile{repos/vaisakh-shaj__kalman-linear-attention/readme.md} positions KLA against
+  softmax attention and SSMs/GLA: ``fractional linear (M\"obius)'' expressivity versus linear for
+  SSMs/GLA, $\bigO(T)$ training and $\bigO(1)$ per-token inference, explicit sequence uncertainty,
+  and parallel training. It describes KLA as a drop-in replacement for other linear attention layers.
+  \item \repofile{repos/vaisakh-shaj__kalman-linear-attention/docs/usage.md}: at $d_\text{model}=512$
+  the Mamba-style block has about 1.79M parameters against 3.76M for the plain block; both use the
+  same Kalman scan. The paper uses the plain block for MAD and the Mamba-style block for FineWeb-Edu
+  pretraining.
+  \item \repofile{repos/vaisakh-shaj__kalman-linear-attention/docs/backends.md}: the CUDA backend
+  was the fastest in the paper's NVIDIA GPU training benchmarks, ``substantially faster than
+  Triton'', with a much smaller scan-memory footprint.
+  \item The survey \citep{zhoubian2026memory} describes Kalman Linear Attention as using filtering
+  ``to modulate updates by estimation quality''.
+\end{itemize}
+Experiment code is marked ``Coming Soon'' in the README; see the paper for language-modelling and
+state-tracking results.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} KLA turns a principled estimator into a layer without giving up parallel
+training: the information form makes writes additive, and the leftover nonlinearity (the precision
+predict step) is linear-fractional and therefore scannable. The write gate is not a free parameter
+but follows from accumulated evidence, and the layer returns a variance estimate at no extra
+cost. Process noise gives a clean, interpretable account of forgetting.
+
+\textbf{Limitations.} The filter is exact only for the factorized model \eqref{eq:c08-kla-model}:
+cells do not share uncertainty, so KLA has no analogue of the key--key coupling
+$\vk_t\vk_t\T$ through which the delta rule (\cref{ch:delta}) erases the old value stored at a
+key. Its transition is diagonal and time-invariant ($a$, $p$, $\Delta$ are static), so its
+expressivity comes from the precision-dependent gate rather than from richer transitions such as
+those of \cref{ch:expressive}. The state is twice as large as GLA's, and the element-wise scan
+cannot use tensor cores.
+
+\textbf{Relations.} With the precision frozen at its steady state, KLA reduces to GLA with a
+constant gate (\cref{ch:linear}); with $p=0$ it reduces to a non-forgetting accumulator. GKA,
+next, keeps the full key covariance that KLA factorizes away.
+
+% ===========================================================================================
+\section{Gated KalmaNet}\label{sec:c08-gka}
+
+\subsection{Motivation}
+
+Linear SSMs and linear-attention layers update their state from the current token alone: a decay,
+an outer product, at most one delta-rule correction. The resulting state is a lossy, fading
+summary of the past, and recall-heavy tasks expose the loss. \Citet{peng2026gka} ask instead for
+the state that is \emph{optimal given the entire past}: at every token, the solution of a ridge
+regression over all previous key--value pairs, weighted by a gated, fading memory. The README of the
+toolkit that ships the official code puts it this way: GKA is ``Inspired by Kalman filtering, it
+computes the state at each time-step based on the entire past rather than the instantaneous update
+rules used by other SSMs'' (\repofile{repos/awslabs__hybrid-model-factory/README.md}). The authors'
+abstract describes the reduction: grounding the layer in the Kalman filter and maintaining the full
+error covariance, a steady-state assumption that enables parallelization turns the problem into
+online ridge regression with constant memory and linear compute. Doing this in practice requires
+solving two engineering problems that the textbook recursions of \cref{sec:c08-rls} do not: they
+are numerically fragile in bfloat16 and inherently sequential. GKA's answers are an input-dependent
+(adaptive) regularizer that bounds the condition number, Chebyshev iteration instead of RLS or
+conjugate gradient, and a chunked kernel.
+
+\begin{taxonomy}
+In the taxonomy of \citet{zhoubian2026memory}, GKA is \textbf{implicit} memory (its state is part
+of the layer's forward computation), with \textbf{online} update dynamics and \textbf{long-term}
+persistence within a sequence (survey Table~I groups it with Kalman Linear Attention as
+``Probabilistic Recurrent State Estimation''). Its \textbf{update rule} is a \emph{state-transition
+update} (survey Table~II): the survey says Kalman Linear Attention and Gated KalmaNet ``use
+filtering or online regression to modulate updates by estimation quality''. Unlike every other
+layer in \cref{ch:linear,ch:delta}, the ``transition'' is not a fixed function of the current token
+but the solution of an optimization problem over the whole gated past.
+\end{taxonomy}
+
+\subsection{Formulation: test-time ridge regression}\label{sec:c08-gka-form}
+
+We use GKA's notation mapped to ours. Per head, keys and queries are $\ell_2$-normalized; a
+\emph{beta gate} $\beta_t\in(0,1)$ multiplies both $\vk_t$ and $\vv_t$; a forgetting gate
+$\alpha_t=e^{g_t}\in(0,1]$ decays the past (the code's \code{g}, computed Mamba-2 style); the
+regularization ratio $r$ (the code's \code{ridge_strength}, default $0.02$) sets the ridge strength;
+and a mixing gate $\nu_t\in(0,1)$ (the code calls it the ``alpha connection'', \code{alpha_proj})
+blends two read-outs. The code's module docstring
+(\repofile{repos/awslabs__hybrid-model-factory/training/src/hmf/model/hybrid_zoo/layers/gated_kalmanet/gka.py})
+states the objective: at each time $t$
+\begin{equation}\label{eq:c08-gka-obj}
+  \mS_t=\argmin_{\mS}\ \lambda_t\norm{\mS}_F^2+\sum_{i\le t}\eta_{t,i}\norm{\mS\vk_i-\vv_i}^2,
+  \qquad \eta_{t,i}=\beta_i^2\prod_{j=i+1}^{t}\alpha_j ,
+\end{equation}
+where $\vk_i,\vv_i$ are the normalized key and the value before the beta gate (applying $\beta_i$ to
+both $\vk_i$ and $\vv_i$ multiplies the squared error by $\beta_i^2$). By \cref{sec:c08-ewridge} the
+solution is
+\begin{equation}\label{eq:c08-gka-sol}
+  \mS_t=\mU_t(\mH_t+\lambda_t\mI)^{-1},\qquad
+  \mH_t=\alpha_t\mH_{t-1}+\beta_t^2\vk_t\vk_t\T,\qquad
+  \mU_t=\alpha_t\mU_{t-1}+\beta_t^2\vv_t\vk_t\T .
+\end{equation}
+
+\paragraph{The Kalman reading.} One way to see the connection (ours; the paper's derivation via a
+steady-state Kalman filter may differ in detail): the static-state Kalman filter of
+\cref{sec:c08-rls} with prior $\mathcal{N}(\bm{0},\lambda_t^{-1}\mI)$ on each row of $\mS$, in which
+the observation of pair $i$ is treated at time $t$ as having noise variance $1/\eta_{t,i}$, has
+exactly \eqref{eq:c08-gka-sol} as its posterior mean (its negative log-posterior is half the
+objective in \eqref{eq:c08-gka-obj}). Fading memory is then ``old observations
+become noisier'', and the Kalman gain uses the full posterior covariance
+$(\mH_t+\lambda_t\mI)^{-1}$ instead of the delta rule's $\beta_t\mI$.
+
+\paragraph{The read-out trick.} Forming $\mS_t$ would require a $d_k\times d_k$ inverse per token.
+But the layer only needs $\mS_t\vq_t$, and
+\begin{equation}\label{eq:c08-gka-read}
+  \mS_t\vq_t=\mU_t\tilde\vq_t,\qquad \tilde\vq_t=(\mH_t+\lambda_t\mI)^{-1}\vq_t .
+\end{equation}
+So GKA (i) solves one $d_k$-dimensional linear system per token for the \emph{whitened query}
+$\tilde\vq_t$, then (ii) reads the gated-linear-attention memory $\mU_t$ with it. Step (ii) is plain
+GLA. The full output is
+\begin{equation}\label{eq:c08-gka-out}
+  \hat\vq_t=\nu_t\tilde\vq_t+(1-\nu_t)\vq_t,\qquad \vo_t=\tfrac{1}{\sqrt{d_k}}\,\mU_t\hat\vq_t ,
+\end{equation}
+followed by a gated RMSNorm and the output projection. With $\nu_t=1$ the layer returns the ridge
+read; with $\nu_t=0$ it is exactly GLA. The learned per-token, per-head $\nu_t$ lets the model choose.
+
+\begin{example}[Why whitening the query helps]\label{ex:c08-whiten}
+Let $d_k=2$, $d_v=1$, no decay, $\beta=1$, and store two nearly parallel keys
+$\vk_1=(1,0)$, $\vk_2=(\cos30^\circ,\sin30^\circ)\approx(0.866,0.5)$ with values $v_1=1$, $v_2=-1$.
+Query with $\vq=\vk_1$, hoping to retrieve $v_1=1$.
+\begin{itemize}
+  \item Linear attention: $\mU\vk_1=v_1(\vk_1\T\vk_1)+v_2(\vk_2\T\vk_1)=1-0.866=0.134$. The
+  similar key interferes.
+  \item Delta rule with $\beta=1$, writing $\vk_1$ then $\vk_2$: the second write fixes
+  $\mS\vk_2=-1$ exactly but drags $\mS\vk_1$ to $-0.616$.
+  \item Ridge with $\lambda\to0$: $\mH=\vk_1\vk_1\T+\vk_2\vk_2\T$ is invertible, and $\mS=\mU\mH^{-1}$
+  satisfies $\mS\vk_1=1$ and $\mS\vk_2=-1$ exactly. The whitened query
+  $\tilde\vq=\mH^{-1}\vk_1$ is the dual vector that has inner product 1 with $\vk_1$ and 0 with
+  $\vk_2$, so it cancels the interference.
+  \item GKA's adaptive ridge, $\lambda=0.02\norm{\mH}_F\approx0.037$: the read is $0.78$. The
+  eigenvalues of $\mH$ are $1.87$ and $0.134$; the small one (the direction that separates the two
+  keys) is shrunk by the factor $0.134/(0.134+0.037)$. Regularization trades exact recall of
+  near-duplicate keys for stability.
+\end{itemize}
+\end{example}
+
+\subsection{Adaptive regularization and the Chebyshev solver}\label{sec:c08-gka-cheb}
+
+GKA sets the ridge strength proportional to the size of the key covariance,
+\begin{equation}\label{eq:c08-gka-lambda}
+  \lambda_t=r\,\norm{\mH_t}_F .
+\end{equation}
+\begin{proposition}[Bounded condition number]\label{prop:c08-kappa}
+With \eqref{eq:c08-gka-lambda}, the eigenvalues of $\mH_t+\lambda_t\mI$ lie in
+$[\lambda_t,\ \lambda_t+\norm{\mH_t}_F]$, so $\kappa(\mH_t+\lambda_t\mI)\le1+1/r$ for every input.
+\end{proposition}
+\begin{proof}
+$\mH_t$ is a nonnegative combination of outer products, so it is symmetric positive semidefinite
+with eigenvalues $0\le\mu_i$. Its largest eigenvalue satisfies $\mu_{\max}\le(\sum_i\mu_i^2)^{1/2}
+=\norm{\mH_t}_F$. Adding $\lambda_t\mI$ shifts every eigenvalue by $\lambda_t$, so the spectrum lies
+in $[\lambda_t,\lambda_t+\norm{\mH_t}_F]$ and the ratio of the ends is
+$1+\norm{\mH_t}_F/\lambda_t=1+1/r$.
+\end{proof}
+The bound is tight when $\mH_t$ has rank one; in our check over 200 random key sets the largest
+condition number observed was exactly 51.0 for $r=0.02$. Three things follow.
+\begin{enumerate}
+  \item \textbf{Stability for any input.} However the gates scale the memory (a long effective
+  window makes $\mH_t$ large, a short one makes it small), the linear system has $\kappa\le51$, a
+  regime in which bfloat16 arithmetic behaves.
+  \item \textbf{Scale invariance.} Multiplying all weights $\eta_{t,i}$ by a common factor $c$
+  multiplies $\mH_t$, $\mU_t$ and $\lambda_t$ by $c$ and leaves $\mS_t$ unchanged, so the balance
+  between data and regularizer does not depend on the overall magnitude of the gates.
+  \item \textbf{A known spectral interval for free.} Chebyshev iteration needs
+  $[\mu_{\min},\mu_{\max}]$; the proposition supplies $[\lambda_t,\lambda_t+\norm{\mH_t}_F]$ at the
+  cost of one Frobenius norm.
+\end{enumerate}
+Plugging this interval into \cref{sec:c08-solvers} gives step size
+$\tau_t=2/(\mu_{\min}+\mu_{\max})=2/(2\lambda_t+F_t)$ and
+$\rho_t=(\mu_{\max}-\mu_{\min})/(\mu_{\max}+\mu_{\min})=F_t/(2\lambda_t+F_t)=1/(1+2r)$, with
+$F_t=\norm{\mH_t}_F$; these are literally the variables \code{stepsize} and \code{rho_sq_4}
+($=\rho^2/4$) of the kernels in \cref{lst:c08-gka-cheb}. With $\kappa\le51$,
+$\sigma=(\sqrt{51}-1)/(\sqrt{51}+1)\approx0.754$, and the worst-case relative error after $n$
+iterations is $2\sigma^n$: about $0.49$ after 5 iterations, $0.12$ after 10 and $4.2\times10^{-4}$
+after 30, the default. The default thus drives the worst-case solver error below bfloat16's unit
+roundoff ($2^{-8}\approx3.9\times10^{-3}$); smaller \code{num_iter} values trade accuracy for
+speed, and the worst case is pessimistic (in \cref{ex:c08-race} the error after 10 iterations was
+$7\times10^{-2}$ and after 30 iterations $2.4\times10^{-4}$).
+
+Why Chebyshev and not the textbook recursions? RLS cannot be used with a fixed, non-decaying
+regularizer and gating (\cref{sec:c08-ewridge}), and its covariance update subtracts nearly equal
+quantities, which destroys positive definiteness in low precision. Conjugate gradient needs inner
+products whose rounding errors change its coefficients. The authors state that Chebyshev iteration
+is more stable than conventional iterative solvers in low precision, which is consistent with its
+data-independent coefficients; our tiny float16 simulation (\cref{ex:c08-race}) was too small to
+show a difference, so see the paper for the evidence.
+
+\subsection{Chunkwise computation}\label{sec:c08-gka-chunk}
+
+During training every token needs products $\mH_t\vx$ for its own matrix $\mH_t$, in each of the
+$n_\text{iter}$ iterations. Materializing $\mH_t$ for every token would cost $Td_k^2$ memory per
+head. GKA uses the chunk decomposition of \cref{ch:linear}. Split the sequence into chunks of $C$
+tokens, let $\mH_{[i]}$ be the state at the start of chunk $i$, and let $G_t=\sum_{j=\text{start}}^{t}
+g_j$ be the chunk-local cumulative log-decay. Then for $t$ in chunk $i$ (keys already include
+$\beta$)
+\begin{equation}\label{eq:c08-gka-chunkH}
+  \mH_t = e^{G_t}\mH_{[i]}+\sum_{j\le t,\ j\in[i]}e^{G_t-G_j}\vk_j\vk_j\T
+  \quad\Longrightarrow\quad
+  \mH_t\vx = e^{G_t}\mH_{[i]}\vx+\sum_{j\le t}e^{G_t-G_j}(\vk_j\T\vx)\,\vk_j .
+\end{equation}
+Stack the $C$ current iterates as rows of $\mX\in\R^{C\times d_k}$ and the keys as rows of
+$\mK_{[i]}$. With the decay mask $D_{tj}=e^{G_t-G_j}$ for $j\le t$ and $0$ otherwise, all $C$
+products are
+\begin{equation}\label{eq:c08-gka-chunkHX}
+  \bigl[\mH_t\vx_t\bigr]_{t\in[i]} = \diag(e^{G})\,\mX\mH_{[i]}+\bigl((\mX\mK_{[i]}\T)\had D\bigr)\mK_{[i]} ,
+\end{equation}
+two matrix multiplications of sizes $C\times d_k\times d_k$ and $C\times C\times d_k$ (using the
+symmetry of $\mH_{[i]}$). The Frobenius norms need the same treatment. Expanding the square of
+\eqref{eq:c08-gka-chunkH} with $\inner{\mH}{\vk\vk\T}_F=\vk\T\mH\vk$ and
+$\inner{\vk\vk\T}{\vk'\vk'^{\top}}_F=(\vk\T\vk')^2$,
+\begin{equation}\label{eq:c08-gka-fro}
+  \norm{\mH_t}_F^2=e^{2G_t}\norm{\mH_{[i]}}_F^2+2e^{G_t}\sum_{j\le t}D_{tj}\,\vk_j\T\mH_{[i]}\vk_j
+  +\sum_{j,l\le t}D_{tj}D_{tl}(\vk_j\T\vk_l)^2 .
+\end{equation}
+In our NumPy check both \eqref{eq:c08-gka-chunkHX} and \eqref{eq:c08-gka-fro} matched the directly
+formed $\mH_t$ to $10^{-15}$. The chunk-start states $\mH_{[i]}$ are themselves a GLA chunk
+recurrence with values equal to keys, and the final read \eqref{eq:c08-gka-out} is a chunkwise GLA
+call, so GKA reuses the GLA machinery of \cref{ch:linear} twice and adds the in-chunk solver.
+
+\paragraph{Backward pass.} Treat $\tilde\vq=\mA^{-1}\vq$ with $\mA=\mH+\lambda\mI$ symmetric. For a
+loss $\loss$ with incoming gradient $\bar{\vx}=\partial\loss/\partial\tilde\vq$, implicit
+differentiation gives
+\begin{equation}\label{eq:c08-gka-bwd}
+  \frac{\partial\loss}{\partial\vq}=\mA^{-1}\bar{\vx},\qquad
+  \frac{\partial\loss}{\partial\mA}=-\Bigl(\frac{\partial\loss}{\partial\vq}\Bigr)\tilde\vq\T .
+\end{equation}
+The first is the same linear solve applied to the gradient, so the backward pass reruns the
+Chebyshev solver; the second is an outer product that flows into the keys through
+\eqref{eq:c08-gka-sol}. Because $\lambda=r\norm{\mH}_F$ also depends on $\mH$, there is an extra
+term: $\partial\loss/\partial\lambda=\tr(\partial\loss/\partial\mA)=-\bar{\vq}\T\tilde\vq$ (with
+$\bar{\vq}=\partial\loss/\partial\vq$) and $\partial\norm{\mH}_F/\partial\mH=\mH/\norm{\mH}_F$, so
+$\mH$ receives the additional gradient $-r(\bar{\vq}\T\tilde\vq)\,\mH/\norm{\mH}_F$; the flag
+\code{bp_lambda} turns this term on.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{GKA prefill / training for one head (chunkwise)}\label{alg:c08-gka-prefill}
+\begin{algorithmic}[1]
+\Require $\vq_t,\vk_t,\vv_t$, log-decay $g_t$, gates $\beta_t,\nu_t$; ratio $r$; chunk size $C$; $n_\text{iter}$
+\State $\vq_t\gets\vq_t/\norm{\vq_t}$, \ $\vk_t\gets\beta_t\vk_t/\norm{\vk_t}$, \ $\vv_t\gets\beta_t\vv_t$
+\State $G\gets$ chunk-local cumulative sum of $g$
+\State $\mH_{[i]}$ for all chunks $\gets$ GLA chunk-state recurrence with values $=$ keys
+\For{each chunk $i$ \textbf{in parallel}}
+  \State $F_t\gets\norm{\mH_t}_F$ by \eqref{eq:c08-gka-fro}; \ $\lambda_t\gets rF_t$; \ $\tau_t\gets2/(2\lambda_t+F_t)$; \ $\rho_t\gets F_t/(2\lambda_t+F_t)$
+  \State $\mX_\text{prev}\gets\bm{0}$; \ $\mX\gets\diag(\tau)\mQ_{[i]}$; \ $\omega\gets2$
+  \For{$n=1..n_\text{iter}$}
+    \State $\omega\gets1/(1-\rho^2\omega/4)$ \Comment{per token}
+    \State $\bm{R}\gets\diag(e^{G})\mX\mH_{[i]}+((\mX\mK_{[i]}\T)\had D)\mK_{[i]}+\diag(\lambda)\mX-\mQ_{[i]}$
+    \State $(\mX,\mX_\text{prev})\gets\bigl(\omega\had(\mX-\diag(\tau)\bm{R})+(1-\omega)\had\mX_\text{prev},\ \mX\bigr)$
+  \EndFor
+  \State $\hat\mQ_{[i]}\gets\diag(\nu)\mX+\diag(1-\nu)\mQ_{[i]}$
+\EndFor
+\State $\mO\gets$ chunkwise GLA$(\hat\mQ,\mK,\mV,g)$ with scale $1/\sqrt{d_k}$ \Comment{\cref{ch:linear}}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{GKA decode (one token, one head)}\label{alg:c08-gka-decode}
+\begin{algorithmic}[1]
+\Require state $(\mH,\mU)$; new $\vq,\vk,\vv,g,\beta,\nu$ (normalized and $\beta$-scaled as above)
+\State $\mH\gets e^{g}\mH+\vk\vk\T$; \ $F\gets\norm{\mH}_F$; \ $\lambda\gets rF$
+\State $\tilde\vq\gets$ \Call{Chebyshev}{$\mH+\lambda\mI$, $\vq$, interval $[\lambda,\lambda+F]$, $n_\text{iter}$}
+\State $\mU\gets e^{g}\mU+\vv\vk\T$
+\State \Return $\vo=\mU(\nu\tilde\vq+(1-\nu)\vq)/\sqrt{d_k}$ and the new state
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c08-gka-prefill,alg:c08-gka-decode} summarize GKA. Per head the recurrent state is
+$\mH_t$ and $\mU_t$, $2d_k^2$ numbers for $d_v=d_k$, twice a GLA or Gated DeltaNet head. Each
+Chebyshev iteration on a chunk costs $\bigO(Cd_k^2+C^2d_k)$, so prefill costs
+$\bigO\bigl((n_\text{iter}+1)\,T(d_k^2+Cd_k)\bigr)$ per head, roughly $n_\text{iter}+1$ times GLA,
+with all iterations running on chip inside one kernel per (chunk, head). Decoding costs
+$\bigO(n_\text{iter}d_k^2)$ per token per head, independent of position. The iteration count is a
+\emph{test-time compute knob}: it can be lowered at serving time without retraining, trading
+accuracy of the solve for speed.
+
+\subsection{Implementation walkthrough}
+
+\begin{implnote}[title={In the code: the GKA layer}]
+GKA ships inside the AWS Hybrid Model Factory toolkit. The layer is \code{GatedKalmaNet} in
+\repofile{repos/awslabs__hybrid-model-factory/training/src/hmf/model/hybrid_zoo/layers/gated_kalmanet/gka.py},
+wrapped by \code{GatedKalmaNetLayer} in \code{modules.py} of the same folder, and configured by
+\code{GKAConfig} in \code{gka_config.py}. Its hyperparameters are chosen so that the layer can be
+initialized from an existing attention layer: \code{_construct_from_transformer} copies the head
+dimension and the (grouped-query) head counts of the base Transformer. In \code{forward}:
+\begin{itemize}
+  \item $q,k,v$ projections, each followed by a \code{ShortConvolution} (kernel 4, SiLU, from
+  \fla); key/value heads are repeated (or expanded by an optional low-rank projection) to the
+  query head count;
+  \item $\ell_2$ normalization of $q$ and $k$ (epsilon $10^{-6}$), then the beta gate, the
+  alpha connection $\nu$ and the forgetting gate (\cref{lst:c08-gka-gates});
+  \item \code{gka_chebyshev_gla} (training/prefill) or \code{torch_decoding_one_step} (decoding),
+  then \code{FusedRMSNormGated} with a gate from \code{g_proj}, and \code{o_proj}.
+\end{itemize}
+The cache stores $(\mH_t,\mU_t)$ as \texttt{(h\_kk,~h\_kv)} plus the three convolution states. Defaults
+(\code{GKAConfig}): \code{num_iter=30}, \code{ridge_strength=0.02} (our $r$), \code{chunk_size=64},
+\code{gla_rescale=True} (scale $1/\sqrt{d_k}$), \code{use_forgetting_gate_kk=True} (the same decay
+$g$ for $\mH$ as for $\mU$), \code{bp_lambda=True}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak src/\allowbreak hmf/\allowbreak model/\allowbreak hybrid\_zoo/\allowbreak layers/\allowbreak gated\_kalmanet/\allowbreak gka.py} (method \texttt{GatedKalmaNet.forward}).},label={lst:c08-gka-gates}]
+        # Apply beta gating if enabled
+        if self.use_beta_gate:
+            beta = self.b_proj(hidden_states).sigmoid()  # [B_sp, Lp, H]
+            eps = 1e-6
+            k = ((beta[..., None] + eps) * k).to(k.dtype)  # [B_sp, Lp, H, D]
+            v = ((beta[..., None] + eps) * v).to(v.dtype)  # [B_sp, Lp, H, D]
+
+        # Compute alpha connection parameter
+        if self.use_alpha_connection:
+            alpha = self.alpha_proj(hidden_states).sigmoid()  # [B_sp, Lp, H]
+        else:
+            alpha = torch.ones_like(q[..., 0])  # [B_sp, Lp, H]
+
+        # Compute forgetting gate
+        if self.use_forgetting_gate:
+            g = -self.A_log.float().exp() * F.softplus(
+                self.a_proj(hidden_states).float() + self.dt_bias
+            )  # [B_sp, Lp, H]
+        else:
+            g = None
+
+        gk = g if self.use_forgetting_gate_kk else None
+\end{lstlisting}
+
+The decay is Mamba-2's parameterization, $g_t=-e^{A_{\log}}\,\mathrm{softplus}(\vw_a\T\vx_t+b_{\Delta})$,
+with $A=e^{A_{\log}}$ initialized uniformly in $(0,16)$ and $b_\Delta$ initialized so that the step
+lies in $[10^{-3},10^{-1}]$. The training-time entry point then does two things
+(\cref{lst:c08-gka-solve}): solve for the whitened queries and mix them with the raw queries, and
+hand everything to \fla's \code{chunk_simple_gla}.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak src/\allowbreak hmf/\allowbreak model/\allowbreak hybrid\_zoo/\allowbreak layers/\allowbreak gated\_kalmanet/\allowbreak ops/\allowbreak chebyshev/\allowbreak gka\_chebyshev\_solve.py} (function \texttt{gka\_chebyshev\_gla}). Two non-ASCII comments are elided.},label={lst:c08-gka-solve}]
+    if num_iter > 0:
+        # ...
+        q_, kk_final = latent_chebyshev(
+            k, q, ridge_strength, num_iter, solver_type, bp_lambda, gk, chunk_size
+        )
+
+        q = q + alpha[..., None] * (q_ - q)  # ...
+    else:
+        kk_final = None
+
+    o, kv_final = chunk_simple_gla(
+        q=q, k=k, v=v, scale=gla_scale, g=g, output_final_state=True
+    )
+
+    return o, kk_final, kv_final
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the chunked Chebyshev kernel}]
+\code{latent_chebyshev} calls the autograd function \code{ChebyshevIteration} in
+\repofile{repos/awslabs__hybrid-model-factory/training/src/hmf/model/hybrid_zoo/layers/gated_kalmanet/ops/chebyshev/chebyshev_iteration.py}.
+Its forward computes the chunk-local cumulative decay with \fla's \code{chunk_local_cumsum}, the
+chunk-start states $\mH_{[i]}$ with \fla's \code{chunk_fwd_h} called with \code{v=k}, and launches
+\code{chebyshev_iteration_fro_gating_forward_kernel} on a grid of (number of chunks, batch$\times$heads).
+Each program loads one chunk's $q$ and $k$ ($[C,D]$) and its $\mH_{[i]}$ ($[D,D]$), computes the
+Frobenius norms by \eqref{eq:c08-gka-fro} (stored for the backward pass), and runs all iterations
+(\cref{lst:c08-gka-cheb}). The two \code{tl.dot} lines are \eqref{eq:c08-gka-chunkHX}: \code{mask}
+holds $D_{tj}=\exp(G_t-G_j)$ and \code{exp_gkk} holds $e^{G_t}$. The update
+\texttt{x~=~omega~*~x~-~grad\_and\_x\_prev} expands to
+$\omega(\vx-\tau\bm{R})+(1-\omega)\vx_\text{prev}$, i.e.\ \eqref{eq:c08-cheb-iter}. The backward
+(\code{ChebyshevIteration.backward}) reruns the same forward kernel on the incoming gradient with the
+stored norms (\code{load_fro=1}), which is the first identity of \eqref{eq:c08-gka-bwd}, then turns
+$-\bar{\vq}\tilde\vq\T$ into key gradients with \fla's \code{chunk_bwd_dh} and the custom
+\code{chunk_bwd_dk_gating}; with \code{bp_lambda} the latter adds the term from
+$\lambda=r\norm{\mH}_F$ (in \code{chunk_dk_backward.py} it appears as weights
+\texttt{ridge\_ratio~*~sum(dq~*~x\_out)~/~fro}).
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak src/\allowbreak hmf/\allowbreak model/\allowbreak hybrid\_zoo/\allowbreak layers/\allowbreak gated\_kalmanet/\allowbreak ops/\allowbreak chebyshev/\allowbreak chebyshev\_iteration.py} (end of \texttt{chebyshev\_iteration\_fro\_gating\_forward\_kernel}).},label={lst:c08-gka-cheb}]
+    ridge_strength = ridge_ratio * fro
+
+    stepsize = 2 / (2 * ridge_strength + fro)
+    rho_sq_4 = fro / (2 * ridge_strength + fro) / 2.0
+    rho_sq_4 = rho_sq_4 * rho_sq_4
+
+    x_prev = tl.zeros_like(q).to(tl.float32)
+    x = stepsize * q.to(tl.float32)
+    omega = tl.full((chunk_size, 1), 2.0, dtype=tl.float32)
+
+    for _ in range(num_iter):
+        omega = 1.0 / (1.0 - rho_sq_4 * omega)
+
+        grad_and_x_prev = (
+            stepsize
+            * omega
+            * (
+                tl.dot((x * exp_gkk).to(h_kk.dtype), h_kk)
+                + tl.dot((tl.dot(x.to(k.dtype), tl.trans(k)) * mask).to(k.dtype), k)
+                + ridge_strength * x
+                - q
+            )
+            + (omega - 1) * x_prev
+        )
+        x_prev = x
+
+        x = omega * x - grad_and_x_prev
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: decoding, sequence parallelism, serving, priming}]
+\begin{itemize}
+  \item \textbf{Decoding.} \code{torch_decoding_one_step} calls
+  \code{chebyshev_iteration_forward_triton_inference}, whose kernel (grid batch$\times$heads)
+  updates \code{h_kk} $\gets e^{g}$\code{h_kk}$+\vk\vk\T$, computes the norm and runs the same
+  iteration with $D\times D$ matrix--vector products, then \fla's \code{fused_recurrent_simple_gla}
+  updates $\mU$ and produces the output (\cref{alg:c08-gka-decode}).
+  \item \textbf{Sequence parallelism.} Because $\mH_t$ is a gated sum, chunk states can be passed
+  between GPUs like any linear-attention state: \code{state_passing_gka_p2p} in
+  \code{sequence_parallel/gka_sp_utils.py} passes both \code{h_kk} and \code{h_kv}, after which
+  each GPU recomputes its part with the received initial states.
+  \item \textbf{Serving.} The vLLM plugin has its own grouped-query kernels under
+  \repofile{repos/awslabs__hybrid-model-factory/vllm-inference/src/primed_vllm/gka/}; the iteration
+  count can be overridden at serving time through vLLM's \code{--hf-overrides} flag with a
+  \code{gka_overrides} entry such as \code{num_iter} $=10$
+  (\repofile{repos/awslabs__hybrid-model-factory/docs/Inference.md}).
+  \item \textbf{Priming.} The stage-0 config
+  \repofile{repos/awslabs__hybrid-model-factory/training/examples/priming/stage0/qwen3_8b_gka.yaml}
+  (pattern \texttt{*DA-GKA*-*DA-GKA*-...}) builds a fused Qwen3-8B hybrid in which every other
+  layer is a ``fused GKA + Attention'' layer: the new GKA path runs in parallel with the original
+  attention so that stage~1 can distill attention into GKA (\repofile{repos/awslabs__hybrid-model-factory/docs/Priming.md}),
+  with the defaults above (\texttt{num\_iter:~30}, \texttt{ridge\_strength:~0.02}, all gates on). Priming
+  itself, the conversion of a pretrained Transformer into a hybrid, is the subject of \cref{ch:hybrid}
+  \citep{chattopadhyay2026priming}.
+\end{itemize}
+\end{implnote}
+
+\subsection{Reference implementation}
+
+\Cref{lst:c08-gka-ours} gives a recurrent GKA head (the semantics of \cref{alg:c08-gka-decode}
+applied token by token) and the chunked product \eqref{eq:c08-gka-chunkHX}. Run through our NumPy
+stand-in for \code{torch}, the recurrent head with 80 iterations matched the closed form
+$\mU_t(\mH_t+\lambda_t\mI)^{-1}\vq_t/\sqrt{d_k}$ to $2\times10^{-10}$ (with $\nu_t=1$), and
+\code{chunk_Hx} matched the directly formed $\mH_t\vx_t$ to $10^{-15}$.
+
+\begin{lstlisting}[caption={Reference implementation (ours): a recurrent GKA head and the chunked product.},label={lst:c08-gka-ours}]
+import torch
+
+def chebyshev_solve(H, q, lam, fro, n_iter):
+    """Solve (H + lam I) x = q; the eigenvalues lie in [lam, lam + fro]."""
+    step = 2.0 / (2 * lam + fro)                        # 2 / (mu_min + mu_max)
+    rho_sq_4 = (fro / (2 * lam + fro) / 2) ** 2         # (rho / 2)^2
+    x_prev, x, w = torch.zeros_like(q), step * q, 2.0
+    for _ in range(n_iter):
+        w = 1.0 / (1.0 - rho_sq_4 * w)                  # Chebyshev weight omega_n
+        r = H @ x + lam * x - q                         # residual = gradient
+        x, x_prev = w * (x - step * r) + (1 - w) * x_prev, x
+    return x
+
+def gka_recurrent(q, k, v, g, beta, nu, ratio=0.02, n_iter=30):
+    """One head. q, k, v: [T,D]; g: [T] log-decay (<= 0); beta, nu: [T] in (0,1)."""
+    T, D = q.shape
+    q = q / q.norm(dim=-1, keepdim=True)
+    k = k / k.norm(dim=-1, keepdim=True)
+    k, v = beta[:, None] * k, beta[:, None] * v         # sample weight beta^2
+    H, U, out = torch.zeros(D, D), torch.zeros(v.shape[1], D), []
+    for t in range(T):
+        a = torch.exp(g[t])
+        H = a * H + torch.outer(k[t], k[t])             # fading key covariance H_t
+        U = a * U + torch.outer(v[t], k[t])             # fading value-key memory U_t
+        fro = torch.linalg.norm(H)                      # ||H_t||_F
+        lam = ratio * fro                               # adaptive ridge strength
+        x = chebyshev_solve(H, q[t], lam, fro, n_iter)  # ~ (H_t + lam I)^{-1} q_t
+        qm = nu[t] * x + (1 - nu[t]) * q[t]             # mix with the plain query
+        out.append(U @ qm / D ** 0.5)                   # GLA-style read-out
+    return torch.stack(out)
+
+def chunk_Hx(X, K, G, H0):
+    """H_t x_t for every t of one chunk without forming H_t.
+    X, K: [C,D]; G: [C] chunk-local cumulative log-decay; H0: state at chunk start."""
+    decay = torch.exp(G[:, None] - G[None, :]).tril()  # exp(G_t - G_j) for j <= t
+    return torch.exp(G)[:, None] * (X @ H0) + ((X @ K.T) * decay) @ K
+\end{lstlisting}
+
+\subsection{Reported results}
+
+\begin{results}
+The repository reports serving-efficiency numbers for \emph{primed hybrid} models in which half of
+the attention layers of Qwen3 were replaced by GKA (all from
+\repofile{repos/awslabs__hybrid-model-factory/docs/Inference.md}; 8$\times$H200, tensor parallelism
+8, sustained decode with a saturated KV cache):
+\begin{itemize}
+  \item \textbf{Decode throughput at 128K context.} GKA-primed-HQwen3-8B: 2,736 tokens/s at the
+  default \code{num_iter=30}, 2.23$\times$ the Qwen3-8B baseline (1,227); 2,801 (2.28$\times$) at
+  \code{num_iter=10}. For comparison the GDN-primed model reaches 2,863 (2.33$\times$). At 16K the
+  GKA model gives 15,892 tokens/s (1.78$\times$) at 30 iterations and 17,261 (1.93$\times$) at 10.
+  GKA-primed-HQwen3-32B reaches 1,168 tokens/s at 128K, 1.99$\times$ the Qwen3-32B baseline (586).
+  \item \textbf{Time to first token} (same batch size as the saturated baseline): at 128K the 8B GKA
+  hybrid needs 0.85$\times$ the Transformer's TTFT at 30 iterations and 0.82$\times$ at 10 (GDN:
+  0.74$\times$); at 16K it is slower than the Transformer (1.26$\times$ at 30 iterations).
+  \item \textbf{Compute control.} The document notes that most of the gain from lowering
+  \code{num_iter} comes from 30 $\rightarrow$ 10 and that the effect is larger at shorter contexts,
+  where the GKA layers are a larger share of the forward pass.
+\end{itemize}
+These numbers measure the hybrids' speed, not GKA's modelling quality. Qualitatively, the README
+states that GKA is more expressive than Mamba-2 and GDN, ``translates to strong performance on
+long-context and reasoning tasks'', and uniquely among the toolkit's SSM layers ``supports variable
+compute at inference via its num\_iter parameter''. See \citet{peng2026gka} for accuracy results.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} GKA's state is optimal for an explicit objective over the whole gated past, not
+the result of a single local correction. Whitening the query cancels interference between similar
+keys (\cref{ex:c08-whiten}), which is what the delta rule tries to do one token at a time. The
+adaptive regularizer gives a provable bound on the condition number, which makes a fixed-interval
+Chebyshev solver both sufficient and stable, and makes the iteration count a deployment-time
+dial. The implementation reuses GLA kernels for everything except the solve.
+
+\textbf{Limitations.} Training and decoding cost grow linearly with the iteration count, and the
+state is twice GLA's. The solve is approximate and the regularizer always shrinks: near-duplicate
+keys are separated only partially (\cref{ex:c08-whiten}). The memory is still a $d_k\times d_k$
+summary, so at most $d_k$ linearly independent keys can be recalled exactly. The layer's output is
+a learned mixture of the ridge read and the plain GLA read, so the regression interpretation holds
+only to the extent $\nu_t\approx1$.
+
+\textbf{Relations.} With $\mH_t+\lambda_t\mI$ replaced by $\mI$ GKA is GLA (\cref{ch:linear}); the
+delta-rule family of \cref{ch:delta}, including Kaczmarz linear attention \citep{zou2026kaczmarz},
+takes single projection or gradient steps toward the same regression target; and the mesa layer of
+\citet{c08-vonoswald2023mesa} solves an in-context ridge regression with a Sherman--Morrison
+recursion, without GKA's fading memory, adaptive regularization or iterative solver. Test-time
+training layers (\cref{ch:ttt}) replace the linear map by a nonlinear one and the exact solve by
+a few gradient steps.
+
+% ===========================================================================================
+\section{Next-Latent Prediction}\label{sec:c08-nextlat}
+
+\subsection{Motivation}
+
+KLA and GKA change \emph{how} a state is updated. Next-Latent Prediction changes \emph{what a state
+should represent}, and does so without touching the architecture. A Transformer's memory is its KV
+cache, which grows with the sequence, and attention can look up any past token whenever it needs
+to. As the authors put it in their abstract, Transformers therefore ``lack an inherent incentive to
+compress history into compact latent states with consistent transition rules'', which can lead to
+solutions that generalize poorly. Recurrent models are forced to compress, but nothing forces the
+compressed state to be \emph{sufficient}. \Citet{teoh2026nextlat} add one auxiliary objective to
+next-token training: from the hidden state at position $t$ and the next token, predict the hidden
+state at position $t+1$. A Transformer that satisfies this objective has hidden states that evolve
+by a fixed transition rule and, together with the usual next-token head, form a world model whose
+states are belief states (\cref{sec:c08-belief}). Architecture, parallel training and inference are
+unchanged; the memory mechanism is shaped offline, by the loss.
+
+\begin{taxonomy}
+In \citet{zhoubian2026memory}, Next-Latent Prediction is \textbf{implicit} memory (hidden activations),
+with \textbf{offline} update dynamics and \textbf{long-term} persistence (survey Table~I: ``Offline,
+Long-Term, Latent Belief-State Induction''). Its \textbf{update rule} is the survey's
+\emph{objective-induced or structural} category (Table~II), alongside Engram, MoE models and
+Priming: memory behaviour is shaped by an auxiliary objective rather than by per-instance online
+writes. The survey stresses that NextLat ``is therefore an offline, objective-induced mechanism
+rather than a new test-time write rule'', occupying ``a different position'' from the
+state-transition updates of the rest of this chapter.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c08-nextlat-form}
+
+Let $x_1,\dots,x_T$ be tokens (integers in $\mathcal{V}$), $\ve(x)\in\R^d$ the token embedding,
+$\vh_t\in\R^d$ the Transformer's final-layer hidden state at position $t$ (after the final norm),
+and $p_{\vtheta}(x_{t+1}\mid\vh_t)=\softmax(\mW\vh_t)$ the next-token head. NextLat adds a small
+\emph{latent dynamics model}
+\begin{equation}\label{eq:c08-nextlat-f}
+  \hat\vh_{t+1}=f_\psi\bigl(\vh_t,\ve(x_{t+1})\bigr)=\vh_t+\mathrm{MLP}_\psi\bigl(\LayerNorm([\ve(x_{t+1});\vh_t])\bigr),
+\end{equation}
+a residual three-layer GELU MLP on the concatenation of the next token's embedding and the current
+hidden state. Writing $\mathrm{sg}(\cdot)$ for stop-gradient, the training loss is
+\begin{align}
+  \loss_{\mathrm{NTP}} &= -\textstyle\sum_t\log p_{\vtheta}(x_{t+1}\mid\vh_t), \nonumber\\
+  \loss_{\mathrm{lat}}^{(j)} &= \textstyle\sum_t \mathrm{SmoothL1}\bigl(\hat\vh_{t+j},\,\mathrm{sg}(\vh_{t+j})\bigr), \label{eq:c08-nextlat-lat}\\
+  \loss_{\mathrm{KL}}^{(j)} &= \textstyle\sum_t \mathrm{KL}\bigl(\softmax(\mathrm{sg}(\mW\vh_{t+j}))\,\|\,\softmax(\mathrm{sg}(\mW)\hat\vh_{t+j})\bigr), \label{eq:c08-nextlat-kl}\\
+  \loss &= \loss_{\mathrm{NTP}}+\frac{\lambda_{\mathrm{MSE}}}{d_h}\sum_{j=1}^{d_h}\loss_{\mathrm{lat}}^{(j)}
+          +\frac{\lambda_{\mathrm{KL}}}{d_h}\sum_{j=1}^{d_h}\loss_{\mathrm{KL}}^{(j)} , \label{eq:c08-nextlat-total}
+\end{align}
+where the multi-step predictions roll the model's own transition forward: starting from
+$\hat\vh_t=\vh_t$, we set $\hat\vh_{t+j}=f_\psi(\hat\vh_{t+j-1},\ve(x_{t+j}))$ for $j=1,\dots,d_h$,
+up to a horizon $d_h$ (the code's \code{mtp_horizon}). The code refers to \eqref{eq:c08-nextlat-lat} as the
+hidden-state MSE term, weighted by \code{lambda_mse} (``lambda\_MSE in the paper'', says the config
+comment), but computes it with PyTorch's smooth-L1 (Huber) loss. Sums are
+taken as means over valid positions in the code. Each design choice has a reason.
+\begin{itemize}
+  \item \textbf{Stop-gradient on the target.} Gradients flow into the trunk through the
+  \emph{input} $\vh_t$ (and the embedding), pushing $\vh_t$ to be predictive of $\vh_{t+1}$, but not
+  through the target $\vh_{t+1}$, which would otherwise be pulled toward whatever is easy to predict.
+  Collapse to a trivial constant state is prevented by $\loss_{\mathrm{NTP}}$, which still requires
+  $\vh_t$ to predict the next token.
+  \item \textbf{The KL term} asks that the predicted latent produce the same next-token distribution
+  as the true one, i.e.\ agree with it where it matters for output, even if not in every coordinate.
+  The head $\mW$ is detached on the student side, so only $\loss_{\mathrm{NTP}}$ trains the head.
+  \item \textbf{Multi-step rollouts} ($d_h>1$) penalize compounding errors of the transition, as in
+  model-based reinforcement learning.
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners=2pt,align=center,font=\small,minimum height=7mm,inner sep=3pt},
+  arr/.style={-{Stealth[length=2mm]},thick}, darr/.style={-{Stealth[length=2mm]},thick,dashed}]
+\node[box,minimum width=58mm,fill=gray!8] (trunk) {Transformer trunk (unchanged)};
+\node[font=\small,below=4mm of trunk.south west,anchor=north west] (xt) {$x_{\le t}$};
+\node[font=\small,below=4mm of trunk.south east,anchor=north east] (xt1) {$x_{\le t+1}$};
+\draw[arr] (xt) -- (xt|-trunk.south);
+\draw[arr] (xt1) -- (xt1|-trunk.south);
+\node[box,above=8mm of trunk.north west,anchor=south west] (ht) {$\vh_t$};
+\node[box,above=8mm of trunk.north east,anchor=south east] (ht1) {$\vh_{t+1}$};
+\draw[arr] (ht|-trunk.north) -- (ht);
+\draw[arr] (ht1|-trunk.north) -- (ht1);
+\node[box,fill=blue!6] (f) at ($(ht)!0.5!(ht1)+(0,14mm)$) {$f_\psi$};
+\node[font=\small,above=5mm of f] (e) {$\ve(x_{t+1})$};
+\draw[arr] (e) -- (f);
+\draw[arr] (ht) -- (f);
+\node[box] (hhat) at (ht1|-f) {$\hat\vh_{t+1}$};
+\draw[arr] (f) -- (hhat);
+\draw[darr] (ht1) -- node[right,font=\scriptsize,align=left] {smooth-L1 to sg$(\vh_{t+1})$\\KL of the heads} (hhat);
+\node[box,left=6mm of ht] (ntp) {$p(x_{t+1}\mid\vh_t)$};
+\draw[arr] (ht) -- (ntp);
+\end{tikzpicture}
+\caption{Next-Latent Prediction. The trunk and the next-token head are trained as usual; a small
+latent dynamics model $f_\psi$ predicts the next hidden state from the current one and the next
+token, and its prediction is matched to the (stop-gradient) true next hidden state and to its
+next-token distribution.}
+\label{fig:c08-nextlat}
+\end{figure}
+
+\subsection{Why the objective produces belief states}
+
+The following statement captures the idea; it is our informal version, and the paper proves a
+precise convergence result (see the paper for its exact statement and assumptions).
+\begin{proposition}[Exact next-latent prediction gives a belief state]\label{prop:c08-belief}
+Suppose that for every history (a) the head is exact,
+$p_{\vtheta}(x_{t+1}\mid\vh_t)=P(x_{t+1}\mid x_{1:t})$, and (b) the transition is exact,
+$\vh_{t+1}=f(\vh_t,x_{t+1})$. Then for every $k\ge1$ the conditional law
+$P(x_{t+1:t+k}\mid x_{1:t})$ depends on the history only through $\vh_t$: $\vh_t$ is a belief state,
+and $(f,p_{\vtheta})$ is a world model in the sense of \cref{sec:c08-belief}.
+\end{proposition}
+\begin{proof}
+By (b) and induction on $j$, $\vh_{t+j}=F_j(\vh_t,x_{t+1:t+j})$ where $F_j$ applies $f$ $j$ times.
+By the chain rule and (a),
+\[
+  P(x_{t+1:t+k}\mid x_{1:t})=\prod_{j=1}^{k}P(x_{t+j}\mid x_{1:t+j-1})
+  =\prod_{j=1}^{k}p_{\vtheta}\bigl(x_{t+j}\mid F_{j-1}(\vh_t,x_{t+1:t+j-1})\bigr),
+\]
+and the right-hand side is a function of $\vh_t$ and the future tokens only.
+\end{proof}
+Next-token prediction alone delivers (a) but not (b). A Transformer can let $\vh_t$ encode only what
+is needed for $x_{t+1}$ and recover everything else later by attending to the KV cache. Condition (b)
+forbids this: $\vh_{t+1}$ may contain nothing that cannot be computed from $\vh_t$ and $x_{t+1}$, so
+$\vh_t$ must already carry every piece of the history the future will need. Our HMM check in
+\cref{sec:c08-belief} is the same computation with the exact Bayes filter in place of $(f,\vh)$.
+
+How does this relate to other auxiliary objectives that the repository implements as baselines?
+Multi-token prediction \citep{c08-gloeckle2024mtp} adds heads that predict $x_{t+2},x_{t+3},\dots$
+from $\vh_t$, which forces $\vh_t$ to contain information about the future but imposes no
+consistent transition between states. The Belief State Transformer \citep{c08-hu2025bst} learns
+belief states with a forward and a backward encoder that predict the next and the previous token.
+NextLat obtains the recurrence constraint with one small MLP and losses in latent space.
+
+\subsection{Self-speculative decoding}\label{sec:c08-nextlat-spec}
+
+The latent dynamics model gives the Transformer a cheap draft model of itself. After one full
+forward pass produces $\vh_t$, drafts are generated by the MLP alone:
+$\hat x_{t+1}\sim\softmax(\mW\vh_t)$, $\hat\vh_{t+1}=f_\psi(\vh_t,\ve(\hat x_{t+1}))$,
+$\hat x_{t+2}\sim\softmax(\mW\hat\vh_{t+1})$, and so on for $\gamma$ tokens. One full forward pass
+over the prefix and the drafts then gives the target distributions $p_j$, and standard speculative
+sampling \citep{c08-leviathan2023speculative} accepts draft $j$ with probability
+$\min(1,p_j(\hat x)/q_j(\hat x))$, stops at the first rejection and resamples that position from
+$\mathrm{normalize}(\max(0,p_j-q_j))$; if every draft is accepted it samples one bonus token from the
+target. The output distribution is exactly the target model's: for one position,
+\[
+  P(\text{out}=y)=q(y)\min\Bigl(1,\tfrac{p(y)}{q(y)}\Bigr)
+  +\Bigl(1-\sum_z\min(p(z),q(z))\Bigr)\frac{p(y)-\min(p(y),q(y))}{\sum_z\bigl(p(z)-\min(p(z),q(z))\bigr)}
+  =p(y),
+\]
+because $1-\sum_z\min(p,q)=\sum_z(p-\min(p,q))$ (both distributions sum to one); we confirmed this
+numerically to $10^{-16}$. The number of tokens accepted per round varies with how well the latent
+rollout tracks the true hidden states, which is why the authors call it variable-length
+self-speculative decoding. The first draft uses the true $\vh_t$ and the true head, so $q_1=p_1$ and
+it is always accepted; the repository's acceptance metrics therefore exclude position~1.
+
+\subsection{Algorithms and complexity}
+
+\begin{algorithm}[t]
+\caption{NextLat training step}\label{alg:c08-nextlat-train}
+\begin{algorithmic}[1]
+\Require batch of token sequences $x_{1:T}$; horizon $d_h$; weights $\lambda_{\mathrm{MSE}},\lambda_{\mathrm{KL}}$
+\State $\ve_{1:T}\gets\ve(x_{1:T})$; \ $\vh_{1:T}\gets\mathrm{Trunk}(\ve_{1:T})$ \Comment{one causal forward pass}
+\State $\loss\gets\loss_{\mathrm{NTP}}(\mW\vh_{1:T-1},x_{2:T})$; \ $\hat\vh\gets\vh$
+\For{$j=1..d_h$}
+  \State $\hat\vh_{t+1}\gets f_\psi(\hat\vh_t,\ve_{t+1})$ for all valid $t$ \Comment{parallel over positions}
+  \State $\loss\gets\loss+\frac{\lambda_{\mathrm{MSE}}}{d_h}\,\mathrm{SmoothL1}(\hat\vh,\mathrm{sg}(\vh))$
+  \State $\loss\gets\loss+\frac{\lambda_{\mathrm{KL}}}{d_h}\,\mathrm{KL}\bigl(\softmax(\mathrm{sg}(\mW\vh))\,\|\,\softmax(\mathrm{sg}(\mW)\hat\vh)\bigr)$
+\EndFor
+\State backpropagate $\loss$ into trunk, embeddings, head and $f_\psi$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{NextLat self-speculative decoding (one round)}\label{alg:c08-nextlat-spec}
+\begin{algorithmic}[1]
+\Require prefix $x_{1:t}$; draft length $\gamma$
+\State $\vh\gets\mathrm{Trunk}(x_{1:t})_t$ \Comment{full model}
+\For{$j=1..\gamma$}
+  \State $q_j\gets\softmax(\mW\vh)$; \ $\hat x_j\sim q_j$; \ $\vh\gets f_\psi(\vh,\ve(\hat x_j))$ \Comment{MLP only}
+\EndFor
+\State $p_{1..\gamma+1}\gets$ next-token distributions of the full model on $x_{1:t}\hat x_{1:\gamma}$ \Comment{one pass}
+\For{$j=1..\gamma$}
+  \If{$u\sim U(0,1)<\min(1,p_j(\hat x_j)/q_j(\hat x_j))$} accept $\hat x_j$
+  \Else\ append a sample of $\mathrm{normalize}(\max(0,p_j-q_j))$ and \Return
+  \EndIf
+\EndFor
+\State append a sample of $p_{\gamma+1}$
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:c08-nextlat-train,alg:c08-nextlat-spec} summarize training and decoding. Training adds,
+per horizon step, one pass of the MLP over all positions and one extra vocabulary projection (the
+student logits must be materialized for the KL), i.e.\ $\bigO(d_hT(d^2+d\abs{\mathcal{V}}))$ on top of
+the Transformer's cost. Inference without speculation is unchanged, and so is the memory footprint:
+the KV cache still grows with $T$. NextLat reorganizes what the hidden state contains; it does not
+shrink the cache. A speculative round costs one forward pass for the prefix, $\gamma$ MLP calls and
+one verification pass. The repository's implementation recomputes the full prefix in both passes
+(``this implementation does not include KV-cache optimization'',
+\repofile{repos/JaydenTeoh__NextLat/utils/speculative_sampling.py}).
+
+\subsection{Implementation walkthrough}
+
+\begin{implnote}[title={In the code: model and losses}]
+Everything is in \repofile{repos/JaydenTeoh__NextLat/models/model_nextlat.py}; the README points
+to the \code{compute_loss()} functions of the files in \repofile{repos/JaydenTeoh__NextLat/models/}
+as the clearest way to compare NextLat with its baselines (\code{model_gpt.py} for next-token
+prediction, \code{model_mtp_gloeckle.py}, \code{model_mtp_jtp.py}, \code{model_bst.py}).
+\begin{itemize}
+  \item \code{NextLatConfig}: \code{lambda_kl}, \code{lambda_mse}, \code{lambda_ce} (an optional
+  cross-entropy on the next-next token, 0 by default and used for logging), \code{mtp_horizon}
+  ($d_h$) and \code{proj_factor}.
+  \item \code{NextLatDynamicsModel} is $f_\psi$: input width $2d$, hidden width
+  $128\cdot\mathrm{round}(\text{\code{proj_factor}}\cdot2d/128)$ (for $d=768$ and factor 1.3 this is 2048),
+  \code{LayerNorm} on the concatenation \texttt{[next\_token\_embeds,~hidden\_states]}, and a residual
+  output (\cref{lst:c08-nextlat-f}).
+  \item \texttt{NextLatTransformer.forward(...,~return\_hidden\_states=True)} returns the token
+  embeddings and the normalized final hidden states, the two inputs of the latent losses.
+  \item \code{_nextlat_compute_losses} implements the horizon loop: at each step it shifts the
+  predicted states left and the embeddings, targets and teacher logits right by one, applies
+  \code{dynamics_model}, and calls \code{_nextlat_loss_function} (\cref{lst:c08-nextlat-loss}). The
+  smooth-L1 term skips targets that are end-of-sequence tokens (they start a new document in packed
+  sequences), and the token-level KL skips next-next tokens that cross a document boundary.
+  \item \code{compute_loss} computes all losses on \emph{detached} copies of the hidden states and
+  embeddings (re-marked \code{requires_grad}), backpropagates the loss to those copies, and then
+  calls \texttt{fabric.backward(combined\_emb,~gradient=combined\_grad)} to push the accumulated
+  gradients through the trunk once. The comments explain the purpose: the loss function can be
+  compiled separately with \code{torch.compile}, and gradients from all losses are combined before
+  the single backward pass through the trunk.
+\end{itemize}
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak JaydenTeoh\_\_NextLat/\allowbreak models/\allowbreak model\_nextlat.py} (\texttt{NextLatDynamicsModel.forward}).},label={lst:c08-nextlat-f}]
+        hidden_states = self.hidden_state_dropout(current_states)
+        x = torch.cat([next_token_embeds, hidden_states], dim=-1)
+        x = self.norm_x(x)
+
+        # residual connection
+        delta = self.mlp(x)
+        next_states = delta + current_states
+
+        return next_states
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak JaydenTeoh\_\_NextLat/\allowbreak models/\allowbreak model\_nextlat.py} (\texttt{NextLat.\_nextlat\_loss\_function}).},label={lst:c08-nextlat-loss}]
+        mse_elem = F.smooth_l1_loss(pred_h_t_next, h_t_next.detach(), reduction="none")
+        w = mse_mask.unsqueeze(-1).to(dtype=mse_elem.dtype)
+        # Same as reduction="mean" over masked (B, T, n_embd) elements.
+        # i.e., divide over B*T*n_embd elements.
+        denom = w.expand_as(mse_elem).sum().clamp_min(1.0)
+        MSE = (mse_elem * w).sum() / denom
+        # ...
+        pred_token_inputs = pred_h_t_next[:, :-1]
+        # Keep NextLat CE/KL from updating lm_head by using detached head weights.
+        # Have to materialize student logits to compute KL loss
+        lm_head_weight = self.model.lm_head.weight.detach()
+        pred_tokens = F.linear(pred_token_inputs, lm_head_weight)
+        # ...
+        # Detach teacher logits to avoid updating teacher computation graph
+        kl_loss = self._categorical_kl_loss(
+            teacher_logits.detach(), pred_tokens, token_pred_mask
+        )
+\end{lstlisting}
+
+Here \code{teacher_logits} are the next-token logits $\mW\vh$ computed for $\loss_{\mathrm{NTP}}$,
+shifted so that position $t$ holds $\mW\vh_{t+1}$, and \code{_categorical_kl_loss} computes
+$\mathrm{KL}(\text{teacher}\,\|\,\text{student})$ per position with \code{F.kl_div} and averages over
+valid positions.
+
+\begin{implnote}[title={In the code: drafting, verification, configs}]
+\code{NextLat.speculative_propose} (\cref{lst:c08-nextlat-propose}) runs the full model once on the
+prefix, then alternates head sampling and \code{dynamics_model} steps. Verification and the
+accept/resample loop are in \code{speculative_decode_v2} in
+\repofile{repos/JaydenTeoh__NextLat/utils/speculative_sampling.py} (adapted, as its docstring says,
+from an open-source implementation of Leviathan et al.'s algorithm), with target probabilities from
+\code{build_speculative_target_probs_fn} in \repofile{repos/JaydenTeoh__NextLat/models/model_speculative.py}.
+Benchmarks are driven by \code{eval/eval_speculative_checkpoints.py} (\code{--gamma} sets the draft
+length). Configs under \repofile{repos/JaydenTeoh__NextLat/config/} cover Manhattan taxi rides,
+Countdown, path-star graphs, TinyStories and FineWeb-Edu; for example
+\code{config/fineweb/100M/nextlat_finewebedu.yaml} trains a 12-layer, 12-head, $d=768$ model with
+context 1024, $\lambda_{\mathrm{KL}}=\lambda_{\mathrm{MSE}}=1$, horizon 1, \code{proj_factor} 1.3, the
+Muon optimizer, about 10B tokens (19,074 updates of 524,288 tokens), and in-training speculative
+evaluation with draft length 4. The 1B FineWeb-Edu configs come in horizon-1 and horizon-2 variants.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak JaydenTeoh\_\_NextLat/\allowbreak models/\allowbreak model\_nextlat.py} (\texttt{NextLat.speculative\_propose}).},label={lst:c08-nextlat-propose}]
+        core = self._unwrap_module()
+        _, hidden_states = core(seq, return_hidden_states=True)
+        state = hidden_states[:, -1, :]
+        drafted: List[torch.Tensor] = []
+        q_probs_steps: List[torch.Tensor] = []
+
+        for _ in range(steps_to_propose):
+            logits = core.lm_head(state)
+            q_probs = normalize_logits(
+                logits, temperature=temperature, top_k=top_k, top_p=top_p
+            )
+            tok = sample_from_probs(q_probs)
+            drafted.append(tok)
+            q_probs_steps.append(q_probs)
+            next_token_emb = core.token_embedding(tok).squeeze(1)
+            state = core.dynamics_model(state, next_token_emb)
+
+        return torch.cat(drafted, dim=1), q_probs_steps
+\end{lstlisting}
+
+\subsection{Reference implementation}
+
+\Cref{lst:c08-nextlat-ours} gives the loss \eqref{eq:c08-nextlat-total} and the drafting loop in a
+few lines, for a generic causal trunk. The index bookkeeping follows the repository's: at horizon
+step $j$ (0-based) the predicted states are $\hat\vh_{2+j},\dots,\hat\vh_T$ and the teacher logits are
+$\mW\vh_{2+j},\dots,\mW\vh_{T-1}$. We could not execute this listing (PyTorch is not installed in
+our environment); its probabilistic content, the belief-state rollout and the exactness of the
+acceptance rule, was checked numerically as described above.
+
+\begin{lstlisting}[caption={Reference implementation (ours): the NextLat loss and latent drafting.},label={lst:c08-nextlat-ours}]
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class LatentDynamics(nn.Module):              # f_psi(h_t, e(x_{t+1})) -> h_{t+1}
+    def __init__(self, d, proj=1.3):
+        super().__init__()
+        hid = 128 * round(proj * 2 * d / 128)
+        self.norm = nn.LayerNorm(2 * d)
+        self.mlp = nn.Sequential(nn.Linear(2 * d, hid), nn.GELU(),
+                                 nn.Linear(hid, hid), nn.GELU(), nn.Linear(hid, d))
+    def forward(self, h, e_next):
+        return h + self.mlp(self.norm(torch.cat([e_next, h], -1)))   # residual
+
+def nextlat_loss(trunk, emb, head, f, x, horizon=1, l_mse=1.0, l_kl=1.0):
+    """x: [B,T] tokens; trunk maps embeddings to final (normed) hidden states."""
+    e = emb(x); h = trunk(e)                          # [B,T,d]
+    logits = head(h[:, :-1])                          # predicts x_2..x_T
+    loss = F.cross_entropy(logits.flatten(0, 1), x[:, 1:].flatten())
+    teacher = F.log_softmax(logits.detach(), -1)      # log p(. | h_t), no grad
+    h_pred = h
+    for j in range(horizon):
+        h_pred = f(h_pred[:, :-1], e[:, j + 1:])      # roll the latent forward
+        loss = loss + l_mse / horizon * F.smooth_l1_loss(h_pred, h[:, j + 1:].detach())
+        student = F.log_softmax(F.linear(h_pred[:, :-1], head.weight.detach()), -1)
+        loss = loss + l_kl / horizon * F.kl_div(       # KL(teacher || student)
+            student.flatten(0, 1), teacher[:, j + 1:].flatten(0, 1),
+            log_target=True, reduction='batchmean')
+    return loss
+
+@torch.no_grad()
+def draft(trunk, emb, head, f, prefix, gamma):        # cheap self-drafting
+    h = trunk(emb(prefix))[:, -1]                     # one full forward pass
+    toks, qs = [], []
+    for _ in range(gamma):
+        q = F.softmax(head(h), -1); tok = torch.multinomial(q, 1)
+        toks.append(tok); qs.append(q)
+        h = f(h, emb(tok).squeeze(1))                 # MLP step, no attention
+    return torch.cat(toks, 1), qs
+\end{lstlisting}
+
+\subsection{Reported results}
+
+\begin{results}
+The repository contains no result tables; its README describes the evaluations without numbers
+(\repofile{repos/JaydenTeoh__NextLat/README.md}):
+\begin{itemize}
+  \item \textbf{Manhattan taxi rides}: generated trajectories are used to reconstruct the model's
+  internal map of Manhattan and to score sequence compression, detour robustness and the effective
+  rank of the latents (\code{data/manhattan/}).
+  \item \textbf{TinyStories}: frozen models are probed with linear probes on the hidden states to
+  predict 1--20 tokens ahead.
+  \item \textbf{FineWeb-Edu pretraining}: downstream benchmarks via the LM Evaluation Harness, and
+  self-speculative decoding of the multi-token-prediction models (JTP, MTP, NextLat) across domains,
+  reporting acceptance rate and accepted tokens per step.
+  \item Path-Star graphs and Countdown accuracies are tracked during training.
+\end{itemize}
+The survey \citep{zhoubian2026memory} summarizes the mechanism as an objective ``encouraging hidden
+representations to preserve history useful for future prediction''. See \citet{teoh2026nextlat}
+for the reported gains in accuracy, representation compression, planning and decoding speed.
+\end{results}
+
+\subsection{Discussion}
+
+\textbf{Strengths.} NextLat changes neither the architecture nor inference, so it composes with any
+Transformer recipe; the extra cost is a small MLP and a few losses. It gives a concrete,
+testable meaning to ``compact world model'' (\cref{prop:c08-belief}), and the same MLP doubles as a
+free draft model.
+
+\textbf{Limitations.} The guarantee holds only at the optimum of the objective; in practice the
+transition is approximate and errors compound over long rollouts, which is what the horizon
+$d_h$ and the KL term try to control. The KV cache, the actual memory footprint, is unchanged: a
+belief-state Transformer could in principle drop old cache entries, but NextLat itself does not.
+The extra vocabulary-sized projection for the KL term is not free for large vocabularies.
+
+\textbf{Relations.} NextLat is the ``objective-induced'' counterpart of this chapter's other systems:
+KLA and GKA hard-code an estimator into the state update, while NextLat asks gradient descent to
+discover a state with the defining property of an estimator's state. It connects to compressive or
+consolidating designs that do shrink the cache (Bottlenecked Transformers, \cref{ch:routing},
+\citep{oomerjee2026bottlenecked}) and to hybrids that pair a recurrent state with attention
+(\cref{ch:hybrid}).
+
+% ===========================================================================================
+\section{Comparison and discussion}\label{sec:c08-comparison}
+
+\begin{table}[t]
+\centering
+\small
+\caption{The three systems of this chapter side by side ($d_v\times d_k$ state per head or layer;
+$n_\text{iter}$ solver iterations; $\gamma$ draft length).}
+\label{tab:c08-compare}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.3cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & \textbf{Kalman Linear Attention} & \textbf{Gated KalmaNet} & \textbf{Next-Latent Prediction} \\
+\midrule
+What is estimated & Posterior over every state cell of a factorized linear-Gaussian model & Ridge-regression map $\mS_t$ over the gated past & Nothing explicitly; hidden state trained to be a belief state \\
+State & $(\mLambda_t,\mU_t)$: $2d_vd_k$ & $(\mH_t,\mU_t)$: $2d_k^2$ per head & Unchanged KV cache \\
+Write & Precision M\"obius update; GLA-like write gated by $a/(a^2+p\Lambda_{t-1})$ & GLA writes to $\mH_t$ (values $=$ keys) and $\mU_t$ & No new write rule \\
+Read & $(\mU_t\oslash\mLambda_t)\vq_t$, plus variance & $\mU_t(\mH_t+\lambda_t\mI)^{-1}\vq_t$, mixed with GLA read & Standard attention \\
+Uncertainty & Explicit per-cell variance & Implicit (posterior covariance never formed) & None explicit \\
+Forgetting & Process noise $p$ caps precision & Decay gate $\alpha_t$ fades $\mH_t,\mU_t$; the ridge $\lambda_t$ is not decayed & Not applicable \\
+Parallel training & Two associative scans & Chunked Chebyshev + chunkwise GLA & Standard Transformer \\
+Decode cost/token & $\bigO(d_vd_k)$ & $\bigO(n_\text{iter}d_k^2)$ per head & Transformer cost; optional drafting with $\gamma$ MLP steps \\
+Survey update rule & State transition (filtering) & State transition (online regression) & Objective-induced (offline) \\
+Code (mirror) & \texttt{repos/\allowbreak vaisakh-shaj\_\_kalman-\allowbreak linear-attention} & \texttt{repos/\allowbreak awslabs\_\_hybrid-\allowbreak model-factory} & \texttt{repos/\allowbreak JaydenTeoh\_\_NextLat} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:c08-compare} puts the three systems side by side. KLA and GKA sit at opposite corners of
+the same design space. KLA keeps \emph{dynamics} (a transition and process noise) and pays for
+tractability with a fully factorized posterior: it knows how uncertain each cell is but ignores
+correlations between cells. GKA keeps the \emph{full key covariance}, and with it the ability to
+cancel interference between correlated keys, but assumes a static map with fading data in place of
+process noise, and never forms the covariance explicitly: it touches it only through linear solves.
+KLA buys its parallelism with algebra (the information form turns the filter into scans); GKA buys
+it with numerics (an adaptive regularizer makes a fixed-coefficient solver safe inside a chunked
+kernel). NextLat stands apart: it adds no state and no write rule, and instead uses the training
+objective to make an existing representation carry the property, sufficiency, that the other two
+build in by construction.
+
+Practical consequences follow. KLA is the natural choice when per-token uncertainty is itself
+useful downstream, or when decoding cost must stay at GLA levels. GKA is the natural choice for
+recall-heavy workloads inside hybrids, where its extra solve buys precision and its iteration count
+can be tuned at deployment (\cref{ch:hybrid}). NextLat can be added to any Transformer training run,
+including those of hybrid models, and yields a draft model as a by-product.
+
+% ===========================================================================================
+\section{Memory as estimation}\label{sec:c08-estimation}
+
+The background section showed that the delta rule, RLS and the Kalman filter are three ways of
+estimating the same regression map. We can now place the book's recurrent memories on a single
+scale, ordered by how much of the estimation problem each one solves (\cref{tab:c08-ladder}).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Recurrent memories as estimators of the map $\mS$ with $\mS\vk_i\approx\vv_i$. ``Exact''
+means the minimizer of the stated objective (up to solver tolerance for GKA).}
+\label{tab:c08-ladder}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{2.7cm}@{}}
+\toprule
+\textbf{Memory} & \textbf{Objective and step} & \textbf{Preconditioner} & \textbf{Cost/token} \\
+\midrule
+Linear attention / GLA (\cref{ch:linear}) & One unit step on $-\inner{\mS\vk_t}{\vv_t}$ (plus decay) & none & $\bigO(d_kd_v)$ \\
+Delta rule, Gated DeltaNet (\cref{ch:delta}) & One SGD step on $\tfrac12\norm{\mS\vk_t-\vv_t}^2$ from $\mS_{t-1}$ & $\beta_t\mI$ & $\bigO(d_kd_v)$ \\
+Kaczmarz LA (\cref{ch:delta}) & Projection onto $\{\mS:\mS\vk_t=\vv_t\}$ & $\mI/\norm{\vk_t}^2$ & $\bigO(d_kd_v)$ \\
+RLS / static Kalman filter & Exact minimizer of $\sum_{i\le t}\norm{\mS\vk_i-\vv_i}^2+\lambda\norm{\mS}^2$ (one Newton step) & $\mP_t$, i.e.\ $(\mH_t+\lambda\mI)^{-1}$ & $\bigO(d_k^2+d_kd_v)$ \\
+Gated KalmaNet & Exact minimizer of the gated, adaptively regularized objective \eqref{eq:c08-gka-obj}, read along $\vq_t$ only & $(\mH_t+\lambda_t\mI)^{-1}$ via Chebyshev & $\bigO(n_\text{iter}d_k^2)$ \\
+Kalman Linear Attention & Exact posterior of a factorized dynamic model with process noise & per-cell $1/\Lambda_t$ & $\bigO(d_kd_v)$ \\
+Test-time training (\cref{ch:ttt}) & A few gradient steps on a nonlinear memory's loss & optimizer-dependent & model-dependent \\
+Next-Latent Prediction & Changes what is estimated: trains $\vh_t$ to be a sufficient statistic & --- & unchanged \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three observations organize the table.
+
+\paragraph{The preconditioner is a per-direction learning rate.} Every row of the form
+$\mS_t=\mS_{t-1}+(\vv_t-\mS_{t-1}\vk_t)\vk_t\T\bm{B}_t$ differs only in the matrix $\bm{B}_t$. The
+delta rule uses a scalar. Kaczmarz normalizes by the key norm, which makes each write an exact
+projection. RLS uses the inverse key covariance, which gives each direction a learning rate
+inversely proportional to how much evidence it has already received; this is the
+uncertainty-driven step size of the scalar example in \cref{sec:c08-kf}. Per-channel gates in
+Kimi Delta Attention or Gated DeltaNet-2 (\cref{ch:delta}) can be read as cheap diagonal
+approximations of this preconditioner. KLA's per-cell gate $\alpha_t$ and normalizer $1/\Lambda_t$
+are another diagonal choice, derived rather than learned.
+
+\paragraph{Exactness costs compute or structure.} Solving the regression exactly at every token
+requires either a covariance-sized state that is updated with care (RLS, which is fragile with
+forgetting and in low precision), an iterative solve per token (GKA, $n_\text{iter}$ matrix--vector
+products), or a factorization that makes the problem small (KLA). The first-order rules are cheap
+precisely because they solve only the newest term of the objective. Which end of the scale is better
+is an empirical question: keys, values and gates are learned, so the network can compensate for a
+crude estimator, and an exact solution of the wrong objective is not obviously better than an
+approximate solution of the right one.
+
+\paragraph{From updating a state to shaping one.} All rows but the last fix a state and an update
+rule and differ in how faithfully the rule estimates. NextLat inverts the question: it keeps the
+Transformer's machinery and asks training to produce a representation with the defining property of
+an estimator's state. The two approaches are complementary; nothing prevents training a KLA or GKA
+hybrid with a next-latent objective.
+
+\begin{summarybox}
+\begin{itemize}
+  \item A key--value memory can be viewed as an estimator of the map $\mS$ with $\mS\vk_i\approx\vv_i$.
+  The delta rule is one SGD step on the newest pair; RLS, equivalently the posterior mean of a static
+  Kalman filter, is the exact ridge solution, obtained by one Newton step whose preconditioner is the
+  posterior covariance. The delta rule is RLS with that covariance replaced by $\beta_t\mI$.
+  \item In the information form of the Kalman filter, measurement updates add, and prediction is
+  linear (no process noise) or linear-fractional (scalar state with process noise). Both kinds of maps
+  compose associatively, so filtering becomes a parallel scan.
+  \item \textbf{Kalman Linear Attention} runs an exact, factorized Kalman filter in every state cell:
+  a M\"obius scan for the precisions and an affine (GLA-like) scan for the information. Its write
+  gate $a/(a^2+p\Lambda_{t-1})$ comes from the accumulated precision, its read-out divides by the
+  precision, it returns a variance for free, and process noise is its forgetting mechanism.
+  \item \textbf{Gated KalmaNet} sets the state to the solution of a gated, fading ridge regression and
+  reads it as $\mU_t(\mH_t+\lambda_t\mI)^{-1}\vq_t$: a whitened query read from a GLA memory. The
+  adaptive ridge $\lambda_t=r\norm{\mH_t}_F$ bounds the condition number by $1+1/r$, which makes a
+  fixed-interval Chebyshev solver stable in low precision and turns the iteration count into a
+  test-time compute dial; chunked kernels evaluate $\mH_t\vx$ without forming $\mH_t$.
+  \item \textbf{Next-Latent Prediction} adds a latent dynamics MLP and losses that predict the next
+  hidden state; at the optimum, hidden states are belief states. It is offline, objective-induced
+  memory: no architectural change, an unchanged KV cache, and a free draft model for exact
+  self-speculative decoding.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Information-form filter for one cell]\label{ex:c08-ex-info}
+(a) Starting from the scalar model $z_t=az_{t-1}+w_t$, $y_t=cz_t+e_t$ with $\mathrm{Var}(w_t)=p$ and
+$\mathrm{Var}(e_t)=\sigma^2$, derive \eqref{eq:c08-kla-prec} and \eqref{eq:c08-kla-info} with
+$\phi_t=c^2/\sigma^2$ and $r_t=cy_t/\sigma^2$. (b) Show that the derivative of the map
+$\Lambda\mapsto\Lambda/(a^2+p\Lambda)+\phi$ equals $\alpha^2$ with $\alpha=a/(a^2+p\Lambda)$, and
+conclude that for constant $\phi>0$ and $p>0$ the precision converges to the fixed point
+$\Lambda^\star$. (c) Show that rescaling the leaf matrix \eqref{eq:c08-kla-leaf} by any $c>0$ leaves
+$\Lambda_t$ unchanged, and that the product of two leaves has positive trace.
+\end{exercise}
+
+\begin{exercise}[RLS, ridge and the delta rule]\label{ex:c08-ex-rls}
+(a) Prove the Sherman--Morrison formula $(\bm{M}+\vk\vk\T)^{-1}=\bm{M}^{-1}-\bm{M}^{-1}\vk\vk\T
+\bm{M}^{-1}/(1+\vk\T\bm{M}^{-1}\vk)$ and use it to show by induction that RLS with
+$\mP_0=\lambda^{-1}\mI$, $\mS_0=\bm{0}$ produces the ridge solution \eqref{eq:c08-ridge} at every $t$.
+(b) Show that RLS with forgetting factor $\gamma$ (replace $\mP_{t-1}$ by $\mP_{t-1}/\gamma$) minimizes
+$\sum_i\gamma^{t-i}\norm{\mS\vk_i-\vv_i}^2+\lambda\gamma^t\norm{\mS}_F^2$, and explain why the vanishing
+regularizer is a problem when keys stop exciting some direction. (c) Write the delta rule as RLS with
+$\mP_t$ replaced by $\beta_t\mI$ and find the $\beta_t$ for which one delta step from $\mS_{t-1}$ makes
+$\mS_t\vk_t=\vv_t$ exactly (this is the Kaczmarz step of \cref{ch:delta}).
+\end{exercise}
+
+\begin{exercise}[How many Chebyshev iterations?]\label{ex:c08-ex-cheb}
+(a) Using \cref{prop:c08-kappa} and \eqref{eq:c08-cheb-poly}, compute the number of iterations needed
+to guarantee relative error $10^{-3}$ for $r\in\{0.005,0.02,0.1\}$, and the number gradient descent
+with the optimal step would need. (b) Redo \cref{ex:c08-whiten} for these values of $r$ and plot the
+retrieved value against $r$. What does the regularizer trade against what? (c) Explain why the
+Chebyshev output after $n$ steps is a linear function of $\vq$ with a symmetric Jacobian, and why
+this lets the backward pass reuse the forward solver, as in \eqref{eq:c08-gka-bwd}.
+\end{exercise}
+
+\begin{exercise}[Coding: chunked GKA]\label{ex:c08-ex-code}
+Implement \cref{alg:c08-gka-prefill} in NumPy for one head, using \eqref{eq:c08-gka-chunkHX} and
+\eqref{eq:c08-gka-fro}, and check it against \code{gka_recurrent} of \cref{lst:c08-gka-ours} for
+several chunk sizes. Then implement the backward pass for $\tilde\vq_t$ by \eqref{eq:c08-gka-bwd}
+(including the term from $\lambda_t=r\norm{\mH_t}_F$) and verify it against finite differences.
+\end{exercise}
+
+\begin{exercise}[Belief states need the transition constraint]\label{ex:c08-ex-belief}
+(a) Extend the proof of \cref{prop:c08-belief} to show that if (a) and (b) hold then any two histories
+with the same $\vh_t$ have identical conditional distributions over all futures. (b) Construct a
+two-symbol source and two histories for which $P(x_{t+1}\mid\text{history})$ is identical but
+$P(x_{t+2}\mid\text{history},x_{t+1})$ differs. Explain why a Transformer trained only on next-token
+prediction may map both histories to the same $\vh_t$, and why condition (b) forbids it.
+\end{exercise}
+
+\begin{exercise}[Speculative sampling]\label{ex:c08-ex-spec}
+(a) Prove that the accept/resample rule of \cref{sec:c08-nextlat-spec} outputs exactly $p$, and that
+the probability of accepting a draft is $\sum_y\min(p(y),q(y))=1-\mathrm{TV}(p,q)$. (b) If drafts at
+positions $2,\dots,\gamma$ are accepted independently with probability $\pi$, compute the expected
+number of tokens produced per verification pass. Why is the first draft of NextLat always accepted?
+\end{exercise}

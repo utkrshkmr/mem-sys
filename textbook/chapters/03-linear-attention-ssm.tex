@@ -1,3 +1,2092 @@
 \chapter{Linear Attention, State-Space Models, and Chunkwise Computation}\label{ch:linear}
+% Code-heavy chapter: avoid stretched vertical glue around unbreakable boxes and tables.
+% \flushbottom (the book-class default) is restored at the end of this file.
+\raggedbottom
 
-(Chapter in preparation.)
+A Transformer remembers its context in the KV cache (\cref{ch:foundations}): every token leaves
+a key and a value behind, and every new query reads all of them. This memory is exact and never
+forgets anything, but it grows with the context. A head that has seen $t$ tokens stores
+$t(d_k+d_v)$ numbers and spends $\bigO(t(d_k+d_v))$ operations to produce the next output, and
+training on a sequence of length $T$ costs $\bigO(T^2)$. In the taxonomy of \cref{ch:taxonomy}
+the KV cache is implicit, online, short-term memory whose capacity is paid for with storage.
+
+This chapter develops the main alternative, which the survey of \citet{zhoubian2026memory} calls
+\emph{recurrent sequence memory} (its \S III-C). The idea is to compress the whole past into a
+matrix of fixed size per head, $\mS_t\in\R^{d_v\times d_k}$, to update this matrix with a cheap
+rule at every token, and to read it with a single matrix--vector product, $\vo_t=\mS_t\vq_t$.
+Memory and per-token cost then no longer depend on $t$. The price is that a fixed-size state can
+hold only a limited amount of information, so \emph{how} the state is written---what is added,
+what is forgotten, what is overwritten---becomes the central design question. The survey's
+Table~II groups these mechanisms under \emph{state-transition updates} and names their two main
+risks: compression loss and interference inside the state.
+
+The chapter is organized as follows. \Cref{sec:c03-linear} derives linear attention from
+softmax attention, interprets it as a fast-weight memory and proves how many associations such a
+memory can hold. \Cref{sec:c03-forms} shows that the same computation has three equivalent
+forms---recurrent, parallel and chunkwise---and explains why the chunkwise form is the one that
+runs fast on GPUs. \Cref{sec:c03-gating} adds forgetting (RetNet, GLA, the Mamba-2 gate) and
+shows how to keep the decay factors numerically stable. \Cref{sec:c03-delta} derives the delta
+rule as online regression and its chunkwise algorithm through the WY representation and the UT
+transform. \Cref{sec:c03-ssm} connects all of this to state-space models: S4, Mamba, Mamba-2 and
+structured state-space duality, together with parallel scans. \Cref{sec:c03-fla} reads the
+corresponding code in the \fla{} library and in the Mamba repository, and \cref{sec:c03-ours}
+gives our own reference implementations together with the numerical checks we ran on them.
+\Cref{sec:c03-comparison} summarizes every model of the chapter as one recurrence
+$\mS_t=\mathcal{A}_t(\mS_{t-1})+\mathcal{B}_t$.
+
+This chapter is the foundation for Part~II (implicit memory) and for the recurrent half of the
+hybrid models of \cref{ch:hybrid}. Gated DeltaNet and Kimi Delta Attention (\cref{ch:delta}),
+DeltaProduct, Comba and RWKV-7 (\cref{ch:expressive}), Log-Linear Attention, Mixture-of-Memories
+and Mamba-3 (\cref{ch:structured}), and the Kalman-filter models of \cref{ch:probabilistic} all
+differ from the models here only in their transition and write terms, and all of them inherit
+the chunkwise algorithm derived below. We therefore derive every step.
+
+\paragraph{Conventions.}
+We work with a single head and drop the head index. Vectors are columns. Stacked matrices have
+one token per row, so row $t$ of $\mQ\in\R^{T\times d_k}$ is $\vq_t\T$. The state maps keys to
+values, $\mS_t\in\R^{d_v\times d_k}$, so that a read is $\vo_t=\mS_t\vq_t$. Code bases differ:
+the \fla{} library stores the transpose $\mS_t\T$ (shape \texttt{[K, V]}), whereas the Mamba
+code stores \texttt{(headdim, d\_state)}, which is our $d_v\times d_k$ layout. We flag the
+transposition whenever we read code. We write $\bm{L}\in\{0,1\}^{T\times T}$ for the
+\emph{multiplicative} causal mask, $L_{ts}=1$ if $s\le t$ and $0$ otherwise; it is related to
+the additive mask $\mM$ of \cref{ch:foundations} by $\bm{L}=\exp(\mM)$ elementwise, because
+$e^0=1$ and $e^{-\infty}=0$.
+
+% ======================================================================
+\section{From softmax attention to linear attention}\label{sec:c03-linear}
+
+\subsection{Attention as a key--value memory}
+
+Causal softmax attention for one head computes, at position $t$,
+\begin{equation}\label{eq:c03-softmax}
+  \vo_t=\sum_{i=1}^{t}
+  \frac{\exp\!\big(\vq_t\T\vk_i/\sqrt{d_k}\big)}{\sum_{j=1}^{t}\exp\!\big(\vq_t\T\vk_j/\sqrt{d_k}\big)}\,\vv_i .
+\end{equation}
+Read as a memory, the \emph{write} operation appends the pair $(\vk_t,\vv_t)$ to a growing list,
+and the \emph{read} operation returns an average of all stored values, weighted by how similar
+their keys are to the query. Nothing is ever forgotten, so recall can be exact, but both storage
+and read cost grow linearly with $t$.
+
+Why can we not simply summarize the list in a fixed-size object? Because the exponential couples
+the query and each key inside a nonlinearity. For each new query the weights
+$\exp(\vq_t\T\vk_i/\sqrt{d_k})$ must be recomputed for every stored key; there is no quantity
+that can be computed once from the keys and values and then reused for all future queries.
+
+\subsection{Kernelized attention and the associativity trick}
+
+\citet{katharopoulos2020transformers} replace the similarity $\exp(\vq\T\vk/\sqrt{d_k})$ by an
+inner product of features, $\mathrm{sim}(\vq,\vk)=\phi(\vq)\T\phi(\vk)$, where
+$\phi:\R^{d_k}\to\R^{d'}$ is a \emph{feature map} with nonnegative outputs (they use
+$\phi(x)=\mathrm{elu}(x)+1$ applied elementwise). Attention becomes
+\begin{equation}\label{eq:c03-kernel-attn}
+  \vo_t=\frac{\sum_{i=1}^{t}\big(\phi(\vq_t)\T\phi(\vk_i)\big)\,\vv_i}
+             {\sum_{j=1}^{t}\phi(\vq_t)\T\phi(\vk_j)} .
+\end{equation}
+Now look at one term of the numerator. The factor $\phi(\vq_t)\T\phi(\vk_i)$ is a scalar, so it
+can be moved to the right of $\vv_i$; the inner product is symmetric, so it equals
+$\phi(\vk_i)\T\phi(\vq_t)$; and matrix multiplication is associative, so
+\[
+  \big(\phi(\vq_t)\T\phi(\vk_i)\big)\vv_i
+  =\vv_i\big(\phi(\vk_i)\T\phi(\vq_t)\big)
+  =\big(\vv_i\phi(\vk_i)\T\big)\phi(\vq_t).
+\]
+The query has moved \emph{outside} the sum, so
+\begin{equation}\label{eq:c03-la-normalized}
+  \vo_t=\frac{\mS_t\,\phi(\vq_t)}{\vz_t\T\phi(\vq_t)},\qquad
+  \mS_t=\sum_{i=1}^{t}\vv_i\phi(\vk_i)\T\in\R^{d_v\times d'},\qquad
+  \vz_t=\sum_{i=1}^{t}\phi(\vk_i)\in\R^{d'}.
+\end{equation}
+Both $\mS_t$ and $\vz_t$ are running sums, so they obey
+$\mS_t=\mS_{t-1}+\vv_t\phi(\vk_t)\T$ and $\vz_t=\vz_{t-1}+\phi(\vk_t)$. The whole past is
+summarized in $d_v d'+d'$ numbers, independent of $t$: this is the sense in which
+``Transformers are RNNs''.
+
+Linear attention is not an approximation of softmax attention. The exponential kernel
+corresponds to an infinite-dimensional feature map, so no finite $\phi$ reproduces it exactly;
+random-feature methods such as Performers \citep{c03-choromanski2021performers} approximate it,
+but the models that matter for this book simply choose a cheap $\phi$ and train the network
+around it. In modern layers $\phi$ is usually the identity or a SiLU, followed by a
+normalization of $\vq$ and $\vk$ (the \fla{} DeltaNet layer, for example, defaults to SiLU and
+$\ell_2$ normalization; \cref{sec:c03-fla}). From now on we absorb $\phi$ into the projections,
+writing $\vq_t$ for $\phi(\mW_Q\T\vx_t)$ and $\vk_t$ for $\phi(\mW_K\T\vx_t)$, so that $d'=d_k$.
+
+\begin{definition}[Linear attention, recurrent form]\label{def:c03-la}
+Given queries and keys $\vq_t,\vk_t\in\R^{d_k}$, values $\vv_t\in\R^{d_v}$ and an initial state
+$\mS_0\in\R^{d_v\times d_k}$ (usually $\bm 0$), linear attention computes
+\begin{equation}\label{eq:c03-la}
+  \mS_t=\mS_{t-1}+\vv_t\vk_t\T,\qquad \vo_t=\mS_t\vq_t,\qquad t=1,\dots,T.
+\end{equation}
+\end{definition}
+
+\subsection{Normalization}
+
+\Cref{eq:c03-la} drops the denominator $\vz_t\T\vq_t$ of \cref{eq:c03-la-normalized}. Two
+problems motivate this. First, with feature maps that can be negative (identity, SiLU) the
+denominator can be close to zero or negative, and dividing by it is unstable.
+\citet{c03-qin2022devil} trace unbounded gradients in linear Transformers to this scaling and
+propose replacing it by a normalization layer on the output. Second, the denominator is an
+extra state that every later variant would have to carry through its gates and corrections,
+whereas a normalization of the output achieves a similar rescaling without it. Current practice,
+which we follow, is to drop the denominator, scale queries by $1/\sqrt{d_k}$, and apply an
+RMSNorm or LayerNorm to each head's output before the output projection. The \fla{} code exposes
+both choices: the kernel \code{chunk_linear_attn} has a \code{normalize} flag that divides by
+$\vq_t\T(\sum_{i\le t}\vk_i)$, while the \code{LinearAttention} layer passes
+\code{normalize=do_feature_map_norm}, which is off by default, and applies an output RMSNorm.
+
+\subsection{What a fixed-size memory costs}
+
+\begin{table}[t]
+\centering
+\caption{Cost of one head of softmax attention and of linear attention. ``State'' is what must
+be kept in memory during generation after $t$ tokens. The training figure for linear attention
+is the number of arithmetic operations of the recurrent form; \cref{sec:c03-forms} shows how to
+obtain it with parallel hardware-friendly computation.}
+\label{tab:c03-cost}
+\begin{tabular}{lll}
+\toprule
+ & Softmax attention & Linear attention \\
+\midrule
+State after $t$ tokens & KV cache, $t\,(d_k+d_v)$ numbers & $\mS_t$, $d_k d_v$ numbers \\
+Cost of one decoding step & $\bigO(t\,(d_k+d_v))$ & $\bigO(d_k d_v)$ \\
+Training / prefill on $T$ tokens & $\bigO(T^2(d_k+d_v))$ & $\bigO(T d_k d_v)$ \\
+Exact recall of any past token & yes & no (\cref{prop:c03-capacity}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:c03-cost} compares the two. A concrete reading: with $d_k=d_v=128$, the state holds
+$128\times 128=16384$ numbers, which is the size of the KV cache of $16384/256=64$ tokens. A
+linear-attention head therefore has the memory footprint of a 64-token KV cache, whether it has
+read a hundred tokens or a million. That makes the capacity question unavoidable.
+
+\subsection{Linear attention as a fast-weight programmer}
+
+The state $\mS_t$ is the weight matrix of a linear layer that is applied to the query:
+$\vo_t=\mS_t\vq_t$. Its weights are not trained by backpropagation across the dataset; they are
+\emph{written} during the forward pass, one rank-one ``program'' $\vv_t\vk_t\T$ per token, by
+the slowly trained projections $\mW_K$ and $\mW_V$. This is a \emph{fast-weight} system in the
+sense of \citet{schmidhuber1992fastweights} and \citet{ba2016fastweights}, and
+\citet{c02-schlag2021linear} make the equivalence precise: a linear Transformer is a fast-weight
+programmer whose update is the outer product of value and key. The outer-product update is
+Hebb's rule---the connection between input unit $j$ (key coordinate) and output unit $i$ (value
+coordinate) is strengthened by the product of their activities, $(\vv_t)_i(\vk_t)_j$.
+
+The fast-weight view is the thread of the whole chapter. A memory with a matrix state is an
+\emph{associative memory}: we store pairs $(\vk_i,\vv_i)$ and hope that reading with $\vk_j$
+returns $\vv_j$. Different models differ in the \emph{learning rule} that writes the fast
+weights: linear attention uses the Hebbian sum, gated models add weight decay
+(\cref{sec:c03-gating}), and the delta rule uses error-correcting gradient descent
+(\cref{sec:c03-delta}). \Cref{ch:ttt} pushes the view further by replacing the matrix with a
+small neural network trained at test time.
+
+\begin{taxonomy}
+\textbf{Linear attention and the other recurrences of this chapter} (survey \S III-C,
+\citet{zhoubian2026memory}).
+\emph{Representation:} implicit---the state $\mS_t$ is a by-product of the forward computation
+and has no separate read/write interface.
+\emph{Update dynamics:} online---the state is written at every token during inference.
+\emph{Persistence:} the survey's Table~I lists RetNet, Mamba/Mamba-2 and the delta-rule models
+as long-term, because the state can carry information across an unbounded stream; it is still
+confined to one sequence or session.
+\emph{Update rule (Table~II):} state-transition updates, whose main risks are compression loss
+and interference inside the state.
+\end{taxonomy}
+
+\subsection{Capacity and interference}\label{sec:c03-capacity}
+
+Suppose pairs $(\vk_1,\vv_1),\dots,(\vk_n,\vv_n)$ have been written with \cref{eq:c03-la},
+starting from $\mS_0=\bm 0$, and we read with one of the stored keys:
+\begin{equation}\label{eq:c03-crosstalk}
+  \mS_n\vk_j=\sum_{i=1}^{n}\vv_i(\vk_i\T\vk_j)
+  =\underbrace{\norm{\vk_j}^2\vv_j}_{\text{signal}}
+  +\underbrace{\sum_{i\ne j}(\vk_i\T\vk_j)\,\vv_i}_{\text{crosstalk}} .
+\end{equation}
+The retrieved vector is the stored value plus a mixture of every other value, weighted by key
+overlaps. Exact recall requires the crosstalk to vanish.
+
+\begin{proposition}[Exact recall with the sum rule]\label{prop:c03-orthogonal}
+Let $\vk_1,\dots,\vk_n\in\R^{d_k}$ have unit norm and let $\mS=\sum_{i=1}^n\vv_i\vk_i\T$. Then
+$\mS\vk_j=\vv_j$ holds for all $j$ and for every choice of values $\vv_1,\dots,\vv_n$ if and only
+if the keys are pairwise orthogonal. In particular this requires $n\le d_k$.
+\end{proposition}
+
+\begin{proof}
+If the keys are orthonormal, the crosstalk term in \cref{eq:c03-crosstalk} is zero and the
+signal term is $\vv_j$. Conversely, suppose exact recall holds for every choice of values. Fix
+an index $m$, a nonzero vector $\ve\in\R^{d_v}$, and choose $\vv_m=\ve$ and $\vv_i=\bm 0$ for
+$i\ne m$. Then $\mS=\ve\vk_m\T$ and, for $j\ne m$, exact recall demands
+$\bm 0=\vv_j=\mS\vk_j=(\vk_m\T\vk_j)\ve$, hence $\vk_m\T\vk_j=0$. Since $m$ was arbitrary, the
+keys are pairwise orthogonal. Orthonormal vectors are linearly independent, and $\R^{d_k}$ has
+at most $d_k$ linearly independent vectors, so $n\le d_k$.
+\end{proof}
+
+The bound $n\le d_k$ is not an artifact of the Hebbian rule. It holds for \emph{every} memory
+of this chapter, because all of them read linearly from a $d_v\times d_k$ matrix.
+
+\begin{proposition}[Capacity of any matrix memory with a linear read]\label{prop:c03-capacity}
+Let $\vk_1,\dots,\vk_n\in\R^{d_k}$ with $n>d_k$. There are coefficients $c_1,\dots,c_n$, not
+all zero, such that for \emph{every} matrix $\mS\in\R^{d_v\times d_k}$ the retrieved vectors
+$\hat\vv_i=\mS\vk_i$ satisfy $\sum_i c_i\hat\vv_i=\bm 0$. Consequently no write rule, however
+clever, can make $\mS\vk_i=\vv_i$ hold for all $i$ when the targets violate this linear
+relation, for example when $\vv_i=c_i\ve$ with $\ve\ne\bm 0$.
+\end{proposition}
+
+\begin{proof}
+More than $d_k$ vectors in $\R^{d_k}$ are linearly dependent, so there are coefficients
+$c\ne\bm 0$ with $\sum_i c_i\vk_i=\bm 0$. Applying $\mS$ gives
+$\sum_i c_i\mS\vk_i=\mS\sum_i c_i\vk_i=\bm 0$. If $\vv_i=c_i\ve$, exact recall would give
+$\sum_i c_i\vv_i=(\sum_i c_i^2)\ve\ne\bm 0$, a contradiction.
+\end{proof}
+
+The key dimension $d_k$ (the state size $N$ in state-space language, \cref{sec:c03-ssm}) is
+therefore a hard bound on how many arbitrary associations one head can recall exactly. Beyond
+that bound, the write rule decides \emph{which} associations survive and how the error is
+distributed: linear attention superimposes everything, gated models let old associations fade,
+and the delta rule overwrites. These are the three strategies of the next sections, and the
+bound is one reason hybrid architectures (\cref{ch:hybrid}) keep a few softmax-attention layers.
+
+\begin{example}[Interference with $d_k=d_v=2$]\label{ex:c03-interference}
+Write $(\vk_1,\vv_1)=(\ve_1,\ve_1)$ and $(\vk_2,\vv_2)=(\ve_2,\ve_2)$, where $\ve_1,\ve_2$ are
+the standard basis vectors. Then $\mS_2=\ve_1\ve_1\T+\ve_2\ve_2\T=\mI$, and both pairs are
+recalled exactly because the keys are orthogonal. Now write a third pair whose key overlaps both:
+$\vk_3=(1,1)\T/\sqrt2$, $\vv_3=(1,-1)\T$. The state becomes
+\[
+  \mS_3=\mI+\vv_3\vk_3\T=
+  \begin{pmatrix}1.7071 & 0.7071\\ -0.7071 & 0.2929\end{pmatrix},
+\]
+and every read is now wrong (the targets are $(1,0)\T$, $(0,1)\T$ and $(1,-1)\T$):
+\[
+  \mS_3\vk_1=\begin{pmatrix}1.7071\\-0.7071\end{pmatrix},\qquad
+  \mS_3\vk_2=\begin{pmatrix}0.7071\\0.2929\end{pmatrix},\qquad
+  \mS_3\vk_3=\vk_3+\vv_3=\begin{pmatrix}1.7071\\-0.2929\end{pmatrix}.
+\]
+The third key has overlap $1/\sqrt2$ with each of the first two, so it leaks into their reads
+and they leak into its read. With $n=3>d_k=2$, \cref{prop:c03-capacity} says no rule could
+have stored all three exactly; the point of the example is that linear attention spreads the
+error over every association and never removes it. We return to this example with the delta
+rule in \cref{ex:c03-delta}.
+\end{example}
+
+% ======================================================================
+\section{Three ways to compute the same thing}\label{sec:c03-forms}
+
+Linear attention can be computed in three ways that give identical outputs but have very
+different costs on real hardware. Stack the sequence as $\mQ,\mK\in\R^{T\times d_k}$ and
+$\mV,\mO\in\R^{T\times d_v}$, one token per row.
+
+\subsection{The recurrent form}
+
+The recurrent form is \cref{eq:c03-la} executed token by token (\cref{alg:c03-recurrent}). Each
+step does an outer product and a matrix--vector product, $\bigO(d_kd_v)$ operations, so a
+sequence costs $\bigO(Td_kd_v)$ operations and $\bigO(d_kd_v)$ memory for the state. For
+\emph{decoding}, one token at a time, this is ideal: the cost per token does not grow.
+
+For \emph{training} and for prefilling a long prompt it is a poor fit to a GPU, for three
+reasons. (i) The $T$ steps are sequential; the only parallelism is across batch elements, heads
+and tiles of the state. (ii) Outer products and matrix--vector products cannot use tensor cores,
+which accelerate only dense matrix--matrix products (\cref{ch:foundations}); each state element
+takes part in $\bigO(1)$ arithmetic operations per step, so when the state does not fit on chip
+the computation is limited by memory bandwidth. (iii) Backpropagation needs the intermediate
+states; storing all of them costs $\bigO(Td_kd_v)$ memory.
+
+\begin{algorithm}[t]
+\caption{Linear attention, recurrent form (decoding, or reference prefill)}\label{alg:c03-recurrent}
+\begin{algorithmic}[1]
+\Require $\vq_t,\vk_t\in\R^{d_k}$, $\vv_t\in\R^{d_v}$ for $t=1..T$; initial state $\mS_0$
+\Ensure outputs $\vo_1,\dots,\vo_T$; final state $\mS_T$
+\For{$t=1$ to $T$}
+  \State $\mS_t\gets\mS_{t-1}+\vv_t\vk_t\T$ \Comment{rank-one write, $\bigO(d_kd_v)$}
+  \State $\vo_t\gets\mS_t\vq_t$ \Comment{read, $\bigO(d_kd_v)$}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{The parallel form}
+
+\begin{proposition}[Parallel form]\label{prop:c03-parallel}
+With $\mS_0=\bm 0$, the outputs of \cref{eq:c03-la} are
+\begin{equation}\label{eq:c03-parallel}
+  \mO=(\mQ\mK\T\had\bm{L})\,\mV .
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By induction on $t$, $\mS_t=\sum_{i=1}^{t}\vv_i\vk_i\T$: this holds for $t=0$ (empty sum), and
+$\mS_t=\mS_{t-1}+\vv_t\vk_t\T$ adds the $t$-th term. Therefore
+\[
+  \vo_t=\mS_t\vq_t=\sum_{i=1}^{t}\vv_i(\vk_i\T\vq_t)
+  =\sum_{i=1}^{T}L_{ti}\,(\vq_t\T\vk_i)\,\vv_i ,
+\]
+and the right-hand side is row $t$ of $(\mQ\mK\T\had\bm{L})\mV$ written as a column: entry
+$(t,i)$ of $\mQ\mK\T$ is $\vq_t\T\vk_i$, the mask removes $i>t$, and multiplying by $\mV$ forms
+the weighted sum of value rows.
+\end{proof}
+
+This is softmax attention with the softmax (and its normalization) removed. It costs
+$\bigO(T^2(d_k+d_v))$ operations and is fully parallel and made of matrix products, but it is
+quadratic in $T$ again, which defeats the purpose.
+
+\subsection{The chunkwise parallel form}
+
+The chunkwise form interpolates between the two. Split the sequence into $N=T/C$ chunks of $C$
+consecutive tokens (pad the sequence if $C$ does not divide $T$). Chunk $i\in\{1,\dots,N\}$
+contains positions $(i-1)C+1,\dots,iC$; we write $\mQ_{[i]},\mK_{[i]}\in\R^{C\times d_k}$ and
+$\mV_{[i]},\mO_{[i]}\in\R^{C\times d_v}$ for its rows, $\bm{L}_C$ for the $C\times C$ causal mask,
+and
+\[
+  \mS_{[i]}\defeq\mS_{iC}\qquad(\text{the state after chunk } i),\qquad \mS_{[0]}=\mS_0 .
+\]
+
+\paragraph{Derivation.}
+Take a position inside chunk $i$, $t=(i-1)C+r$ with $1\le r\le C$, and unroll the recurrence
+only back to the start of the chunk:
+\[
+  \mS_t=\mS_{[i-1]}+\sum_{j=1}^{r}\vv_{(i-1)C+j}\,\vk_{(i-1)C+j}\T .
+\]
+Multiplying by $\vq_t$ splits the output into a contribution from all earlier chunks, carried by
+the state, and a contribution from the current chunk:
+\[
+  \vo_t=\underbrace{\mS_{[i-1]}\vq_t}_{\text{inter-chunk}}
+  +\underbrace{\sum_{j=1}^{r}\big(\vq_t\T\vk_{(i-1)C+j}\big)\,\vv_{(i-1)C+j}}_{\text{intra-chunk}} .
+\]
+Stacking the $C$ rows of the chunk turns both terms into matrix products. Row $r$ of
+$\mQ_{[i]}\mS_{[i-1]}\T$ is $\vq_t\T\mS_{[i-1]}\T=(\mS_{[i-1]}\vq_t)\T$, and the intra-chunk
+sum is row $r$ of \cref{eq:c03-parallel} applied to the chunk alone. Unrolling to the end of the
+chunk ($r=C$) gives the next boundary state. Altogether:
+\begin{align}
+  \mO_{[i]}&=\mQ_{[i]}\mS_{[i-1]}\T+\big(\mQ_{[i]}\mK_{[i]}\T\had\bm{L}_C\big)\mV_{[i]},
+  \label{eq:c03-chunk-out}\\
+  \mS_{[i]}&=\mS_{[i-1]}+\mV_{[i]}\T\mK_{[i]} .\label{eq:c03-chunk-state}
+\end{align}
+The state update uses $\mV_{[i]}\T\mK_{[i]}=\sum_{j=1}^{C}\vv_{(i-1)C+j}\vk_{(i-1)C+j}\T$.
+
+\begin{proposition}[Equivalence of the three forms]\label{prop:c03-chunk-equiv}
+For every chunk size $C$ dividing $T$, \cref{eq:c03-chunk-out,eq:c03-chunk-state} produce the
+same outputs as \cref{alg:c03-recurrent} and, when $\mS_0=\bm 0$, as \cref{eq:c03-parallel}.
+The cases $C=1$ and $C=T$ are the recurrent and the parallel form.
+\end{proposition}
+
+\begin{proof}
+The derivation above shows that \cref{eq:c03-chunk-out} equals the recurrent output at every
+position, given that $\mS_{[i-1]}$ is the true state after chunk $i-1$; \cref{eq:c03-chunk-state}
+is the recurrence unrolled over one chunk, so this holds for every $i$ by induction. The
+parallel form agrees with the recurrent one by \cref{prop:c03-parallel}. A second, more
+pictorial proof partitions $\mQ\mK\T\had\bm{L}$ into $C\times C$ blocks. Block $(i,i')$ is
+$\mQ_{[i]}\mK_{[i']}\T$ if $i'<i$ (the mask is all ones there), $\mQ_{[i]}\mK_{[i]}\T\had\bm{L}_C$
+if $i'=i$, and zero if $i'>i$. Row block $i$ of \cref{eq:c03-parallel} is therefore
+\[
+  \sum_{i'<i}\mQ_{[i]}\mK_{[i']}\T\mV_{[i']}+\big(\mQ_{[i]}\mK_{[i]}\T\had\bm{L}_C\big)\mV_{[i]}
+  =\mQ_{[i]}\Big(\sum_{i'<i}\mV_{[i']}\T\mK_{[i']}\Big)\T+\cdots
+  =\mQ_{[i]}\mS_{[i-1]}\T+\cdots,
+\]
+which is \cref{eq:c03-chunk-out}.
+\end{proof}
+
+The block picture (\cref{fig:c03-chunk}) is worth remembering. The off-diagonal blocks of the
+$T\times T$ ``attention matrix'' are products of a $C\times d_k$ and a $d_k\times C$ matrix, so
+they have rank at most $d_k$, and all of them in one block row are handled at once through the
+state $\mS_{[i-1]}$. Only the diagonal blocks need the explicit $C\times C$ masked product. We
+will meet the same picture again for gated models (\cref{sec:c03-gating}), the delta rule
+(\cref{sec:c03-delta}) and Mamba-2, where it is called structured state-space duality
+(\cref{sec:c03-ssm}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=1.05cm,y=1.05cm]
+  % block matrix
+  \foreach \i in {0,1,2,3} {
+    \foreach \j in {0,1,2,3} {
+      \ifnum\j<\i
+        \fill[blue!18] (\j,-\i) rectangle ++(1,-1);
+      \fi
+    }
+    \fill[orange!45] (\i,-\i) -- (\i,-\i-1) -- (\i+1,-\i-1) -- cycle;
+  }
+  \draw[gray!70,step=1] (0,0) grid (4,-4);
+  \draw[thick] (0,0) rectangle (4,-4);
+  \foreach \i in {1,2,3,4} {
+    \node[font=\scriptsize,anchor=east] at (-0.05,-\i+0.5) {chunk $\i$};
+  }
+  \node[font=\small] at (2,-4.4) {$\mQ\mK\T\odot\bm{L}$ in $C\times C$ blocks};
+  % legend
+  \fill[orange!45] (-0.9,-4.95) rectangle ++(0.3,-0.3);
+  \node[font=\scriptsize,anchor=west] at (-0.55,-5.1) {diagonal block: explicit masked $C\times C$ product (intra-chunk)};
+  \fill[blue!18] (-0.9,-5.45) rectangle ++(0.3,-0.3);
+  \node[font=\scriptsize,anchor=west] at (-0.55,-5.6) {off-diagonal block: rank $\le d_k$, read through $\mQ_{[i]}\mS_{[i-1]}\T$ (inter-chunk)};
+  % state chain
+  \foreach \i/\n in {0/0,1/1,2/2,3/3} {
+    \node[draw,rounded corners,fill=blue!8,minimum width=1.1cm,minimum height=0.5cm,font=\small]
+      (s\i) at (6.0,-\i-0.5) {$\mS_{[\n]}$};
+    \draw[->,dashed,gray] (s\i.west) -- (4.15,-\i-0.5);
+  }
+  \foreach \i/\j in {0/1,1/2,2/3} {
+    \draw[->,thick] (s\i.south) -- (s\j.north);
+    \node[font=\scriptsize,anchor=west] at (6.6,-\i-1) {$+\,\mV_{[\j]}\T\mK_{[\j]}$};
+  }
+  \node[font=\scriptsize,align=center] at (6.3,-4.4) {sequential pass over\\ $N=T/C$ chunk states};
+\end{tikzpicture}
+\caption{Chunkwise computation of linear attention with $N=4$ chunks. Left: the masked score
+matrix partitioned into $C\times C$ blocks; diagonal blocks (orange) are computed explicitly
+with the causal mask, off-diagonal blocks (blue) are never formed because each block row reads
+them through the state at the start of the chunk. Right: the states at chunk boundaries, each
+obtained from the previous one by adding one $d_v\times d_k$ matrix product; the dashed arrows
+show which state serves which block row.}
+\label{fig:c03-chunk}
+\end{figure}
+
+\begin{algorithm}[t]
+\caption{Linear attention, chunkwise parallel form (training and prefill)}\label{alg:c03-chunk}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK\in\R^{T\times d_k}$, $\mV\in\R^{T\times d_v}$, chunk size $C$, initial state $\mS_{[0]}$
+\Ensure $\mO\in\R^{T\times d_v}$ and the final state $\mS_{[N]}$
+\LineComment{Pass 1: state passing, sequential over $N=T/C$ chunks}
+\For{$i=1$ to $N$}
+  \State store $\mS_{[i-1]}$ \Comment{only $N$ states are ever written to memory}
+  \State $\mS_{[i]}\gets\mS_{[i-1]}+\mV_{[i]}\T\mK_{[i]}$ \Comment{$(d_v\times C)(C\times d_k)$ matmul}
+\EndFor
+\LineComment{Pass 2: outputs, all chunks in parallel}
+\For{$i=1$ to $N$ \textbf{in parallel}}
+  \State $\mO_{[i]}\gets\mQ_{[i]}\mS_{[i-1]}\T+(\mQ_{[i]}\mK_{[i]}\T\odot\bm{L}_C)\mV_{[i]}$ \Comment{inter + intra}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.}
+Per chunk, the intra-chunk part costs $C^2d_k$ operations for $\mQ_{[i]}\mK_{[i]}\T$ and $C^2d_v$
+for the product with $\mV_{[i]}$; over $N=T/C$ chunks that is $\bigO(TC(d_k+d_v))$. The
+inter-chunk read $\mQ_{[i]}\mS_{[i-1]}\T$ and the state update $\mV_{[i]}\T\mK_{[i]}$ each cost
+$Cd_kd_v$ per chunk, $\bigO(Td_kd_v)$ in total. Per head, the chunkwise algorithm therefore costs
+\begin{equation}\label{eq:c03-chunk-cost}
+  \bigO\big(TC(d_k+d_v)+Td_kd_v\big)\quad\text{operations},\qquad
+  \bigO\big((T/C)\,d_kd_v\big)\quad\text{memory for boundary states},
+\end{equation}
+with only $T/C$ sequential steps. With $d_v\approx d_k$ this is the $\bigO(TCd_k+Td_kd_v)$ of the
+chapter overview. The two terms balance when $C\approx d_k d_v/(d_k+d_v)$, so chunk sizes of the
+same order as the head dimension are natural; the \fla{} kernels default to $C=64$ and the
+Mamba-2 module to a chunk size of 256 (\cref{sec:c03-fla,sec:c03-ssm}).
+
+\subsection{Why the chunkwise form is the one that runs fast}
+
+All work in \cref{alg:c03-chunk} consists of dense matrix products with inner dimension $C$,
+$d_k$ or $d_v$, which is exactly what tensor cores execute efficiently. Compared with the
+recurrent form it has three hardware advantages.
+\begin{enumerate}
+\item \emph{Matrix multiplications instead of matrix--vector products.} Each loaded element of
+$\mQ_{[i]}$, $\mK_{[i]}$ or the state is reused in $\bigO(C)$ or $\bigO(d)$ multiply--adds, so
+the arithmetic intensity grows with $C$ and the computation is no longer limited by memory
+bandwidth.
+\item \emph{State materialized only at chunk boundaries.} The $T$ per-token states never exist
+in memory; only $N=T/C$ of them are written to high-bandwidth memory, and the backward pass can
+recompute them chunk by chunk instead of storing them (the \fla{} backward functions call the
+state-passing kernel again for this reason).
+\item \emph{Short sequential dependency.} Only Pass~1 is sequential, with $N$ steps of one
+small matmul each; Pass~2, which holds most of the arithmetic, is parallel over chunks, heads
+and batch elements.
+\end{enumerate}
+There are two common schedules. The one in \cref{alg:c03-chunk} first materializes all
+boundary states (one kernel) and then computes all outputs in parallel (a second kernel); \fla{}
+calls these \code{chunk_fwd_h} and \code{chunk_fwd_o}. A \emph{fused} schedule keeps the state
+in on-chip memory and loops over chunks inside a single kernel, interleaving Pass~1 and Pass~2;
+it writes no intermediate states at all but has less parallelism. The chunkwise algorithm is the
+linear-attention analogue of FlashAttention's tiling (\cref{ch:foundations}): both partition the
+$T\times T$ interaction into tiles that fit on chip, and both avoid ever forming the full matrix.
+
+% ======================================================================
+\section{Decay and gating}\label{sec:c03-gating}
+
+Linear attention only ever adds to its state:
+$\mS_T=\sum_{i\le T}\vv_i\vk_i\T$. Associations that stopped being relevant thousands of tokens
+ago keep contributing crosstalk (\cref{eq:c03-crosstalk}) forever, and the norm of the state
+keeps growing. The first remedy is to let the memory \emph{forget}. Most models of this book use
+a write of the form
+\begin{equation}\label{eq:c03-gated-general}
+  \mS_t=\mG_t\had\mS_{t-1}+\vv_t\vk_t\T,\qquad \mG_t\in(0,1]^{d_v\times d_k},
+\end{equation}
+with a \emph{forget gate} $\mG_t$ that shrinks the old state before the new association is
+added. Three special cases matter, in increasing order of flexibility.
+
+\begin{enumerate}
+\item \textbf{Fixed scalar decay (RetNet).} $\mG_t=\gamma\,\bm 1\bm 1\T$ with a constant
+$\gamma\in(0,1)$ per head \citep{sun2023retnet}:
+$\mS_t=\gamma\mS_{t-1}+\vv_t\vk_t\T$. The \fla{} implementation
+(\repofile{repos/fla-org__flash-linear-attention/fla/ops/retention/chunk.py}) sets head $h$'s
+decay to $\gamma_h=1-2^{-5-h}$ for $h=0,\dots,H-1$, so different heads have different memory
+horizons: an association decays by a factor $e$ after about $1/(1-\gamma_h)=2^{5+h}$ tokens, i.e.
+32, 64, 128, \dots{} tokens. (RetNet also rotates queries and keys by position-dependent phases,
+which we omit.)
+\item \textbf{Data-dependent scalar gate (Mamba-2, ``simple GLA'').} $\mG_t=\alpha_t\bm 1\bm 1\T$
+with $\alpha_t=\alpha(\vx_t)\in(0,1)$ computed from the current token:
+$\mS_t=\alpha_t\mS_{t-1}+\vv_t\vk_t\T$. The model can now decide to keep its memory
+($\alpha_t\approx1$) or flush it ($\alpha_t\approx0$) depending on the content. In Mamba-2,
+$\alpha_t=\exp(\Delta_t a)$ with a learned $a<0$ per head and a data-dependent step
+$\Delta_t>0$ (\cref{sec:c03-ssm}).
+\item \textbf{Data-dependent per-channel gate (GLA).} $\mG_t=\bm 1\valpha_t\T$ with
+$\valpha_t\in(0,1)^{d_k}$ \citep{yang2024gla}:
+\begin{equation}\label{eq:c03-gla}
+  \mS_t=\mS_{t-1}\diag(\valpha_t)+\vv_t\vk_t\T .
+\end{equation}
+Each key channel (column of $\mS_t$) forgets at its own data-dependent rate, so some channels can
+act as short-term slots and others as long-term ones. The \fla{} GLA layer computes the gate
+through a rank-16 bottleneck and a temperature:
+$\log\valpha_t=\frac{1}{16}\log\sigmoid(\mW_2\mW_1\vx_t+\vb)$, i.e.\
+$\valpha_t=\sigmoid(\cdot)^{1/16}$, which pushes the gates towards one (for example
+$\sigmoid(0)^{1/16}=0.5^{1/16}\approx0.96$).
+\end{enumerate}
+\begin{sloppypar}
+\noindent The two 16s are the layer's defaults \code{gate_low_rank_dim=16} and
+\code{gate_logit_normalizer=16} in
+\repofile{repos/fla-org__flash-linear-attention/fla/layers/gla.py}.
+\end{sloppypar}
+
+Why put the per-channel decay on the key side? Because then the decay factors can be absorbed
+into the queries and keys, as we show next, so the score computation remains a matrix product. A
+decay along the value dimension would be absorbed into the values and outputs instead; the
+\fla{} state-passing kernel supports that variant too (\code{gv}).
+
+\subsection{Unrolling: decay products}
+
+Unrolling the scalar-gated recurrence from $\mS_0=\bm 0$ gives
+\begin{equation}\label{eq:c03-gated-unroll}
+  \mS_t=\sum_{s=1}^{t}\Big(\prod_{r=s+1}^{t}\alpha_r\Big)\vv_s\vk_s\T,
+\end{equation}
+which is proved by induction exactly like \cref{prop:c03-parallel}: multiplying the sum for
+$\mS_{t-1}$ by $\alpha_t$ extends every product by one factor, and the new term $\vv_t\vk_t\T$
+has the empty product $1$. The parallel form follows as before:
+\begin{equation}\label{eq:c03-gated-parallel}
+  \mO=(\mQ\mK\T\had\mD)\mV,\qquad
+  D_{ts}=\begin{cases}\prod_{r=s+1}^{t}\alpha_r & s\le t,\\ 0 & s>t.\end{cases}
+\end{equation}
+For RetNet, $D_{ts}=\gamma^{t-s}$, and \cref{eq:c03-gated-parallel} is the parallel form of
+retention in \citet{sun2023retnet}. With per-channel gates the decay depends on the channel as well:
+$\mS_t=\sum_{s\le t}\vv_s\big(\vk_s\had\prod_{r=s+1}^{t}\valpha_r\big)\T$, with the product taken
+elementwise.
+
+\subsection{Computing decay in log space}\label{sec:c03-logspace}
+
+Define the cumulative product $\pi_t=\prod_{r=1}^{t}\alpha_r$. Then
+$\prod_{r=s+1}^{t}\alpha_r=\pi_t/\pi_s$, so $D_{ts}=(\pi_t/\pi_s)L_{ts}$ and
+\[
+  \mQ\mK\T\had\mD=\big(\diag(\bm{\pi})\mQ\big)\big(\diag(\bm{\pi})^{-1}\mK\big)\T\had\bm{L}.
+\]
+This is tempting: scale the queries by $\pi_t$ and the keys by $1/\pi_s$, and reuse the ungated
+kernel unchanged. It fails numerically. The product $\pi_t$ decays exponentially in $t$, underflows
+to zero, and $1/\pi_s$ overflows to infinity. In an experiment of ours (float32, $T=256$, gates
+drawn uniformly from $(0.3,0.7)$) $\pi_t$ became exactly zero at $t=149$, and the \emph{entire}
+output became NaN, including rows that should not be affected: the mask cannot repair the
+damage, because $0\cdot\infty=\mathrm{NaN}$.
+
+The cure is to work with logarithms. Let $g_t=\log\alpha_t\le0$ and let
+$G_t=\sum_{r\le t}g_r$ be its cumulative sum. Then
+\begin{equation}\label{eq:c03-logdecay}
+  D_{ts}=\exp(G_t-G_s)\quad (s\le t),
+\end{equation}
+and the exponent is always $\le0$: the factor lies in $(0,1]$, can never overflow, and
+underflows only when the true decay is negligible. In the same float32 experiment, computing
+$\mD$ by \cref{eq:c03-logdecay} gave outputs within $7.3\times10^{-5}$ of a float64 recurrence
+(the outputs had magnitude up to about 35).
+
+A second, subtler problem is \emph{cancellation}. $G_t$ grows in magnitude linearly with $t$,
+and for nearby positions the difference $G_t-G_s$ of two large, nearly equal floating-point
+numbers loses significant digits. The cure is to restart the cumulative sum at every chunk, so that the
+numbers that are subtracted stay small. In our float32 experiment with $T=8192$, gates in
+$(0.9,1)$ and $C=64$, the intra-chunk exponents had errors up to $2.0\times10^{-4}$ when taken
+from a global cumulative sum but only $1.3\times10^{-6}$ when taken from chunk-local sums. Both
+libraries we read do this: \fla{} computes gates with \code{chunk_local_cumsum}, and the Mamba
+code computes \code{dA_cumsum} per chunk; Mamba's reference implementation even contrasts a
+``naive'' segment sum that subtracts cumulative sums with a ``more stable'' one that sums only
+the segment (\cref{lst:c03-ssd}).
+
+\subsection{Chunkwise form with a scalar gate}
+
+Fix chunk $i$ and use local positions $r=1,\dots,C$, so that $\vq_r$ means
+$\vq_{(i-1)C+r}$, and similarly for keys, values and gates. Define the \emph{local} log-decay
+\[
+  \gamma_r=\sum_{j=1}^{r}g_{(i-1)C+j},\qquad \gamma_0=0,
+\]
+so that $e^{\gamma_r}$ is the decay accumulated from the start of the chunk up to and including
+position $r$.
+
+\begin{proposition}[Chunkwise gated linear attention]\label{prop:c03-chunk-gated}
+Inside chunk $i$, the state after local position $r$ is
+\begin{equation}\label{eq:c03-chunk-gated-state}
+  \mS_{(i-1)C+r}=e^{\gamma_r}\mS_{[i-1]}+\sum_{j=1}^{r}e^{\gamma_r-\gamma_j}\vv_j\vk_j\T ,
+\end{equation}
+and consequently
+\begin{align}
+  \mO_{[i]}&=\diag(e^{\bm\gamma})\,\mQ_{[i]}\mS_{[i-1]}\T+\big(\mQ_{[i]}\mK_{[i]}\T\had\bm{\Gamma}\big)\mV_{[i]},
+  \qquad \Gamma_{rj}=e^{\gamma_r-\gamma_j}[j\le r],\label{eq:c03-chunk-gated-out}\\
+  \mS_{[i]}&=e^{\gamma_C}\mS_{[i-1]}+\big(\diag(e^{\gamma_C-\bm\gamma})\mV_{[i]}\big)\T\mK_{[i]} .
+  \label{eq:c03-chunk-gated-next}
+\end{align}
+Here $\bm\gamma=(\gamma_1,\dots,\gamma_C)\T$, exponentials of vectors are elementwise, and
+$[j\le r]$ is $1$ if $j\le r$ and $0$ otherwise.
+\end{proposition}
+
+\begin{proof}
+Induction on $r$. For $r=1$: $\mS=\alpha_1\mS_{[i-1]}+\vv_1\vk_1\T$, and indeed
+$e^{\gamma_1}=\alpha_1$ and $e^{\gamma_1-\gamma_1}=1$. Assume
+\cref{eq:c03-chunk-gated-state} for $r$. Then
+\[
+  \alpha_{r+1}\Big(e^{\gamma_r}\mS_{[i-1]}+\sum_{j\le r}e^{\gamma_r-\gamma_j}\vv_j\vk_j\T\Big)
+  +\vv_{r+1}\vk_{r+1}\T
+  =e^{\gamma_{r+1}}\mS_{[i-1]}+\sum_{j\le r+1}e^{\gamma_{r+1}-\gamma_j}\vv_j\vk_j\T,
+\]
+because $\alpha_{r+1}e^{\gamma_r}=e^{\gamma_{r+1}}$ and the last term has
+$e^{\gamma_{r+1}-\gamma_{r+1}}=1$. Multiplying \cref{eq:c03-chunk-gated-state} by $\vq_r$ and
+stacking rows gives \cref{eq:c03-chunk-gated-out}; setting $r=C$ gives
+\cref{eq:c03-chunk-gated-next}.
+\end{proof}
+
+Every exponent in \cref{eq:c03-chunk-gated-out,eq:c03-chunk-gated-next} is $\le0$, and the local
+sums $\gamma_r$ are short. The extra cost over ungated linear attention is the $C\times C$ matrix
+$\bm{\Gamma}$ of exponentials per chunk and a few row scalings. The algorithm is
+\cref{alg:c03-chunk} with these two lines changed; \cref{sec:c03-fla} shows the corresponding
+lines of the \fla{} kernels, and our implementation is \cref{lst:c03-gated}.
+
+\subsection{Chunkwise form with per-channel gates}
+
+For GLA (\cref{eq:c03-gla}) the local log-decay is a vector per position,
+$\bm{\lambda}_r=\sum_{j\le r}\log\valpha_{(i-1)C+j}\in\R^{d_k}$, and the same induction gives
+\begin{align*}
+  \vo_r&=\mS_{[i-1]}\big(\vq_r\had e^{\bm{\lambda}_r}\big)
+  +\sum_{j\le r}\Omega_{rj}\vv_j,\qquad
+  \Omega_{rj}=\sum_{c=1}^{d_k}q_{r,c}\,k_{j,c}\,e^{\lambda_{r,c}-\lambda_{j,c}},\\
+  \mS_{[i]}&=\mS_{[i-1]}\diag(e^{\bm{\lambda}_C})+\sum_{j=1}^{C}\vv_j\big(\vk_j\had e^{\bm{\lambda}_C-\bm{\lambda}_j}\big)\T .
+\end{align*}
+The intra-chunk score $\Omega_{rj}$ is no longer a plain matrix product, because the decay depends on
+the triple $(r,j,c)$. It can be factorized through any reference position $n$:
+\[
+  \Omega_{rj}=\big(\vq_r\had e^{\bm{\lambda}_r-\bm{\lambda}_n}\big)\T\big(\vk_j\had e^{\bm{\lambda}_n-\bm{\lambda}_j}\big).
+\]
+If $j\le n\le r$, both exponents are $\le0$ and nothing overflows. GLA therefore splits each
+chunk into sub-chunks (``secondary chunking'') of size $C'$; \fla{} uses $C'=\min(16,C)$. For a
+query sub-chunk and a strictly earlier key sub-chunk, $n$ is the first position of the query
+sub-chunk and the block of scores is one matrix product on tensor cores. Only the $C/C'$
+diagonal sub-blocks, a fraction of order $C'/C$ of the score entries, are computed elementwise in
+full precision.
+We checked this factorization numerically with $C=64$ and $C'=16$ (\cref{tab:c03-checks}).
+
+\begin{keyidea}
+Gating turns the memory into a leaky integrator with a data-dependent horizon. The gated kernels
+we read in \fla{} and in the Mamba code compute decays as differences of chunk-local cumulative
+sums of log gates, exponentiated only after subtraction, so that every factor lies in $(0,1]$. Scalar gates keep
+the chunkwise algorithm purely matmul-based; per-channel gates need a reference point inside the
+chunk and a small amount of elementwise work.
+\end{keyidea}
+
+% ======================================================================
+\section{The delta rule}\label{sec:c03-delta}
+
+\subsection{Motivation}
+
+Gating forgets uniformly: a scalar gate shrinks every association by the same factor, and a
+per-channel gate shrinks whole key channels. Neither can remove \emph{one} association while
+keeping the others. Linear attention cannot even overwrite: writing $(\vk,\vv_{\text{new}})$ on
+top of an earlier $(\vk,\vv_{\text{old}})$ makes the memory return $\vv_{\text{old}}+\vv_{\text{new}}$.
+We want a write that looks at what is currently stored under $\vk_t$ and corrects it.
+
+\subsection{Derivation: one step of online regression}
+
+Think of $\mS$ as a linear model that should predict the value from the key. When the pair
+$(\vk_t,\vv_t)$ arrives, the model's squared error on it is
+\begin{equation}\label{eq:c03-delta-loss}
+  \loss_t(\mS)=\tfrac12\norm{\mS\vk_t-\vv_t}^2
+  =\tfrac12\sum_{a=1}^{d_v}\Big(\sum_{b=1}^{d_k}S_{ab}k_{t,b}-v_{t,a}\Big)^2 .
+\end{equation}
+Differentiating with respect to one entry gives
+$\partial\loss_t/\partial S_{ab}=(\mS\vk_t-\vv_t)_a\,k_{t,b}$, which in matrix form is the outer
+product
+\[
+  \nabla_{\mS}\loss_t(\mS)=(\mS\vk_t-\vv_t)\,\vk_t\T .
+\]
+One step of gradient descent from $\mS_{t-1}$ with step size $\beta_t$ is the \emph{delta rule}
+\begin{equation}\label{eq:c03-delta}
+  \mS_t=\mS_{t-1}-\beta_t\big(\mS_{t-1}\vk_t-\vv_t\big)\vk_t\T .
+\end{equation}
+This is the Widrow--Hoff least-mean-squares rule \citep{c02-widrow1960adaptive}, applied to fast
+weights. \citet{c02-schlag2021linear} proposed it as a replacement for the Hebbian update of
+linear attention (the resulting model is called DeltaNet), and \citet{c02-yang2024deltanet} made
+it trainable at scale with the chunkwise algorithm derived below. The write strength
+$\beta_t\in(0,1)$ is computed from the token, typically $\beta_t=\sigmoid(\vw_\beta\T\vx_t)$.
+
+\Cref{eq:c03-delta} has three equivalent readings.
+\begin{enumerate}
+\item \emph{Write what is missing.} Let $\vv_t^{\text{old}}=\mS_{t-1}\vk_t$ be what the memory
+currently returns for $\vk_t$. Then $\mS_t=\mS_{t-1}+\beta_t(\vv_t-\vv_t^{\text{old}})\vk_t\T$:
+only the prediction error is written.
+\item \emph{Erase, then write.}
+$\mS_t=\mS_{t-1}-\beta_t\vv_t^{\text{old}}\vk_t\T+\beta_t\vv_t\vk_t\T$: remove a fraction
+$\beta_t$ of the old association and add the same fraction of the new one.
+\item \emph{A linear recurrence with a data-dependent transition.}
+\begin{equation}\label{eq:c03-delta-transition}
+  \mS_t=\mS_{t-1}\big(\mI-\beta_t\vk_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T .
+\end{equation}
+\end{enumerate}
+For comparison, linear attention is gradient descent with step size $1$ on the \emph{linear}
+objective $\loss_t^{\text{lin}}(\mS)=-\vv_t\T\mS\vk_t$, whose gradient $-\vv_t\vk_t\T$ does not
+depend on $\mS$. That objective is unbounded below, so there is no error to correct and no point
+at which writing stops: the Hebbian rule only accumulates. In the survey's Table~II the delta
+rule is still a state-transition update, but one whose transition depends on the key.
+
+\subsection{What the delta rule fixes}
+
+\begin{proposition}[Targeted overwrite]\label{prop:c03-delta-overwrite}
+Assume $\norm{\vk_t}=1$. Then
+\begin{enumerate}
+\item $\mS_t\vk_t=(1-\beta_t)\mS_{t-1}\vk_t+\beta_t\vv_t$; in particular $\beta_t=1$ gives
+$\mS_t\vk_t=\vv_t$ exactly;
+\item $\mS_t\vu=\mS_{t-1}\vu$ for every $\vu$ orthogonal to $\vk_t$.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+From \cref{eq:c03-delta},
+$\mS_t\vk_t=\mS_{t-1}\vk_t-\beta_t(\mS_{t-1}\vk_t-\vv_t)(\vk_t\T\vk_t)$, and
+$\vk_t\T\vk_t=1$ gives the first claim. For $\vu\perp\vk_t$ the correction term contains the
+factor $\vk_t\T\vu=0$.
+\end{proof}
+
+So the delta rule moves the read-out for $\vk_t$ a fraction $\beta_t$ of the way towards the
+target and leaves every orthogonal direction untouched. With $\beta_t=1$ it is an orthogonal
+projection step: it makes the equation $\mS\vk_t=\vv_t$ hold exactly while changing $\mS$ as
+little as possible in Frobenius norm. This is one step of the Kaczmarz method for solving the
+linear system $\{\mS\vk_i=\vv_i\}$, an interpretation that Kaczmarz Linear Attention
+\citep{zou2026kaczmarz} builds on (\cref{ch:delta}).
+
+\begin{example}[Overwriting, continued from \cref{ex:c03-interference}]\label{ex:c03-delta}
+Start from $\mS=\ve_1\ve_1\T$, which stores $(\ve_1,\ve_1)$, and write the same key with a new
+value, $(\vk,\vv)=(\ve_1,(0,2)\T)$. Linear attention reads back $\mS\ve_1=(1,2)\T$, the sum of
+old and new. The delta rule with $\beta=1$ reads back $(0,2)\T$: the old value is gone. With
+$\beta=0.5$ it reads back $(0.5,1)\T$, half way between.
+Now repeat \cref{ex:c03-interference} with the delta rule and $\beta=1$, writing the three pairs
+in order from $\mS_0=\bm 0$. The state becomes
+\[
+  \mS_3=\begin{pmatrix}1.2071 & 0.2071\\ -1.2071 & -0.2071\end{pmatrix},
+\]
+and the reads are
+\[
+  \mS_3\vk_1=\begin{pmatrix}1.2071\\-1.2071\end{pmatrix},\qquad
+  \mS_3\vk_2=\begin{pmatrix}0.2071\\-0.2071\end{pmatrix},\qquad
+  \mS_3\vk_3=\begin{pmatrix}1\\-1\end{pmatrix}\ (\text{exact}).
+\]
+Three pairs still do not fit into $d_k=2$
+(\cref{prop:c03-capacity}), but the failure is now structured: the newest association is
+always exact, and the third write changed the state only along the key direction $\vk_3$
+(\cref{prop:c03-delta-overwrite}), so the older reads moved only through their overlap with
+$\vk_3$.
+\end{example}
+
+\subsection{The transition: a generalized Householder matrix}\label{sec:c03-householder}
+
+The transition in \cref{eq:c03-delta-transition} is $\mA_t=\mI-\beta_t\vk_t\vk_t\T$, the
+identity minus a symmetric rank-one matrix. When $\norm{\vk_t}=1$ and $\beta_t=2$ this is the
+Householder reflection across the hyperplane orthogonal to $\vk_t$; for other $\beta_t$ it is
+called a \emph{generalized Householder} matrix. Its spectrum is easy to read off:
+\[
+  \mA_t\vk_t=(1-\beta_t\norm{\vk_t}^2)\,\vk_t,\qquad \mA_t\vu=\vu\quad\text{for }\vu\perp\vk_t .
+\]
+So $\mA_t$ has the eigenvalue $1$ with multiplicity $d_k-1$ (every direction orthogonal to the
+key is kept) and one eigenvalue $\lambda_t=1-\beta_t\norm{\vk_t}^2$ along the key. Because
+$\mA_t$ is symmetric, its eigenvectors are orthogonal and its spectral norm is
+$\norm{\mA_t}_2=\max(1,\abs{\lambda_t})$.
+
+With unit keys this gives a clean picture:
+\begin{itemize}
+\item $\beta_t\in(0,1]$: $\lambda_t\in[0,1)$, a contraction along $\vk_t$ (erasure of what is
+stored under that key);
+\item $\beta_t\in(1,2]$: $\lambda_t\in[-1,0)$, a \emph{negative} eigenvalue, which flips the sign
+of the stored component. \citet{c03-grazzi2025unlocking} show that allowing negative eigenvalues
+improves state tracking; the \fla{} DeltaNet layer has an option \code{allow_neg_eigval} that
+doubles $\beta_t$ to range over $(0,2)$ (\cref{ch:expressive} returns to this);
+\item for every $\beta_t\in[0,2]$, $\norm{\mA_t}_2=1$, so the transition never amplifies the
+state, and $\norm{\mS_t}_2\le\norm{\mS_{t-1}}_2+\beta_t\norm{\vv_t}$.
+\end{itemize}
+We verified numerically that for $\beta\in\{0.5,1,1.5,2\}$ the eigenvalues are $1$ (fifteen
+times, for $d_k=16$) and $1-\beta$.
+
+\begin{pitfall}[title={Pitfall: unnormalized keys}]
+The bound above needs $\beta_t\norm{\vk_t}^2\le2$. If keys are not normalized,
+$\abs{\lambda_t}$ can exceed one and the state grows geometrically. In our test with
+$\norm{\vk_t}=3$ and $\beta_t=1$ (so $\lambda_t=-8$) the largest entry of the state reached
+about $10^{64}$ after 256 steps, against about $2.6$ with unit keys. This is why delta-rule layers
+$\ell_2$-normalize keys (and queries): the \fla{} DeltaNet layer defaults to
+\code{qk_norm='l2'} and can fuse the normalization into the kernel
+(\code{use_qk_l2norm_in_kernel}).
+\end{pitfall}
+
+The recurrent form costs the same as linear attention: per token one matrix--vector product
+$\mS_{t-1}\vk_t$, one rank-one update and one read, $\bigO(d_kd_v)$. The parallel form, however,
+is no longer obvious. Unrolling \cref{eq:c03-delta-transition} gives
+\begin{equation}\label{eq:c03-delta-unroll}
+  \mS_t=\sum_{s=1}^{t}\beta_s\vv_s\vk_s\T\,\mA_{s+1}\mA_{s+2}\cdots\mA_t ,
+\end{equation}
+which involves products of $d_k\times d_k$ matrices. Computing such products directly costs
+$\bigO(d_k^3)$ each (\cref{sec:c03-scan} discusses this). The way out is a classical result of
+numerical linear algebra: a product of generalized Householder matrices is again ``identity
+minus low rank'', and its low-rank factors can be computed with matrix products.
+
+\subsection{Chunkwise delta rule: the WY representation and the UT transform}\label{sec:c03-wy}
+
+Fix chunk $i$, use local positions $r=1,\dots,C$, write $\mA_r=\mI-\beta_r\vk_r\vk_r\T$, and
+let $\mS^{0}=\mS_{[i-1]}$ and $\mS^{r}=\mS^{r-1}\mA_r+\beta_r\vv_r\vk_r\T$.
+
+\begin{lemma}[Unrolling within a chunk]\label{lem:c03-delta-unroll}
+For $r=0,\dots,C$,
+\[
+  \mS^{r}=\mS^{0}\mP_r+\mH_r,\qquad
+  \mP_r=\mA_1\mA_2\cdots\mA_r,\qquad
+  \mH_r=\sum_{j=1}^{r}\beta_j\vv_j\vk_j\T\mA_{j+1}\cdots\mA_r ,
+\]
+with $\mP_0=\mI$ and $\mH_0=\bm 0$.
+\end{lemma}
+
+\begin{proof}
+Induction: $\mS^{r}=(\mS^0\mP_{r-1}+\mH_{r-1})\mA_r+\beta_r\vv_r\vk_r\T
+=\mS^0\mP_{r-1}\mA_r+(\mH_{r-1}\mA_r+\beta_r\vv_r\vk_r\T)$, and the two brackets are $\mP_r$
+and $\mH_r$ by definition.
+\end{proof}
+
+\begin{lemma}[WY representation]\label{lem:c03-wy}
+Define vectors $\vw_r\in\R^{d_k}$ and $\vu_r\in\R^{d_v}$ recursively by
+\begin{equation}\label{eq:c03-wy-rec}
+  \vw_r=\beta_r\Big(\vk_r-\sum_{j<r}(\vk_j\T\vk_r)\,\vw_j\Big),\qquad
+  \vu_r=\beta_r\Big(\vv_r-\sum_{j<r}(\vk_j\T\vk_r)\,\vu_j\Big).
+\end{equation}
+Then $\mP_r=\mI-\sum_{j\le r}\vw_j\vk_j\T$ and $\mH_r=\sum_{j\le r}\vu_j\vk_j\T$.
+\end{lemma}
+
+\begin{proof}
+Both claims hold for $r=0$. Assume them for $r-1$. Then
+\begin{align*}
+  \mP_r=\mP_{r-1}\mA_r
+  &=\Big(\mI-\sum_{j<r}\vw_j\vk_j\T\Big)\big(\mI-\beta_r\vk_r\vk_r\T\big)\\
+  &=\mI-\sum_{j<r}\vw_j\vk_j\T-\beta_r\vk_r\vk_r\T+\beta_r\sum_{j<r}\vw_j(\vk_j\T\vk_r)\vk_r\T\\
+  &=\mI-\sum_{j<r}\vw_j\vk_j\T-\underbrace{\beta_r\Big(\vk_r-\sum_{j<r}(\vk_j\T\vk_r)\vw_j\Big)}_{=\vw_r}\vk_r\T ,
+\end{align*}
+where we used that $\vk_j\T\vk_r$ is a scalar. Similarly
+\begin{align*}
+  \mH_r=\mH_{r-1}\mA_r+\beta_r\vv_r\vk_r\T
+  &=\sum_{j<r}\vu_j\vk_j\T-\beta_r\sum_{j<r}\vu_j(\vk_j\T\vk_r)\vk_r\T+\beta_r\vv_r\vk_r\T\\
+  &=\sum_{j<r}\vu_j\vk_j\T+\underbrace{\beta_r\Big(\vv_r-\sum_{j<r}(\vk_j\T\vk_r)\vu_j\Big)}_{=\vu_r}\vk_r\T .\qedhere
+\end{align*}
+\end{proof}
+
+Writing a product of $r$ Householder-type matrices as the identity plus the product of a
+$d_k\times r$ and an $r\times d_k$ factor is the \emph{WY representation} of
+\citet{c03-bischof1987wy}; it was invented to turn Householder-based QR factorization into
+matrix--matrix products, which is exactly our purpose.
+
+\paragraph{Matrix form and the UT transform.}
+Stack the vectors of the chunk as rows: $\mW\in\R^{C\times d_k}$ with rows $\vw_r\T$ and
+$\mU\in\R^{C\times d_v}$ with rows $\vu_r\T$. Define the strictly lower-triangular (hence nilpotent) matrix
+\begin{equation}\label{eq:c03-ut-A}
+  \bm{N}\in\R^{C\times C},\qquad
+  N_{rj}=\begin{cases}\beta_r\,\vk_r\T\vk_j & j<r,\\ 0 & j\ge r,\end{cases}
+  \qquad\text{i.e. } \bm{N}=\mathrm{tril}\big(\diag(\vbeta)\mK_{[i]}\mK_{[i]}\T,\,-1\big).
+\end{equation}
+Row $r$ of $\bm{N}\mW$ is $\sum_{j<r}\beta_r(\vk_r\T\vk_j)\vw_j\T$, so the recursions
+\cref{eq:c03-wy-rec} say $\mW=\diag(\vbeta)\mK_{[i]}-\bm{N}\mW$ and
+$\mU=\diag(\vbeta)\mV_{[i]}-\bm{N}\mU$, that is,
+\begin{equation}\label{eq:c03-ut}
+\begin{gathered}
+  (\mI+\bm{N})\mW=\diag(\vbeta)\mK_{[i]},\qquad (\mI+\bm{N})\mU=\diag(\vbeta)\mV_{[i]},\\
+  \mT\defeq(\mI+\bm{N})^{-1}\diag(\vbeta),\qquad \mW=\mT\mK_{[i]},\qquad \mU=\mT\mV_{[i]} .
+\end{gathered}
+\end{equation}
+The matrix $\mI+\bm{N}$ is unit lower-triangular, hence always invertible (its determinant is one),
+and the systems are solved by forward substitution: row $r$ of the solution is the right-hand
+side's row $r$ minus $\sum_{j<r}N_{rj}$ times the already computed rows. The compact form
+$\mP_C=\mI-\mK_{[i]}\T\mT\T\mK_{[i]}$, with a small triangular matrix $\mT$ in the middle, is
+known as the \emph{UT transform} \citep{c03-joffrain2006accumulating}.
+
+\paragraph{The chunk update.}
+With \cref{lem:c03-delta-unroll,lem:c03-wy}, $\mP_C=\mI-\mW\T\mK_{[i]}$ and
+$\mH_C=\mU\T\mK_{[i]}$ (because $\mW\T\mK_{[i]}=\sum_j\vw_j\vk_j\T$). Therefore
+\[
+  \mS_{[i]}=\mS_{[i-1]}\big(\mI-\mW\T\mK_{[i]}\big)+\mU\T\mK_{[i]}
+  =\mS_{[i-1]}+\big(\mU-\mW\mS_{[i-1]}\T\big)\T\mK_{[i]} .
+\]
+Define the \emph{pseudo-values}
+\begin{equation}\label{eq:c03-pseudo}
+  \widetilde\mV_{[i]}\defeq\mU-\mW\mS_{[i-1]}\T\in\R^{C\times d_v},
+  \qquad\text{row } r:\ \tilde\vv_r=\vu_r-\mS_{[i-1]}\vw_r .
+\end{equation}
+Then the state update is $\mS_{[i]}=\mS_{[i-1]}+\widetilde\mV_{[i]}\T\mK_{[i]}$, \emph{the
+linear-attention update \cref{eq:c03-chunk-state} with $\mV$ replaced by $\widetilde\mV$}. The
+outputs follow the same way: by \cref{lem:c03-delta-unroll,lem:c03-wy},
+\[
+  \vo_r=\mS^{r}\vq_r=\mS^0\vq_r-\sum_{j\le r}(\mS^0\vw_j)(\vk_j\T\vq_r)+\sum_{j\le r}\vu_j(\vk_j\T\vq_r)
+  =\mS_{[i-1]}\vq_r+\sum_{j\le r}(\vk_j\T\vq_r)\,\tilde\vv_j ,
+\]
+or, stacked,
+\begin{equation}\label{eq:c03-delta-chunk-out}
+  \mO_{[i]}=\mQ_{[i]}\mS_{[i-1]}\T+\big(\mQ_{[i]}\mK_{[i]}\T\had\bm{L}_C\big)\widetilde\mV_{[i]} .
+\end{equation}
+
+\begin{theorem}[Chunkwise delta rule]\label{thm:c03-delta-chunk}
+For any chunk size $C$, \cref{alg:c03-delta-chunk} produces the same outputs and final state as
+the recurrence \cref{eq:c03-delta}.
+\end{theorem}
+
+\begin{proof}
+\Cref{lem:c03-delta-unroll,lem:c03-wy} express every intermediate state of a chunk through
+$\mS_{[i-1]}$, $\mW$ and $\mU$; \cref{eq:c03-ut} computes $\mW$ and $\mU$ exactly; the two
+displays above then give the outputs and the next boundary state. Induction over chunks
+completes the proof.
+\end{proof}
+
+The pseudo-value $\tilde\vv_r$ is what the delta rule \emph{actually} adds at position $r$ once
+everything already stored has been accounted for: the triangular solve removes what earlier
+tokens of the same chunk already wrote, and the term $-\mS_{[i-1]}\vw_r$ removes what the state
+entering the chunk already holds. The delta rule is linear attention on corrected values.
+
+\begin{algorithm}[t]
+\caption{Delta rule, chunkwise form via the WY representation / UT transform}\label{alg:c03-delta-chunk}
+\begin{algorithmic}[1]
+\Require $\mQ,\mK\in\R^{T\times d_k}$ (unit-norm keys), $\mV\in\R^{T\times d_v}$, $\vbeta\in(0,1)^T$, chunk size $C$, $\mS_{[0]}$
+\Ensure $\mO\in\R^{T\times d_v}$, final state $\mS_{[N]}$
+\LineComment{Stage 1: WY factors, all chunks in parallel}
+\For{$i=1$ to $N$ \textbf{in parallel}}
+  \State $\bm{N}\gets\mathrm{tril}(\diag(\vbeta_{[i]})\mK_{[i]}\mK_{[i]}\T,-1)$ \Comment{$C\times C$, strictly lower}
+  \State solve $(\mI+\bm{N})\,[\mW_{[i]}\ \mU_{[i]}]=\diag(\vbeta_{[i]})\,[\mK_{[i]}\ \mV_{[i]}]$ \Comment{forward substitution}
+\EndFor
+\LineComment{Stage 2: state passing, sequential over chunks}
+\For{$i=1$ to $N$}
+  \State store $\mS_{[i-1]}$
+  \State $\widetilde\mV_{[i]}\gets\mU_{[i]}-\mW_{[i]}\mS_{[i-1]}\T$ \Comment{pseudo-values}
+  \State $\mS_{[i]}\gets\mS_{[i-1]}+\widetilde\mV_{[i]}\T\mK_{[i]}$
+\EndFor
+\LineComment{Stage 3: outputs, all chunks in parallel}
+\For{$i=1$ to $N$ \textbf{in parallel}}
+  \State $\mO_{[i]}\gets\mQ_{[i]}\mS_{[i-1]}\T+(\mQ_{[i]}\mK_{[i]}\T\odot\bm{L}_C)\widetilde\mV_{[i]}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.}
+Stage~1 costs $C^2d_k$ per chunk for $\mK_{[i]}\mK_{[i]}\T$ and $C^2(d_k+d_v)$ for forward
+substitution with $d_k+d_v$ right-hand sides, $\bigO(TC(d_k+d_v))$ in total. Stage~2 costs two
+products of size $C\times d_k\times d_v$ per chunk, $\bigO(Td_kd_v)$, and Stage~3 is identical to
+linear attention. The total is again $\bigO(TC(d_k+d_v)+Td_kd_v)$, the same order as
+\cref{eq:c03-chunk-cost}. The sequential stage is somewhat heavier than for linear attention,
+because the pseudo-values depend on the incoming state through a matrix product.
+
+\paragraph{The effective attention matrix.}
+Take a single chunk, $C=T$, with $\mS_{[0]}=\bm0$. Then $\widetilde\mV=\mU=\mT\mV$ and
+\cref{eq:c03-delta-chunk-out} becomes
+\begin{equation}\label{eq:c03-delta-parallel}
+  \mO=\big(\mQ\mK\T\had\bm{L}\big)\big(\mI+\mathrm{tril}(\diag(\vbeta)\mK\mK\T,-1)\big)^{-1}\diag(\vbeta)\,\mV .
+\end{equation}
+DeltaNet is therefore a linear attention whose $T\times T$ score matrix is multiplied on the
+right by the inverse of a unit lower-triangular matrix built from key similarities.
+\begin{sloppypar}
+\noindent The function \code{parallel_delta_rule} in
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/delta_rule/parallel.py} computes
+DeltaNet in this quadratic form and can return the materialized $T\times T$ matrix
+(\code{output_attentions=True}); the reference \code{naive_delta_rule_parallel} in the same file
+builds it block by block.
+\end{sloppypar}
+\noindent We checked \cref{eq:c03-delta-parallel} against
+the recurrence numerically (\cref{tab:c03-checks}).
+
+\subsection{Preview: the gated delta rule}
+
+The delta rule erases precisely but slowly; a gate erases coarsely but fast. Gated DeltaNet
+\citep{yang2025gdn} combines the two:
+\begin{equation}\label{eq:c03-gdn}
+  \mS_t=\alpha_t\,\mS_{t-1}\big(\mI-\beta_t\vk_t\vk_t\T\big)+\beta_t\vv_t\vk_t\T .
+\end{equation}
+Its chunkwise algorithm merges the two derivations of this chapter: the decay factors
+$e^{\gamma_r-\gamma_j}$ of \cref{prop:c03-chunk-gated} enter the matrix $\bm{N}$ of
+\cref{eq:c03-ut-A} and the inter-chunk terms. In \fla{} the same kernel that builds $\bm{N}$ for
+DeltaNet multiplies entry $(r,j)$ by $2^{g_r-g_j}$ when a gate is passed, where $g$ is the
+chunk-local cumulative log-gate in base-2 units, i.e.\ by $e^{\gamma_r-\gamma_j}$
+(\repofile{repos/fla-org__flash-linear-attention/fla/ops/common/chunk_scaled_dot_kkt.py}).
+\Cref{ch:delta} derives this in full and continues with Kimi Delta Attention (per-channel gates)
+and Gated DeltaNet-2 (separate erase and write gates).
+
+\begin{results}
+\textbf{Sources:} \citet{zhoubian2026memory} (\S III-C and Table~II) and
+\repofile{repos/fla-org__flash-linear-attention/README.md}. The survey describes Gated Delta
+Networks as using ``input-conditioned delta-rule updates for content-aware retention'' and lists
+them, with Mamba, as representative state-transition updates whose main risks are compression
+loss and state interference. The \fla{} README reports (news item of 2025-09) that its Gated
+DeltaNet kernels were integrated into Qwen3-Next. The mirrored repositories contain no quality
+benchmarks for DeltaNet itself; see \citet{c02-yang2024deltanet} and \citet{yang2025gdn} for
+numbers.
+\end{results}
+
+% ======================================================================
+\section{State-space models}\label{sec:c03-ssm}
+
+State-space models (SSMs) reach the same recurrences from a different starting point: the
+discretization of a continuous-time linear dynamical system. Following this route explains
+where the decay $\exp(\Delta_t a)$ of Mamba-2 comes from, and it leads to a second proof that
+gated linear attention and SSMs are the same computation.
+
+\subsection{Continuous-time linear SSMs}
+
+A single-input, single-output linear SSM maps an input signal $x(\tau)\in\R$ to an output
+$y(\tau)\in\R$ through a hidden state $\vh(\tau)\in\R^{N}$:
+\begin{equation}\label{eq:c03-ssm-ct}
+  \vh'(\tau)=\mA\vh(\tau)+\vb\,x(\tau),\qquad y(\tau)=\bm{c}\T\vh(\tau)+D\,x(\tau),
+\end{equation}
+with $\mA\in\R^{N\times N}$, $\vb,\bm{c}\in\R^N$ (written $\mB,\mC$ in the SSM papers) and
+$D\in\R$. A layer applies one such system to each of the $d$ channels of the sequence. The state
+$\vh$ is a running summary of the input's history; the HiPPO theory
+\citep{c03-gu2020hippo} chooses $\mA$ so that $\vh(\tau)$ holds the coefficients of an optimal
+polynomial approximation of the past input, which motivated the use of SSMs for long-range
+dependencies.
+
+\subsection{Discretization}
+
+A sequence model sees samples $x_1,x_2,\dots$, so \cref{eq:c03-ssm-ct} must be discretized with
+a step size $\Delta>0$. The \emph{zero-order hold} (ZOH) assumes the input is constant between
+samples. Multiplying the ODE by $e^{-\mA\tau}$ gives
+$\frac{d}{d\tau}\big(e^{-\mA\tau}\vh(\tau)\big)=e^{-\mA\tau}\vb\,x(\tau)$; integrating over one
+step with $x$ held at $x_t$ yields
+\[
+  \vh(\tau_0+\Delta)=e^{\Delta\mA}\vh(\tau_0)+\Big(\int_0^{\Delta}e^{\mA s}\,ds\Big)\vb\,x_t
+  =e^{\Delta\mA}\vh(\tau_0)+\mA^{-1}\big(e^{\Delta\mA}-\mI\big)\vb\,x_t ,
+\]
+where the last step assumes $\mA$ invertible. Hence the discrete recurrence
+\begin{equation}\label{eq:c03-zoh}
+  \vh_t=\bar\mA\vh_{t-1}+\bar\vb\,x_t,\qquad y_t=\bm{c}\T\vh_t+Dx_t,\qquad
+  \bar\mA=e^{\Delta\mA},\quad \bar\vb=(\Delta\mA)^{-1}\big(e^{\Delta\mA}-\mI\big)\Delta\vb .
+\end{equation}
+The forward \emph{Euler} method instead uses the first-order approximations
+$\bar\mA=\mI+\Delta\mA$ and $\bar\vb=\Delta\vb$; expanding the exponential shows that ZOH's
+$\bar\vb$ equals $\Delta\vb+\bigO(\Delta^2)$. For diagonal $\mA=\diag(\va)$, everything is
+elementwise: $\bar A_n=e^{\Delta a_n}$ and $\bar b_n=(e^{\Delta a_n}-1)b_n/a_n$.
+
+The Mamba code uses a mixture: the exact exponential for the transition and the Euler form for
+the input, $\bar\mA=e^{\Delta\mA}$ and $\bar\vb=\Delta\vb$ (\cref{lst:c03-mamba1,lst:c03-mamba2step}).
+With $a_n<0$ and $\Delta>0$, $e^{\Delta a_n}\in(0,1)$ for every step size, so the recurrence is
+stable by construction. The step size now has a clear meaning: a large $\Delta$ makes
+$\bar\mA\approx0$ (forget the past, attend to the current input), a small $\Delta$ makes
+$\bar\mA\approx\mI$ and $\bar\vb\approx0$ (ignore the input, keep the state). S4 used the
+bilinear discretization instead, and Mamba-3 introduces an exponential-trapezoidal rule
+(\cref{ch:structured}).
+
+\subsection{From S4 to Mamba: selectivity}
+
+In S4 \citep{c03-gu2022s4} the parameters $\mA,\vb,\bm{c},\Delta$ are the same at every time step:
+the system is \emph{linear time-invariant} (LTI). Unrolling \cref{eq:c03-zoh} from $\vh_0=\bm0$
+gives $y_t=\sum_{s\le t}\bm{c}\T\bar\mA^{\,t-s}\bar\vb\,x_s+Dx_t$, a causal convolution of the input
+with the kernel $\bar K_j=\bm{c}\T\bar\mA^{j}\bar\vb$. S4 computes this kernel efficiently by
+giving $\mA$ a structured (normal plus low-rank) form initialized from HiPPO, and applies it to
+the whole sequence with a fast Fourier transform. The weakness of LTI models is that every token
+is processed by the same dynamics: the model cannot decide, based on content, to ignore a filler
+token or to store a key fact.
+
+Mamba \citep{gu2023mamba} makes the system \emph{selective} by computing $\Delta$, $\vb$ and
+$\bm{c}$ from the input: $\vb_t=\mW_B\T\vx_t\in\R^N$ and $\bm{c}_t=\mW_C\T\vx_t\in\R^N$ (shared by all
+channels) and a per-channel step $\Delta_t=\mathrm{softplus}(\mW_\Delta\T\vx_t+\text{bias})\in\R^d$.
+The matrix $\mA$ stays input-independent and diagonal per channel, $\mA\in\R^{d\times N}$ holding
+the diagonals. Stacking the $d$ channel states as the rows of $\mH_t\in\R^{d\times N}$, the
+recurrence is
+\begin{equation}\label{eq:c03-mamba1}
+  \mH_t=\bar\mA_t\had\mH_{t-1}+(\bm\Delta_t\had\vx_t)\,\vb_t\T,\qquad
+  \vy_t=\mH_t\bm{c}_t+\bm{d}\had\vx_t,\qquad (\bar\mA_t)_{cn}=e^{\Delta_{t,c}A_{cn}},
+\end{equation}
+with $\bm\Delta_t$ the vector of per-channel steps and $\bm{d}$ the skip weights. Put next to
+\cref{eq:c03-gated-general}, this is gated linear attention with a full elementwise gate:
+\[
+  \mH_t\leftrightarrow\mS_t\ (d_v=d,\ d_k=N),\qquad
+  \vx_t\leftrightarrow\vv_t,\qquad \vb_t\leftrightarrow\vk_t,\qquad \bm{c}_t\leftrightarrow\vq_t,\qquad
+  \bar\mA_t\leftrightarrow\mG_t .
+\]
+A time-varying system is no longer a convolution, so Mamba evaluates the recurrence with a
+hardware-aware scan that keeps the expanded state in on-chip memory. That scan uses only
+elementwise operations, not tensor cores.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak state-spaces\_\_mamba/\allowbreak mamba\_ssm/\allowbreak ops/\allowbreak selective\_scan\_interface.py} (function \texttt{selective\_scan\_ref}): Mamba's selective scan in plain PyTorch. \texttt{u} is the input $x$, \texttt{delta} is $\Delta_t$, and the state \texttt{x} has shape (batch, $d$, $N$).},label={lst:c03-mamba1}]
+    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    # ...
+    else:
+        if B.dim() == 3:
+            deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+    # ...
+    for i in range(u.shape[2]):
+        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+\end{lstlisting}
+
+\subsection{Mamba-2 and structured state-space duality}
+
+Mamba-2 \citep{dao2024ssd} restricts the transition to a \emph{scalar times the identity} per
+head: $\mA=a\mI$ with one learned $a<0$ per head, and one step $\Delta_t>0$ per head. The
+transition becomes the scalar $\alpha_t=e^{\Delta_t a}\in(0,1)$. A head now carries $p$ channels
+(the head dimension) that share $\vb_t$ and $\bm{c}_t$, so its state is a $p\times N$ matrix:
+\begin{equation}\label{eq:c03-mamba2}
+  \mS_t=\alpha_t\,\mS_{t-1}+(\Delta_t\vx_t)\,\vb_t\T,\qquad
+  \vy_t=\mS_t\bm{c}_t+D\,\vx_t,\qquad \alpha_t=e^{\Delta_t a},\qquad \mS_t\in\R^{p\times N}.
+\end{equation}
+This is exactly the scalar-gated linear attention of \cref{sec:c03-gating} with
+\[
+  \vq_t=\bm{c}_t,\qquad \vk_t=\vb_t,\qquad \vv_t=\Delta_t\vx_t,\qquad \alpha_t=e^{\Delta_t a},\qquad d_v=p,\ d_k=N,
+\]
+where $\Delta_t$ plays two roles: it sets the forget gate and it scales the write (an input
+gate). Several heads can share $\vb_t,\bm{c}_t$ (the \code{ngroups} argument), much like grouped
+key--value heads in attention. The restriction from a diagonal to a scalar transition loses
+some flexibility per channel, but it buys a matmul-based training algorithm and makes larger
+states affordable: the usage examples in the Mamba README use \code{d_state=16} for Mamba and
+\code{d_state=64} (``typically 64 or 128'') for Mamba-2, and the \code{Mamba2} module defaults to
+$N=128$ (\code{d_state}) and $p=64$ (\code{headdim}).
+
+\paragraph{Semiseparable matrices.}
+Unrolling \cref{eq:c03-mamba2} from $\mS_0=\bm0$, exactly as in \cref{eq:c03-gated-unroll},
+gives $\vy_t=\sum_{s\le t}\big(\prod_{r=s+1}^{t}\alpha_r\big)(\bm{c}_t\T\vb_s)\,\Delta_s\vx_s+D\vx_t$.
+Ignoring the skip term, the whole layer is a matrix multiplication along the time axis,
+$\mY=\mM\widetilde\mX$, where row $s$ of $\widetilde\mX$ is $(\Delta_s\vx_s)\T$ and
+\begin{equation}\label{eq:c03-ssd-matrix}
+  \mM=(\mC\mB\T)\had\mD,\qquad D_{ts}=\exp(G_t-G_s)\,[s\le t],\qquad G_t=\sum_{r\le t}\Delta_ra ,
+\end{equation}
+with $\mC,\mB\in\R^{T\times N}$ stacking $\bm{c}_t\T$ and $\vb_t\T$. This is
+\cref{eq:c03-gated-parallel} again: SSD's ``attention matrix'' is $\mQ\mK\T\had\mD$ with a decay
+mask.
+
+\begin{definition}[Semiseparable matrix]
+A lower-triangular matrix $\mM\in\R^{T\times T}$ is called \emph{$N$-semiseparable} if
+every submatrix lying entirely in its lower-triangular part (diagonal included) has rank at
+most $N$.
+\end{definition}
+
+\begin{proposition}\label{prop:c03-semisep}
+If all $\alpha_t>0$, the matrix $\mM$ of \cref{eq:c03-ssd-matrix} is $N$-semiseparable.
+\end{proposition}
+
+\begin{proof}
+Take row indices $I$ and column indices $J$ with $\min I\ge\max J$, so that the submatrix lies in
+the lower triangle. For $t\in I$, $s\in J$:
+$M_{ts}=\bm{c}_t\T\vb_s\,e^{G_t-G_s}=(e^{G_t}\bm{c}_t)\T(e^{-G_s}\vb_s)$. So
+$\mM[I,J]=\widehat\mC_I\widehat\mB_J\T$ with $\widehat\mC_I\in\R^{\abs{I}\times N}$ and
+$\widehat\mB_J\in\R^{\abs{J}\times N}$, which has rank at most $N$. (This factorization is for
+the proof only; numerically one never forms $e^{-G_s}$, \cref{sec:c03-logspace}.)
+\end{proof}
+
+\citet{dao2024ssd} also develop the converse direction, relating every $N$-semiseparable matrix
+to a time-varying SSM with state size $N$ (see the paper for the precise statement), and call the
+resulting equivalence \emph{structured state-space duality} (SSD): the same sequence map can be computed in a \emph{linear} mode, as the recurrence
+\cref{eq:c03-mamba2} with $\bigO(TNp)$ work, or in a \emph{quadratic} mode, as the masked
+``attention'' $\mM\widetilde\mX$ with $\bigO(T^2(N+p))$ work. When all $\alpha_t=1$, $\mD=\bm{L}$
+and SSD is plain linear attention. The training algorithm of Mamba-2 is the block decomposition
+of $\mM$ that we drew in \cref{fig:c03-chunk}: diagonal blocks in quadratic mode, off-diagonal
+blocks factored through the chunk states, i.e.\ \cref{prop:c03-chunk-gated}.
+
+\begin{implnote}[title={In the code: Mamba-2's minimal SSD reference}]
+\Cref{lst:c03-ssd-chunks} is the reference implementation in
+\repofile{repos/state-spaces__mamba/mamba_ssm/modules/ssd_minimal.py} (the docstring calls it
+``the same as Listing 1 from the paper''). Its arguments are already discretized: the caller
+passes \code{X*dt} and \code{A*dt}, as the file's own \code{test_correctness} does. The mapping to
+our notation, per head:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\code{ssd_minimal} & this chapter \\
+\midrule
+\code{X} (length, \code{d_head}) & values $\vv_t=\Delta_t\vx_t$, i.e.\ $\mV$ \\
+\code{A} (length) & log-gates $g_t=\Delta_ta=\log\alpha_t$ \\
+\code{B}, \code{C} (length, \code{d_state}) & keys $\mK$ and queries $\mQ$ \\
+\code{block_len} & chunk size $C$ \\
+\code{L = exp(segsum(A))} & intra-chunk decay mask $\bm{\Gamma}$ of \cref{eq:c03-chunk-gated-out} \\
+\code{decay_states} & $e^{\gamma_C-\gamma_j}$ in \cref{eq:c03-chunk-gated-next} \\
+\code{states} (\ldots, \code{p}, \code{n}) & chunk states $\mS_{[i]}\in\R^{d_v\times d_k}$ \\
+\code{state_decay_out} & $e^{\gamma_r}$ in \cref{eq:c03-chunk-gated-out} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Steps~1 and~4 are the intra- and inter-chunk terms of \cref{eq:c03-chunk-gated-out}. Step~2
+computes each chunk's own contribution to the state (the second term of
+\cref{eq:c03-chunk-gated-next}), and step~3 chains these contributions across chunks with the
+decay $e^{\gamma_C}$ of each chunk. The reference does step~3 in quadratic mode, as a small
+(chunks$\times$chunks) masked matrix \code{decay_chunk}; this is the parallel form of a
+scalar-gated recurrence \emph{over chunks}. The fused Triton path in
+\repofile{repos/state-spaces__mamba/mamba_ssm/ops/triton/ssd_combined.py} runs the same four
+stages as separate kernels: \code{_chunk_cumsum_fwd} (chunk-local cumulative sums of
+$\Delta_ta$), \code{_chunk_state_fwd} (step~2), \code{_state_passing_fwd} (step~3, sequential
+over chunks), and \code{_bmm_chunk_fwd} plus \code{_chunk_scan_fwd} ($\mC\mB\T$ per chunk, then
+steps~1 and~4). We ported \code{ssd_minimal_discrete} line by line to NumPy and checked it
+against the recurrence \cref{eq:c03-mamba2} and against our own gated chunkwise code
+(\cref{tab:c03-checks}).
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak state-spaces\_\_mamba/\allowbreak mamba\_ssm/\allowbreak modules/\allowbreak ssd\_minimal.py} (function \texttt{ssd\_minimal\_discrete}): the four steps of the chunkwise SSD algorithm.},label={lst:c03-ssd-chunks}]
+    X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
+
+    A = rearrange(A, "b c l h -> b h c l")
+    A_cumsum = torch.cumsum(A, dim=-1)
+
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    L = torch.exp(segsum(A))
+    Y_diag  = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
+
+    # 2. Compute the state for each intra-chunk
+    # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
+
+    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+    # (middle term of factorization of off-diag blocks; A terms)
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([initial_states, states], dim=1)
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+    states, final_state = new_states[:, :-1], new_states[:, -1]
+
+    # 4. Compute state -> output conversion per chunk
+    # (left term of low-rank factorization of off-diagonal blocks; C terms)
+    state_decay_out = torch.exp(A_cumsum)
+    Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
+
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+    return Y, final_state
+\end{lstlisting}
+
+The same file contains the two segment-sum functions mentioned in \cref{sec:c03-logspace}
+(\cref{lst:c03-ssd}). \code{segsum(x)} returns the matrix with entries
+$\sum_{r=s+1}^{t}x_r$ for $s\le t$ and $-\infty$ above the diagonal, so that its exponential is
+the decay mask $\mD$ with zeros above the diagonal. The ``naive'' version subtracts two
+cumulative sums and is exposed to cancellation; the ``more stable'' version masks the input
+first and then sums only the entries of each segment.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak state-spaces\_\_mamba/\allowbreak mamba\_ssm/\allowbreak modules/\allowbreak ssd\_minimal.py}: naive and stable segment sums.},label={lst:c03-ssd}]
+def segsum_unstable(x):
+    """Naive segment sum calculation."""
+    T = x.size(-1)
+    x_cumsum = torch.cumsum(x, dim=-1)
+    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
+
+def segsum(x):
+    """More stable segment sum calculation."""
+    T = x.size(-1)
+    x = repeat(x, "... d -> ... d e", e=T)
+    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=-1)
+    x = x.masked_fill(~mask, 0)
+    x_segsum = torch.cumsum(x, dim=-2)
+    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the Mamba-2 block and its decoding step}]
+\code{Mamba2} in \repofile{repos/state-spaces__mamba/mamba_ssm/modules/mamba2.py} produces
+$[\vz,\vx,\vb,\bm{c},\Delta]$ with a single input projection (\code{in_proj}), runs a short causal
+depthwise convolution (\code{d_conv=4}) and a SiLU over $(\vx,\vb,\bm{c})$, applies the SSD
+recurrence, multiplies by the gate $\vz$ inside a gated RMSNorm, and projects back. Defaults:
+\code{d_state=128}, \code{headdim=64}, \code{expand=2}, \code{chunk_size=256},
+\code{A_init_range=(1, 16)} for $-a$ (stored as its logarithm \code{A_log}, with $a=-e^{\texttt{A\_log}}$), and $\Delta$ initialized log-uniformly
+between \code{dt_min=0.001} and \code{dt_max=0.1} through the bias of a softplus. For training
+and prefill it calls \code{mamba_chunk_scan_combined} (the chunkwise algorithm); for decoding,
+\code{step} applies \cref{eq:c03-mamba2} once per token, and when the fused
+\code{selective_state_update} kernel is unavailable it falls back to the plain PyTorch lines of
+\cref{lst:c03-mamba2step}. The state \code{ssm_state} has shape (batch, heads, \code{headdim},
+\code{d_state}), i.e.\ $d_v\times d_k$ per head as in this book.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak state-spaces\_\_mamba/\allowbreak mamba\_ssm/\allowbreak modules/\allowbreak mamba2.py} (method \texttt{Mamba2.step}): one decoding step of Mamba-2. \texttt{dA} is $\alpha_t$, \texttt{dBx} is $(\Delta_t\boldsymbol{x}_t)\boldsymbol{b}_t^{\top}$.},label={lst:c03-mamba2step}]
+            # Discretize A and B
+            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+            dA = torch.exp(dt * A)  # (batch, nheads)
+            x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+            ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+            y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+            y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+\end{lstlisting}
+
+\begin{taxonomy}
+\textbf{Mamba and Mamba-2} (survey Table~I: ``Mamba / Mamba-2, 2024, Online, Long-Term, State
+Space Recurrence''; \citet{zhoubian2026memory}).
+\emph{Representation:} implicit. \emph{Update dynamics:} online, every token.
+\emph{Persistence:} long-term within a stream. \emph{Update rule:} state-transition update; the
+survey's \S III-C notes that Mamba-style models ``emphasize structured state transitions'' and
+trade flexible token-wise access for compressed temporal dynamics.
+\end{taxonomy}
+
+\begin{results}
+\textbf{Sources:} \repofile{repos/state-spaces__mamba/README.md} and \citet{zhoubian2026memory}
+(\S III-C). The README states that Mamba shows ``promising performance on information-dense data
+such as language modeling, where previous subquadratic models fall short of Transformers'', and
+that it is built ``with an efficient hardware-aware design and implementation in the spirit of
+FlashAttention''. The survey credits Mamba and Mamba-2 with selective updates and efficient
+state-space-duality formulations, ``trading flexible token-wise access for compressed temporal
+dynamics''. The mirrored repository contains no result tables; see \citet{gu2023mamba} and
+\citet{dao2024ssd} for numbers.
+\end{results}
+
+\subsection{Associative scans}\label{sec:c03-scan}
+
+Every recurrence in this chapter is affine in the state, $\mS_t=\mS_{t-1}\mA_t+\mB_t$, for some
+transition $\mA_t\in\R^{d_k\times d_k}$ and input $\mB_t\in\R^{d_v\times d_k}$ (for linear
+attention $\mA_t=\mI$, for GLA $\mA_t=\diag(\valpha_t)$, for the delta rule
+$\mA_t=\mI-\beta_t\vk_t\vk_t\T$). Affine recurrences can be parallelized over time with a
+\emph{prefix scan}, which is how Mamba's training kernel and earlier work on linear RNNs
+\citep{c03-martin2018parallelizing,c03-smith2023s5} avoid $T$ sequential steps.
+
+Represent step $t$ by the pair $e_t=(\mA_t,\mB_t)$, standing for the affine map
+$f_t(\mS)=\mS\mA_t+\mB_t$. Applying $f_1$ and then $f_2$ gives
+$f_2(f_1(\mS))=\mS\mA_1\mA_2+(\mB_1\mA_2+\mB_2)$, so define
+\begin{equation}\label{eq:c03-scan-op}
+  e_1\bullet e_2=(\mA_1\mA_2,\ \mB_1\mA_2+\mB_2).
+\end{equation}
+
+\begin{lemma}\label{lem:c03-assoc}
+The operator $\bullet$ is associative.
+\end{lemma}
+
+\begin{proof}
+$(e_1\bullet e_2)\bullet e_3=(\mA_1\mA_2\mA_3,\ (\mB_1\mA_2+\mB_2)\mA_3+\mB_3)$ and
+$e_1\bullet(e_2\bullet e_3)=(\mA_1\mA_2\mA_3,\ \mB_1\mA_2\mA_3+\mB_2\mA_3+\mB_3)$, which are equal
+by distributivity. (Equivalently: composition of functions is associative.)
+\end{proof}
+
+Writing $(\widehat\mA_t,\widehat\mB_t)=e_1\bullet e_2\bullet\cdots\bullet e_t$, every state is
+$\mS_t=\mS_0\widehat\mA_t+\widehat\mB_t$. Computing all prefixes of an associative operation is
+the classical \emph{scan} problem. \Cref{alg:c03-scan} is the simple Hillis--Steele scan:
+$\lceil\log_2T\rceil$ rounds, each fully parallel, $\bigO(T\log T)$ applications of $\bullet$
+in total. Blelloch's work-efficient scan \citep{c03-blelloch1990prefix} needs only $\bigO(T)$
+applications, at twice the depth.
+
+\begin{algorithm}[t]
+\caption{Inclusive parallel scan (Hillis--Steele) for affine recurrences}\label{alg:c03-scan}
+\begin{algorithmic}[1]
+\Require elements $e_1,\dots,e_T$ with $e_t=(\mA_t,\mB_t)$; associative operator $\bullet$ of \cref{eq:c03-scan-op}
+\Ensure $x_t=e_1\bullet\cdots\bullet e_t$ for all $t$; then $\mS_t=\mS_0\widehat\mA_t+\widehat\mB_t$ with $(\widehat\mA_t,\widehat\mB_t)=x_t$
+\State $x_t\gets e_t$ for all $t$; \ $d\gets1$
+\While{$d<T$}
+  \For{$t=1$ to $T$ \textbf{in parallel}}
+    \State $x'_t\gets x_{t-d}\bullet x_t$ \textbf{if} $t>d$ \textbf{else} $x_t$ \Comment{earlier segment first}
+  \EndFor
+  \State $x\gets x'$; \ $d\gets2d$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+After the round with offset $d$, $x_t$ composes the elements $e_{\max(1,t-2d+1)},\dots,e_t$
+(induction on the round), so after $\lceil\log_2T\rceil$ rounds it composes $e_1,\dots,e_t$. The
+cost of one application of $\bullet$ is what decides whether a scan pays off:
+\begin{itemize}
+\item \emph{Scalar or diagonal transitions} (RetNet, Mamba, Mamba-2, GLA): $\mA_1\mA_2$ is an
+elementwise product and $\mB_1\mA_2$ a column scaling, $\bigO(d_kd_v)$, the same as one
+recurrent step. The scan does $\bigO(T)$ or $\bigO(T\log T)$ such steps in logarithmic depth.
+\item \emph{Dense transitions} (the delta rule): $\mA_1\mA_2$ is a $d_k\times d_k$ matrix
+product, $\bigO(d_k^3)$, so the scan costs $\bigO(Td_k^3)$ against $\bigO(Td_kd_v)$ for the
+recurrence. This is why the delta rule is parallelized with the WY representation, which never
+forms a $d_k\times d_k$ product of transitions.
+\end{itemize}
+Even for diagonal transitions, a scan consists of elementwise operations that cannot use tensor
+cores, which is the main reason Mamba-2 replaced Mamba's scan by the matmul-based chunkwise SSD
+algorithm. Scans remain useful one level up: the sequential pass over chunk states in
+\cref{alg:c03-chunk,alg:c03-delta-chunk} is itself an affine recurrence over $T/C$ steps, which
+can be scanned when the number of chunks is large (the \fla{} file
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/common/chunk_h_parallel.py} is
+described in its docstring as ``fully parallelized state passing''). Our implementation is
+\cref{lst:c03-scan}; we checked it on both diagonal and delta-rule transitions.
+
+% ======================================================================
+\section{Implementation walkthrough: the fla library}\label{sec:c03-fla}
+\begin{sloppypar}
+
+The \fla{} library \citep{c03-yang2024fla}, \gh{fla-org/flash-linear-attention}, mirrored at
+\repo{fla-org__flash-linear-attention}, is the common implementation substrate for most recurrent
+models in this book: its README lists, among many others, RetNet, GLA, DeltaNet, Mamba-2, Gated
+DeltaNet, RWKV-7, DeltaProduct, Comba, MoM, Log-Linear Attention, Kimi Delta Attention, Mamba-3
+and Gated DeltaNet-2. Once the code for the four operators of this chapter is clear, the
+operators of later chapters read as small variations.
+
+\subsection{Organization}
+
+\begin{description}[style=nextline,leftmargin=1.2em]
+\item[\texttt{fla/ops/<op>/}] One directory per recurrence: \code{linear_attn}, \code{retention},
+\code{simple_gla}, \code{gla}, \code{delta_rule}, \code{gated_delta_rule}, \code{kda},
+\code{rwkv7}, \dots{} Inside, the same files recur:
+\code{naive.py} (plain PyTorch references with Python loops---the best place to start reading),
+\code{fused_recurrent.py} (one Triton kernel that steps through the tokens with the state held in
+registers; used for decoding), and \code{chunk.py} (the chunkwise algorithm wrapped in a
+\code{torch.autograd.Function} with a hand-written backward pass). Some operators add
+\code{parallel.py}, \code{fused_chunk.py} or, for the delta rule, \code{wy_fast.py}.
+\item[\texttt{fla/ops/common/}] Kernels shared by many operators: \code{chunk_h.py} (state
+passing, Pass~1 of \cref{alg:c03-chunk}, with optional scalar, key-side or value-side gates),
+\code{chunk_o.py} (outputs, Pass~2), \code{chunk_delta_h.py} (state passing with pseudo-values,
+Stage~2 of \cref{alg:c03-delta-chunk}), \code{chunk_scaled_dot_kkt.py} (the matrix $\bm{N}$ of
+\cref{eq:c03-ut-A}) and \code{chunk_h_parallel.py}.
+\item[\texttt{fla/ops/utils/}] Numerical building blocks: \code{cumsum.py}
+(\code{chunk_local_cumsum}), \code{solve_tril.py} (the inverse $(\mI+\bm{N})^{-1}$),
+\code{constant.py} (\code{RCP_LN2}$\,=1/\ln2$), \code{op.py} (\code{exp2} and friends).
+\item[\texttt{fla/layers/}] One \code{nn.Module} per model (\code{linear_attn.py}, \code{gla.py},
+\code{delta_net.py}, \code{mamba2.py}, \dots): projections, short convolutions, feature maps,
+gates, output normalization, and the choice of kernel through a \code{mode} argument. The
+DeltaNet and GLA layers switch to \code{fused_recurrent} whenever the input has at most 64
+tokens, which covers decoding.
+\item[\texttt{fla/models/<model>/}] Hugging Face-style \code{configuration_*.py} and
+\code{modeling_*.py} files that stack the layers into language models, e.g.\
+\repofile{repos/fla-org__flash-linear-attention/fla/models/delta_net/}.
+\end{description}
+
+Tensors are laid out sequence-first as \texttt{[B, T, H, K]} (batch, time, heads, head
+dimension). Recurrent states are \texttt{[B, H, K, V]}, the transpose $\mS_t\T$ of our
+convention. Variable-length batches are packed into a single sequence with cumulative offsets
+\code{cu_seqlens}, following the FlashAttention interface. The default scale is
+$K^{-1/2}=1/\sqrt{d_k}$, applied to the queries.
+
+\begin{implnote}[title={Reading a Triton kernel}]
+Triton \citep{c03-tillet2019triton} kernels are Python functions decorated with
+\code{@triton.jit}. A few facts suffice to read the \fla{} code.
+\begin{itemize}
+\item \emph{Programs and grids.} A kernel launch runs one \emph{program} per point of a grid;
+\code{tl.program_id(axis)} returns the program's coordinates. In \fla{} the grid is typically
+(chunks, batch$\times$heads) or (tiles of $d_k$ and $d_v$, sequences$\times$heads).
+\item \emph{Blocks.} A program works on tiles held in registers or shared memory.
+\code{tl.arange(0, BT)} creates a vector of offsets; block sizes such as \code{BT} (the chunk
+size $C$), \code{BK}, \code{BV} (tile widths along $d_k$, $d_v$) are \code{tl.constexpr}
+compile-time constants.
+\item \emph{Memory.} Pointers are formed by arithmetic (base $+$ offsets $\times$ strides) and
+accessed with \code{tl.load(ptr, mask=..., other=0)} and \code{tl.store(ptr, x, mask=...)}; the
+mask guards the ragged end of a sequence.
+\item \emph{Compute.} \code{tl.dot(a, b, acc)} multiplies two tiles on tensor cores and adds the
+result to \code{acc}; everything else (\code{*}, \code{tl.where}, \code{tl.sum},
+\code{tl.cumsum}, \code{exp2}) is elementwise or a reduction.
+\item \emph{Specialization.} \code{@triton.heuristics} sets compile-time flags such as
+\code{USE_G} (``a gate was passed''), so unused branches are compiled away;
+\code{@triton.autotune} benchmarks several configurations (\code{num_warps},
+\code{num_stages}, block sizes) and caches the fastest.
+\item \emph{Naming in \fla{}.} \code{b_} = a block (tile) in registers, \code{p_} = pointer,
+\code{o_} = offsets, \code{m_} = mask, \code{i_t} = chunk index, \code{i_bh} = batch--head index.
+\end{itemize}
+\end{implnote}
+
+\subsection{Linear attention and simple GLA}
+
+The naive chunkwise reference for linear attention (\cref{lst:c03-fla-la-naive}) is
+\cref{alg:c03-chunk} written with tensor operations. Since the state is stored as $\mS\T$,
+\code{k.transpose(-1, -2) @ v} is $\mK_{[i]}\T\mV_{[i]}=(\mV_{[i]}\T\mK_{[i]})\T$, the
+contribution of chunk $i$ to the state. Because the transitions are identities, Pass~1 is just an
+\emph{exclusive prefix sum} over chunks: \code{cumsum} followed by a shift by one chunk, which
+places $\mS_{[i-1]}\T$ at position $i$. Then \code{inter} is $\mQ_{[i]}\mS_{[i-1]}\T$ and
+\code{intra} is the masked $C\times C$ product, where \code{triu(..., diagonal=1)} marks the
+entries strictly above the diagonal, which are zeroed.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak linear\_attn/\allowbreak naive.py} (function \texttt{naive\_chunk\_linear\_attn}).},label={lst:c03-fla-la-naive}]
+    q = rearrange(q, 'b (n c) h d -> b h n c d', c=chunk_size) * scale
+    k = rearrange(k, 'b (n c) h d -> b h n c d', c=chunk_size)
+    v = rearrange(v, 'b (n c) h d -> b h n c d', c=chunk_size)
+    kv = k.transpose(-1, -2) @ v
+    kv = kv.cumsum(2)
+    kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)
+    inter = q @ kv
+    intra = ((
+        q @ k.transpose(-1, -2)).masked_fill_(
+        torch.triu(torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device), diagonal=1),
+        0,
+    )) @ v
+    o = inter + intra
+\end{lstlisting}
+
+The production path is shorter than one might expect: \code{chunk_linear_attn}
+(\repofile{repos/fla-org__flash-linear-attention/fla/ops/linear_attn/chunk.py}) calls
+\code{chunk_simple_gla} with no gate and then, if \code{normalize=True}, divides by
+$\vq_t\T\sum_{i\le t}\vk_i$. Simple GLA---the scalar-gated recurrence of
+\cref{sec:c03-gating}; its README describes it as the gating mechanism of Gated RFA, Mamba2 and
+YOCO (``a.k.a., Gated RetNet''), head-wise rather than elementwise---runs three steps (\repofile{repos/fla-org__flash-linear-attention/fla/ops/simple_gla/chunk.py}):
+\begin{enumerate}
+\item \code{chunk_local_cumsum(g, chunk_size, scale=RCP_LN2)} turns the per-token log-gates into
+chunk-local cumulative sums $\gamma_r$ and multiplies them by $1/\ln2$, so that all later kernels
+can use the base-2 exponential: $e^{\gamma}=2^{\gamma/\ln2}$, and \code{exp2} maps directly onto
+the GPU's native base-2 exponential instruction;
+\item \code{chunk_fwd_h} (Pass~1) materializes the boundary states;
+\item \code{chunk_fwd_o} (Pass~2) computes the outputs.
+\end{enumerate}
+
+\Cref{lst:c03-fla-chunk-h} shows the body of the loop over chunks in the state-passing kernel.
+One program owns a \texttt{[BK, BV]} tile \code{b_h} of $\mS\T$ in float32 registers for the
+whole sequence. At the start of each chunk it stores the current tile, which is
+$\mS_{[i-1]}\T$---the ``store'' line of \cref{alg:c03-chunk}. With a scalar gate, \code{b_g} holds
+$\gamma_1,\dots,\gamma_C$ and \code{b_g_last} holds $\gamma_C$ (both in units of $\ln 2$), so the
+two scaling lines implement $e^{\gamma_C}\mS_{[i-1]}$ and $\diag(e^{\gamma_C-\bm\gamma})\mV_{[i]}$,
+and the final \code{tl.dot} adds $\mK_{[i]}\T(\cdots)$: this is
+\cref{eq:c03-chunk-gated-next}, transposed.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak common/\allowbreak chunk\_h.py} (kernel \texttt{chunk\_fwd\_kernel\_h}, loop over chunks).},label={lst:c03-fla-chunk-h}]
+        if i_t_int64 % NTS == 0:
+            tl.store(p_h, (tl.trans(b_h) if STATE_V_FIRST else b_h).to(p_h.dtype.element_ty), mask=m_h)
+        # [BK, BT]
+        b_k = tl.load(p_k, mask=(o_k[:, None] < K) & m_t[None, :], other=0.0)
+        # [BT, BV]
+        b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
+        last_idx = min((i_t_int64 + 1) * BT, T) - 1
+
+        # scalar decay
+        if USE_G:
+            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+            p_g = g + bos*H + (i_t_int64 * BT + tl.arange(0, BT)) * H + i_h
+            b_g = tl.load(p_g, mask=(i_t_int64 * BT + tl.arange(0, BT) < T), other=0.)
+            b_h *= exp2(b_g_last)
+            b_v = (b_v * exp2(b_g_last - b_g)[:, None]).to(b_v.dtype)
+        # ...
+        b_h = tl.dot(b_k, b_v, b_h)
+\end{lstlisting}
+
+The output kernel \code{chunk_fwd_kernel_o} accumulates \code{b_o = tl.dot(b_q, b_h, b_o)}
+($\mQ_{[i]}\mS_{[i-1]}\T$) and \code{b_A = tl.dot(b_q, b_k, b_A)} ($\mQ_{[i]}\mK_{[i]}\T$) over
+tiles of the key dimension, and then applies the gate and the causal mask
+(\cref{lst:c03-fla-chunk-o}): \code{exp2(b_g)} is $e^{\gamma_r}$ and
+\code{exp2(b_g[:, None] - b_g[None, :])} is the matrix $\bm\Gamma$ of
+\cref{eq:c03-chunk-gated-out}. The mask keeps entries with row index $\ge$ column index. The
+same kernel, with \code{g=None}, serves plain linear attention and, as we will see, the delta
+rule.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak common/\allowbreak chunk\_o.py} (kernel \texttt{chunk\_fwd\_kernel\_o}).},label={lst:c03-fla-chunk-o}]
+    if USE_G:
+        g += bos * HV + i_h
+        p_g = g + o_t * HV
+        b_g = tl.load(p_g, mask=m_t, other=0.0)
+        b_o = b_o * exp2(b_g)[:, None]
+        b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+    # ...
+    m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
+    b_A = tl.where(m_A, b_A, 0)
+    # ...
+    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
+\end{lstlisting}
+
+\paragraph{GLA.}
+The GLA layer (\repofile{repos/fla-org__flash-linear-attention/fla/layers/gla.py}) computes the
+per-channel log-gates as \code{F.logsigmoid(gk) / self.gate_logit_normalizer} from a two-layer
+low-rank projection \code{gk_proj}. \code{chunk_gla_fwd} in
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/gla/chunk.py} again starts with
+\code{chunk_local_cumsum(..., scale=RCP_LN2)}, calls \code{chunk_fwd_h} with the key-side gate
+\code{gk} (the branch ``vector decay, h = Diag(gk) @ h'' of the same kernel), and computes the
+intra-chunk scores with secondary chunking, \code{BC = min(16, BT)}. For an off-diagonal pair of
+sub-chunks, \cref{lst:c03-fla-gla} uses the cumulative gate \code{b_gn} at the first position of
+the query sub-chunk as the reference point $n$: \code{b_qg} is $\vq_r\had e^{\bm\lambda_r-\bm\lambda_n}$
+and \code{b_kg} is $\vk_j\had e^{\bm\lambda_n-\bm\lambda_j}$, both with nonpositive exponents,
+and one \code{tl.dot} produces the block of $\Omega_{rj}$. A separate kernel
+(\code{chunk_gla_fwd_A_kernel_intra_sub_intra}) fills the diagonal sub-blocks one key at a time
+with \code{tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1)}.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak gla/\allowbreak chunk.py} (kernel \texttt{chunk\_gla\_fwd\_A\_kernel\_intra\_sub\_inter}).},label={lst:c03-fla-gla}]
+        # [BK,]
+        b_gn = tl.load(p_gn, mask=m_k, other=0)
+        # [BC, BK]
+        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        b_g = tl.load(p_g, mask=m_qk, other=0.0)
+        b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
+        # [BK, BC]
+        b_k = tl.load(p_k, mask=m_kj, other=0.0)
+        b_gk = tl.load(p_gk, mask=m_kj, other=0.0)
+        b_kg = b_k * exp2(b_gn[:, None] - b_gk)
+        # [BC, BC] using tf32 to improve precision here.
+        b_A = tl.dot(b_qg, b_kg, b_A)
+\end{lstlisting}
+
+\subsection{The delta rule}
+
+\paragraph{The naive references.}
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/delta_rule/naive.py} contains a
+recurrent, a chunkwise and a parallel reference. The recurrence (\code{delta_rule_recurrence})
+is \cref{eq:c03-delta} line by line: \code{_v = _v - (S * _k[..., None]).sum(-2)} is
+$\vv_t-\mS_{t-1}\vk_t$, the next line multiplies by $\beta_t$, and
+\code{S = S + _k.unsqueeze(-1) * _v.unsqueeze(-2)} adds the outer product (as $\mS\T$). The
+chunkwise reference (\cref{lst:c03-fla-delta-naive}) is \cref{alg:c03-delta-chunk}:
+\begin{itemize}
+\item \code{v} and \code{k_beta} are pre-multiplied by $\beta$, i.e.\ $\diag(\vbeta)\mV$ and
+$\diag(\vbeta)\mK$;
+\item \code{attn = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)} with a mask on and
+above the diagonal is $-\bm{N}$;
+\item the \code{for} loop overwrites row $i$ of \code{attn} with row $i$ of
+$(\mI+\bm{N})^{-1}-\mI$, using rows $<i$ that are already final (forward substitution: for
+$j<i$, $X_{ij}=-N_{ij}-\sum_{j<m<i}N_{im}X_{mj}$); adding the identity completes
+$(\mI+\bm{N})^{-1}$;
+\item \code{u = attn @ v} and \code{w = attn @ k_beta} are $\mU$ and $\mW$ of \cref{eq:c03-ut};
+\item in the loop over chunks, \code{u_i = u[:, :, i] - w[:, :, i] @ S} is the pseudo-value
+matrix $\widetilde\mV_{[i]}=\mU-\mW\mS_{[i-1]}\T$ (recall \code{S} is $\mS\T$), the output line
+is \cref{eq:c03-delta-chunk-out}, and \code{S = S + k_i.transpose(-1, -2) @ u_i} is the
+linear-attention state update with pseudo-values.
+\end{itemize}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak delta\_rule/\allowbreak naive.py}: chunkwise delta rule via the WY representation.},label={lst:c03-fla-delta-naive}]
+def delta_rule_chunkwise(q, k, v, beta, chunk_size=32):
+    b, h, l, d_k = q.shape
+    d_v = v.shape[-1]
+    q = q * (d_k ** -0.5)
+    v = v * beta[..., None]
+    k_beta = k * beta[..., None]
+
+    assert l % chunk_size == 0
+
+    # compute (I - tri(diag(beta) KK^T))^{-1}
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
+    q, k, v, k_beta = map(lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=chunk_size), [q, k, v, k_beta])
+    attn = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        attn[..., i, :i] = attn[..., i, :i] + (attn[..., i, :, None].clone() * attn[..., :, :i].clone()).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=torch.float, device=q.device)
+
+    u = attn @ v
+    w = attn @ k_beta
+    S = k.new_zeros(b, h, d_k, d_v)
+    o = torch.zeros_like(v)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
+    for i in range(0, l // chunk_size):
+        q_i, k_i = q[:, :, i], k[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2)).masked_fill_(mask, 0)
+        u_i = u[:, :, i] - w[:, :, i] @ S
+        o_inter = q_i @ S
+        o[:, :, i] = o_inter + attn @ u_i
+        S = S + k_i.transpose(-1, -2) @ u_i
+
+    return rearrange(o, 'b h n c d -> b h (n c) d'), S
+\end{lstlisting}
+
+The comment in the listing writes the matrix as $(\mI-\mathrm{tri}(\diag(\beta)\mK\mK\T))^{-1}$,
+with the sign absorbed into \code{tri}; in our notation it is $(\mI+\bm{N})^{-1}$. The file's
+\code{README.md} gives the same derivation in the transposed convention.
+
+\paragraph{The Triton pipeline.}
+\code{chunk_delta_rule_fwd} in
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/delta_rule/chunk.py} chains three
+functions, which are the three stages of \cref{alg:c03-delta-chunk}:
+\begin{enumerate}
+\item \code{prepare_wy_repr_fwd} (\code{wy_fast.py}) computes the WY factors:
+\code{chunk_scaled_dot_kkt_fwd} builds $\bm{N}$ in float32 (the kernel computes
+\code{tl.dot(b_k, tl.trans(b_k), b_A)}, multiplies row $r$ by $\beta_r$, and keeps only entries
+with row index $>$ column index); \code{solve_tril} returns $(\mI+\bm{N})^{-1}$; and
+\code{recompute_w_u_fwd} forms \code{b_w = tl.dot(b_A, b_kb)} and \code{b_u = tl.dot(b_A, b_vb)}
+with \code{b_kb}, \code{b_vb} the $\beta$-scaled keys and values, i.e.\
+$\mW=(\mI+\bm{N})^{-1}\diag(\vbeta)\mK$ and $\mU=(\mI+\bm{N})^{-1}\diag(\vbeta)\mV$.
+\item \code{chunk_gated_delta_rule_fwd_h} (\code{common/chunk_delta_h.py}, called with
+\code{g=None}) is Stage~2. Per chunk it stores the state tile, computes \code{b_v = tl.dot(b_w,
+b_h1)} (and the same for further 64-wide tiles \code{b_h2}, \code{b_h3}, \code{b_h4} of the key
+dimension), subtracts it from the loaded $\mU$ rows to obtain the pseudo-values
+\code{v_new} $=\widetilde\mV_{[i]}$, and adds $\mK_{[i]}\T\widetilde\mV_{[i]}$ to the state.
+\item The output kernel \code{chunk_fwd_o}, the \emph{same} one as for linear attention and
+simple GLA (\cref{lst:c03-fla-chunk-o}), is called with \code{v=v_new}. This line of code is the
+implementation of the statement that the delta rule is linear attention on pseudo-values.
+\end{enumerate}
+\code{solve_tril} inverts the unit lower-triangular $C\times C$ matrix hierarchically: it inverts
+$16\times16$ diagonal blocks by forward substitution (\code{solve_tril_16x16_kernel}) and merges
+them with the block formula
+\[
+  \begin{pmatrix}\mA_{11}&\bm0\\ \mA_{21}&\mA_{22}\end{pmatrix}^{-1}
+  =\begin{pmatrix}\mA_{11}^{-1}&\bm0\\ -\mA_{22}^{-1}\mA_{21}\mA_{11}^{-1}&\mA_{22}^{-1}\end{pmatrix},
+\]
+which is the line \code{b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21), b_Ai_11, ...)} in
+\code{merge_16x16_to_32x32_inverse_kernel} (a 64$\times$64 variant exists as well). The public
+function \code{chunk_delta_rule} accepts \code{chunk_size} 16, 32 or 64 (default 64) and asserts
+that the inputs are not float32 (the error message asks for bfloat16); $\bm{N}$ itself is
+computed in float32, and \code{solve_tril} loads its blocks as float32 before returning the
+inverse in the input precision.
+
+\paragraph{Decoding.}
+\Cref{lst:c03-fla-delta-rec} is the inner loop of the fused recurrent kernel. Unlike the chunk
+kernels, it holds the state tile as \texttt{[BV, BK]}, i.e.\ in our $d_v\times d_k$ orientation:
+\code{b_v_minus} is $\mS_{t-1}\vk_t$, \code{b_v} becomes the error $\vv_t-\mS_{t-1}\vk_t$ (stored
+to \code{u} for the backward pass), is scaled by $\beta_t$, and is added as an outer product; the
+output is $\mS_t\vq_t$ with $\vq_t$ already scaled by $1/\sqrt{d_k}$.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak fla-org\_\_flash-linear-attention/\allowbreak fla/\allowbreak ops/\allowbreak delta\_rule/\allowbreak fused\_recurrent.py} (kernel \texttt{fused\_recurrent\_delta\_rule\_fwd\_kernel}).},label={lst:c03-fla-delta-rec}]
+    for _ in range(0, T):
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * scale
+        b_v_minus = tl.sum(b_h * b_k[None, :], axis=1)
+        b_v -= b_v_minus
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta).to(tl.float32)
+        tl.store(p_u, b_v.to(p_v.dtype.element_ty), mask=mask_v)
+        b_v *= b_beta
+        b_h += b_k[None, :] * b_v[:, None]
+        b_o = b_h * b_q[None, :]
+        b_o = tl.sum(b_o, axis=1)
+\end{lstlisting}
+
+\paragraph{The DeltaNet layer.}
+\code{DeltaNet} in \repofile{repos/fla-org__flash-linear-attention/fla/layers/delta_net.py}
+wraps the kernel as follows: linear projections to $\vq,\vk,\vv$; short causal convolutions
+(\code{conv_size=4}) with SiLU on all three (the constructor warns that the short convolution is
+``crucial to the performance''); $\ell_2$ normalization of $\vq$ and $\vk$ inside the kernel
+(\code{qk_norm='l2'}); one $\beta_t=\sigmoid(\cdot)$ per head from \code{b_proj}, doubled if
+\code{allow_neg_eigval}; the kernel (\code{chunk} for training, \code{fused_recurrent} for short
+inputs); a per-head RMSNorm (optionally gated) on the output; and the output projection.
+
+\begin{implnote}[title={Variable map: \fla{} versus this chapter}]
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+\fla{} & this chapter \\
+\midrule
+\code{q}, \code{k}, \code{v} \texttt{[B, T, H, K/V]} & rows of $\mQ$, $\mK$, $\mV$ per head \\
+\code{h} \texttt{[B, NT, H, K, V]}, \code{b_h} & boundary states $\mS_{[i]}\T$ (transposed) \\
+\code{BT}; \code{BK}, \code{BV} & chunk size $C$; tile widths along $d_k$, $d_v$ \\
+\code{g} after \code{chunk_local_cumsum(..., RCP_LN2)} & $\gamma_r/\ln2$ (scalar gate) \\
+\code{gk} & per-channel log-gates $\log\valpha_t$, then $\bm\lambda_r/\ln2$ \\
+\code{b_g_last}, \code{b_gn} & $\gamma_C$; reference point $\bm\lambda_n$ \\
+\code{beta} & $\beta_t$ \\
+\code{A} (delta rule, before / after \code{solve_tril}) & $\bm{N}$ / $(\mI+\bm{N})^{-1}$ \\
+\code{w}, \code{u} & $\mW$, $\mU$ \\
+\code{v_new} & pseudo-values $\widetilde\mV$ \\
+\code{scale} & $1/\sqrt{d_k}$ (applied to queries) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{implnote}
+
+\begin{results}
+\textbf{Source:} \repofile{repos/fla-org__flash-linear-attention/README.md}, section
+``Benchmarks''. The README compares the Triton kernels \code{chunk_retention},
+\code{chunk_gla} and \code{chunk_gdn} (Gated DeltaNet) with the CUDA FlashAttention-2 kernel on
+a single NVIDIA GB200 GPU (CUDA 12.9, PyTorch 2.9.0); times in milliseconds, $D$ is the head
+dimension. Selected rows:
+\begin{center}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+pass & $B$, $T$, $H$, $D$ & retention & GLA & GDN & FlashAttn \\
+\midrule
+fwd & 1, 8192, 96, 128 & 0.787 & 1.765 & 1.265 & 3.753 \\
+fwd & 8, 1024, 8, 64 & 0.425 & 0.358 & 0.631 & 0.157 \\
+fwd+bwd & 2, 16384, 16, 128 & 2.122 & 5.984 & 3.616 & 19.960 \\
+fwd+bwd & 8, 1024, 8, 64 & 0.898 & 1.707 & 1.974 & 0.477 \\
+fwd+bwd & 8, 2048, 32, 256 & 51.103 & 13.797 & 8.644 & 6.748 \\
+\bottomrule
+\end{tabular}
+\end{center}
+At long sequences the chunkwise kernels are several times faster than FlashAttention-2, as the
+$\bigO(T)$ versus $\bigO(T^2)$ analysis predicts; at short sequences FlashAttention-2 is faster,
+because the quadratic term is small and the recurrent kernels pay fixed costs for state passing.
+The last row shows that kernel speed also depends strongly on the configuration (here head
+dimension 256). These are operator timings only; they say nothing about model quality, for which
+see the individual papers.
+\end{results}
+
+\end{sloppypar}
+
+% ======================================================================
+\section{Reference implementations (ours) and numerical checks}\label{sec:c03-ours}
+
+The listings below are our own minimal implementations of the algorithms of this chapter. They
+are written in NumPy so that they run anywhere and can be checked in double precision; a
+PyTorch version is a mechanical translation (replace \code{np} by \code{torch} and \code{.T} by
+\code{.mT} for batched tensors). Every function shown here is exactly the code we ran for the
+checks of \cref{tab:c03-checks}. All of them use our $d_v\times d_k$ state convention.
+
+\begin{lstlisting}[caption={Reference implementation (ours): linear attention in recurrent, parallel and chunkwise form (\cref{alg:c03-recurrent}, \cref{eq:c03-parallel}, \cref{alg:c03-chunk}).},label={lst:c03-ours-la}]
+import numpy as np
+
+def la_recurrent(Q, K, V):
+    # Q, K: (T, dk); V: (T, dv). The state S has shape (dv, dk).
+    T, dk = K.shape; dv = V.shape[1]
+    S = np.zeros((dv, dk)); O = np.zeros((T, dv))
+    for t in range(T):
+        S = S + np.outer(V[t], K[t])          # write: S_t = S_{t-1} + v_t k_t^T
+        O[t] = S @ Q[t]                       # read:  o_t = S_t q_t
+    return O, S
+
+def la_parallel(Q, K, V):
+    T = Q.shape[0]
+    L = np.tril(np.ones((T, T)))              # multiplicative causal mask
+    return (Q @ K.T * L) @ V
+
+def la_chunkwise(Q, K, V, C):
+    T, dk = K.shape; dv = V.shape[1]
+    assert T % C == 0
+    S = np.zeros((dv, dk)); O = np.zeros((T, dv))
+    L = np.tril(np.ones((C, C)))
+    for i in range(T // C):
+        s = slice(i * C, (i + 1) * C)
+        Qi, Ki, Vi = Q[s], K[s], V[s]
+        O[s] = Qi @ S.T + (Qi @ Ki.T * L) @ Vi   # inter-chunk + intra-chunk
+        S = S + Vi.T @ Ki                         # state at the chunk boundary
+    return O, S
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Reference implementation (ours): chunkwise scalar-gated linear attention with chunk-local log-space decay (\cref{prop:c03-chunk-gated}). With \texttt{log\_alpha = dt * a}, \texttt{V = dt * X}, \texttt{K = B}, \texttt{Q = C} this is Mamba-2's SSD.},label={lst:c03-gated}]
+def gated_chunkwise(Q, K, V, log_alpha, C):
+    # log_alpha: (T,), log of a scalar forget gate in (0, 1]
+    T, dk = K.shape; dv = V.shape[1]
+    S = np.zeros((dv, dk)); O = np.zeros((T, dv))
+    for i in range(T // C):
+        s = slice(i * C, (i + 1) * C)
+        Qi, Ki, Vi = Q[s], K[s], V[s]
+        g = np.cumsum(log_alpha[s])               # gamma_r: local log-decay, r = 1..C
+        D = np.tril(np.exp(np.tril(g[:, None] - g[None, :])))  # exp(g_r - g_j), r >= j
+        O[s] = (Qi * np.exp(g)[:, None]) @ S.T + (Qi @ Ki.T * D) @ Vi
+        S = np.exp(g[-1]) * S + (Vi * np.exp(g[-1] - g)[:, None]).T @ Ki
+    return O, S
+\end{lstlisting}
+
+The inner \code{np.tril} in \cref{lst:c03-gated} sets the entries above the diagonal to zero
+\emph{before} exponentiating, so that no positive exponent is ever evaluated; the outer one
+removes the resulting ones. The \fla{} reference \code{naive_chunk_simple_gla} uses the same
+two-sided \code{tril}.
+
+\begin{lstlisting}[caption={Reference implementation (ours): the delta rule, recurrent and chunkwise via the WY representation / UT transform (\cref{alg:c03-delta-chunk}).},label={lst:c03-ours-delta}]
+def delta_recurrent(Q, K, V, beta):
+    T, dk = K.shape; dv = V.shape[1]
+    S = np.zeros((dv, dk)); O = np.zeros((T, dv))
+    for t in range(T):
+        v_old = S @ K[t]                                # what the memory returns for k_t
+        S = S + beta[t] * np.outer(V[t] - v_old, K[t])  # write what is missing
+        O[t] = S @ Q[t]
+    return O, S
+
+def unit_lower_solve(N, B):
+    # Solve (I + N) X = B for strictly lower-triangular N (forward substitution).
+    X = np.array(B, dtype=float)
+    for r in range(1, N.shape[0]):
+        X[r] -= N[r, :r] @ X[:r]
+    return X
+
+def delta_chunkwise(Q, K, V, beta, C):
+    T, dk = K.shape; dv = V.shape[1]
+    S = np.zeros((dv, dk)); O = np.zeros((T, dv))
+    L = np.tril(np.ones((C, C)))
+    for i in range(T // C):
+        s = slice(i * C, (i + 1) * C)
+        Qi, Ki, Vi, bi = Q[s], K[s], V[s], beta[s]
+        N = np.tril(bi[:, None] * (Ki @ Ki.T), -1)      # N[r, j] = beta_r k_r^T k_j, j < r
+        W = unit_lower_solve(N, bi[:, None] * Ki)       # W = (I + N)^{-1} diag(beta) K
+        U = unit_lower_solve(N, bi[:, None] * Vi)       # U = (I + N)^{-1} diag(beta) V
+        Vn = U - W @ S.T                                # pseudo-values
+        O[s] = Qi @ S.T + (Qi @ Ki.T * L) @ Vn
+        S = S + Vn.T @ Ki
+    return O, S
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Reference implementation (ours): the affine scan operator of \cref{eq:c03-scan-op} and the Hillis--Steele scan of \cref{alg:c03-scan}.},label={lst:c03-scan}]
+def combine(e1, e2):
+    # e = (A, B) is the affine map S -> S @ A + B; e1 is applied first.
+    A1, B1 = e1; A2, B2 = e2
+    return (A1 @ A2, B1 @ A2 + B2)
+
+def inclusive_scan(elems):
+    # Hillis-Steele: in the round with offset d, every t >= d combines with t - d.
+    x = list(elems); d = 1
+    while d < len(x):
+        x = [x[t] if t < d else combine(x[t - d], x[t]) for t in range(len(x))]
+        d *= 2
+    return x                       # x[t] composes e_1 ... e_{t+1}; S = S_0 @ A + B
+\end{lstlisting}
+
+\begin{table}[t]
+\centering
+\caption{Numerical checks run on the reference implementations (float64 unless noted). Inputs
+are random: $T=256$, $d_k=16$, $d_v=8$, standard normal queries, keys and values; for the delta
+rule, unit-norm keys and queries and $\beta_t=\sigmoid(z_t)$ with $z_t$ standard normal. Each
+entry is the largest absolute difference from the token-by-token recurrence. For scale, the
+largest ungated output had magnitude about 190.}
+\label{tab:c03-checks}
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.4cm}>{\raggedright\arraybackslash}Xl@{}}
+\toprule
+Model & Check & Max.\ abs.\ difference \\
+\midrule
+Linear attention & parallel form \cref{eq:c03-parallel} & $1.6\times10^{-13}$ \\
+ & chunkwise, $C\in\{1,8,16,32,64,256\}$: outputs / final state (worst case) & $1.6\times10^{-13}$ / $3.6\times10^{-14}$ \\
+Scalar gate, $\alpha_t\sim\mathcal U(0.8,1)$ & parallel form with $\mD$ from \cref{eq:c03-logdecay} & $7.8\times10^{-14}$ \\
+ & chunkwise (\cref{lst:c03-gated}), $C\in\{16,64\}$ & $\le2.8\times10^{-14}$ \\
+Per-channel gate (GLA), $\alpha\sim\mathcal U(0.5,1)$ & chunkwise, $C=64$, sub-chunks $C'=16$ & $2.8\times10^{-14}$ \\
+Delta rule & chunkwise WY/UT, $C\in\{1,8,16,64\}$ & $\le1.3\times10^{-15}$ \\
+ & effective attention matrix \cref{eq:c03-delta-parallel} & $2.0\times10^{-15}$ \\
+ & WY lemma: $\prod_r(\mI-\beta_r\vk_r\vk_r\T)$ vs.\ $\mI-\mW\T\mK$, $C=8$ & $7.8\times10^{-16}$ \\
+Mamba-2 / SSD & NumPy port of \code{ssd_minimal_discrete}, block 64 & $7.1\times10^{-15}$ \\
+ & same layer through \cref{lst:c03-gated} & $8.9\times10^{-15}$ \\
+Scan (\cref{lst:c03-scan}), $T=37$ & diagonal transitions / delta-rule transitions & $1.8$ / $2.7\times10^{-15}$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:c03-checks} lists what we checked. In every case the alternative forms agree with the
+recurrence to within rounding error of double precision, which confirms
+\cref{prop:c03-chunk-equiv,prop:c03-chunk-gated,thm:c03-delta-chunk}, \cref{lem:c03-wy},
+\cref{eq:c03-delta-parallel}, the SSD mapping of \cref{sec:c03-ssm} and \cref{lem:c03-assoc}
+numerically. We also ran the float32 experiments quoted in \cref{sec:c03-logspace,sec:c03-householder}
+(underflow of the cumulative-product form, cancellation in global cumulative sums, and divergence
+of the delta rule with unnormalized keys) and verified the worked examples
+\cref{ex:c03-interference,ex:c03-delta} and the eigenvalues of the generalized Householder matrix
+in the same script. None of the mirrored repository code was executed; the SSD check uses our
+own line-by-line NumPy port of the reference function.
+
+% ======================================================================
+\section{Comparison and discussion}\label{sec:c03-comparison}
+
+Every model of this chapter is an instance of one recurrence,
+\begin{equation}\label{eq:c03-unified}
+  \mS_t=\mathcal{A}_t(\mS_{t-1})+\mathcal{B}_t,\qquad \vo_t=\mS_t\vq_t,
+\end{equation}
+where $\mathcal{A}_t$ is a linear map on $d_v\times d_k$ matrices that decides what the memory
+keeps, and $\mathcal{B}_t$ is what it writes. \Cref{tab:c03-unified} lists them.
+
+\begin{table}[t]
+\centering
+\caption{The models of this chapter as instances of $\boldsymbol{S}_t=\mathcal{A}_t(\boldsymbol{S}_{t-1})+\mathcal{B}_t$.
+For Mamba and Mamba-2 the mapping to queries, keys and values is $\boldsymbol{q}_t=\boldsymbol{c}_t$,
+$\boldsymbol{k}_t=\boldsymbol{b}_t$ and values $\boldsymbol{x}_t$ (\cref{sec:c03-ssm}). ``Chunkwise'' means
+\cref{alg:c03-chunk} with the decay of \cref{prop:c03-chunk-gated} where applicable; ``WY/UT'' means
+\cref{alg:c03-delta-chunk}.}
+\label{tab:c03-unified}
+\small
+\begin{tabularx}{\textwidth}{@{}lll>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+Model & Transition $\mathcal{A}_t(\mS)$ & Write $\mathcal{B}_t$ & Transition type & Parallel training \\
+\midrule
+Linear attention & $\mS$ & $\vv_t\vk_t\T$ & identity & chunkwise; prefix sum over chunks \\
+RetNet & $\gamma\,\mS$ & $\vv_t\vk_t\T$ & constant scalar & chunkwise, $\Gamma_{rj}=\gamma^{r-j}$ \\
+Mamba-2 (SSD) & $e^{\Delta_ta}\,\mS$ & $\Delta_t\vx_t\vb_t\T$ & data-dependent scalar & chunkwise SSD \\
+Mamba (S6) & $\bar\mA_t\had\mS$ & $(\bm\Delta_t\had\vx_t)\vb_t\T$ & data-dependent elementwise & parallel scan \\
+GLA & $\mS\diag(\valpha_t)$ & $\vv_t\vk_t\T$ & data-dependent diagonal & chunkwise, secondary chunking \\
+DeltaNet & $\mS(\mI-\beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ & identity minus rank one & WY/UT \\
+Gated DeltaNet & $\alpha_t\mS(\mI-\beta_t\vk_t\vk_t\T)$ & $\beta_t\vv_t\vk_t\T$ & scalar $\times$ (identity minus rank one) & WY/UT with decay (\cref{ch:delta}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{A ladder of transitions.}
+Read from top to bottom, \cref{tab:c03-unified} is a ladder of increasingly expressive
+transitions: no forgetting; uniform forgetting at a fixed rate; uniform forgetting at a
+data-dependent rate; per-channel forgetting; targeted erasure of the content stored under the
+current key; and both together. The later chapters climb further. Kimi Delta Attention combines
+per-channel gates with the delta rule and Gated DeltaNet-2 separates erasing from writing
+(\cref{ch:delta}); DeltaProduct applies several Householder steps per token, RWKV-7 uses
+diagonal-plus-low-rank transitions with vector-valued gates, and Comba adds closed-loop feedback
+(\cref{ch:expressive}); Mamba-3 makes transitions complex-valued (rotations) and Log-Linear
+Attention replaces the single state by a hierarchy of states (\cref{ch:structured}); Kalman
+Linear Attention and Gated KalmaNet attach an uncertainty to the state
+(\cref{ch:probabilistic}).
+
+\paragraph{The structural constraint behind every design.}
+The chunkwise algorithm is fast only if the product of the transitions inside a chunk has a
+compact representation that can be computed with matrix multiplications. Scalar transitions
+multiply to the exponential of a cumulative sum; diagonal transitions multiply elementwise and
+need a reference point for stability; identity-minus-rank-one transitions multiply to
+identity-minus-rank-$C$ through the WY representation. A transition without such structure, for
+example a dense learned matrix, would require $d_k\times d_k$ matrix products per step and lose
+the hardware advantage (\cref{sec:c03-scan}). This constraint explains why the 2025--2026
+recurrent models of Part~II all choose transitions of the form ``diagonal (or scalar) times
+identity-minus-low-rank'': it is the most expressive family for which the chunkwise algorithm
+still runs on tensor cores.
+
+\paragraph{The regression view.}
+The fast-weight view of \cref{sec:c03-linear} gives each row of \cref{tab:c03-unified} a
+learning-rule interpretation. Linear attention takes a gradient step on the linear objective
+$-\vv_t\T\mS\vk_t$; the delta rule takes one on the squared error
+$\frac12\norm{\mS\vk_t-\vv_t}^2$; a forget gate $\alpha_t$ multiplies the state by
+$\alpha_t$ before the step, which is weight decay with rate $1-\alpha_t$. Gated DeltaNet is
+therefore online gradient descent on a regression loss with weight decay, performed on a
+$d_v\times d_k$ linear model at every token. \Cref{ch:ttt} generalizes the model from a matrix to
+a small neural network and the single gradient step to an inner optimization loop; the survey's
+Table~II calls that \emph{optimization-based writing}, but for a linear memory the two
+categories coincide.
+
+\paragraph{What a fixed-size state cannot do.}
+\Cref{prop:c03-capacity} bounds every row of \cref{tab:c03-unified}: one head can recall at most
+$d_k$ arbitrary associations exactly, whatever its write rule. Better write rules choose more
+wisely what to keep, but they cannot raise this bound. The remedies explored later in the book
+are to enlarge or multiply states (Mamba-2's larger $N$, Mixture-of-Memories and Log-Linear
+Attention in \cref{ch:structured}), to let memory grow with the sequence (Memory Caching in
+\cref{ch:routing}), and to keep some softmax-attention layers with an exact KV cache (the hybrid
+architectures of \cref{ch:hybrid}). The survey summarizes the trade-off in its discussion of
+recurrent sequence memory: such models support online processing of unbounded streams with
+bounded storage, but their computation-coupled states lack flexible read/write control, and
+long-horizon compression can reduce the fidelity of retained information.
+
+\begin{summarybox}
+\begin{itemize}
+\item Replacing the softmax kernel by a feature-map inner product lets the query move outside
+the sum over the past (associativity), so attention becomes a recurrence on a fixed-size matrix
+state: $\mS_t=\mS_{t-1}+\vv_t\vk_t\T$, $\vo_t=\mS_t\vq_t$ with $\mS_t\in\R^{d_v\times d_k}$.
+Memory and per-token decoding cost are independent of the context length.
+\item The state is a fast-weight associative memory. With a linear read, at most $d_k$ arbitrary
+key--value pairs can be recalled exactly, whatever the write rule
+(\cref{prop:c03-capacity}); beyond that, the write rule decides how errors are distributed.
+\item Recurrent, parallel and chunkwise forms compute the same outputs
+(\cref{prop:c03-chunk-equiv}). The chunkwise form costs $\bigO(TC(d_k+d_v)+Td_kd_v)$ per head,
+uses only matrix products, materializes states only at the $T/C$ chunk boundaries, and is what
+training kernels implement.
+\item Forget gates (RetNet's constant $\gamma$, Mamba-2's scalar $e^{\Delta_ta}$, GLA's
+per-channel $\valpha_t$) make the memory leaky. Decays must be computed as exponentials of
+differences of chunk-local cumulative log-gates; the naive cumulative-product form overflows.
+\item The delta rule is one step of online regression, $\mS_t=\mS_{t-1}-\beta_t(\mS_{t-1}\vk_t-\vv_t)\vk_t\T$.
+Its transition $\mI-\beta_t\vk_t\vk_t\T$ is a generalized Householder matrix with eigenvalues $1$
+and $1-\beta_t\norm{\vk_t}^2$; keys must be normalized.
+\item Through the WY representation and the UT transform, the chunkwise delta rule reduces to
+linear attention on pseudo-values $\widetilde\mV=\mU-\mW\mS\T$, with
+$[\mW\ \mU]=(\mI+\bm{N})^{-1}\diag(\vbeta)[\mK\ \mV]$ from a $C\times C$ triangular solve.
+\item Discretized SSMs give the same recurrences: Mamba-2 is scalar-gated linear attention with
+$\vq=\bm{c}$, $\vk=\vb$, $\vv=\Delta\vx$, and its SSD algorithm is the chunkwise algorithm on a
+semiseparable matrix. Affine recurrences can also be parallelized with associative scans, which
+are cheap only for diagonal transitions.
+\item \fla{} implements all of this with shared kernels: \code{chunk_local_cumsum},
+\code{chunk_fwd_h}, \code{chunk_fwd_o}, plus \code{chunk_scaled_dot_kkt_fwd}, \code{solve_tril}
+and \code{chunk_gated_delta_rule_fwd_h} for the delta-rule family.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[RetNet's chunkwise form]\label{exe:c03-retnet}
+For a constant gate $\alpha_t=\gamma$, show that the matrix $\bm{\Gamma}$ of
+\cref{eq:c03-chunk-gated-out} has entries $\gamma^{r-j}$ for $j\le r$, that the inter-chunk
+factor is $\gamma^{r}$, and that the state update multiplies by $\gamma^{C}$. Then read the
+\code{USE_G_GAMMA} branch of \code{chunk_fwd_kernel_o} in
+\repofile{repos/fla-org__flash-linear-attention/fla/ops/common/chunk_o.py} and explain why it
+computes \code{b_g = b_gamma * (tl.arange(0, BT) + 1)} instead of loading a cumulative sum.
+\end{exercise}
+
+\begin{exercise}[The WY representation by hand]\label{exe:c03-wy}
+Take a chunk of two tokens with unit keys $\vk_1,\vk_2$ and strengths $\beta_1,\beta_2$.
+(a) Write down $\bm{N}$, $(\mI+\bm{N})^{-1}$, $\mW$ and $\mU$ explicitly.
+(b) Verify by direct multiplication that
+$(\mI-\beta_1\vk_1\vk_1\T)(\mI-\beta_2\vk_2\vk_2\T)=\mI-\vw_1\vk_1\T-\vw_2\vk_2\T$.
+(c) Show that if the keys of a chunk are orthonormal then $\bm{N}=\bm0$ and the delta rule
+reduces, inside the chunk, to linear attention with values $\beta_r\vv_r$ corrected only by the
+incoming state. What does \cref{eq:c03-delta-parallel} become?
+\end{exercise}
+
+\begin{exercise}[Stability of delta-rule memories]\label{exe:c03-stability}
+(a) Prove that if $\norm{\vk_t}=1$ and $\beta_t\in[0,2]$ for all $t$, the delta rule satisfies
+$\norm{\mS_t}_2\le\norm{\mS_0}_2+\sum_{s\le t}\beta_s\norm{\vv_s}$.
+(b) Show that the same bound holds for the gated delta rule \cref{eq:c03-gdn} with
+$\alpha_t\in(0,1]$, and improve it to a bound independent of $t$ when $\alpha_t\le\bar\alpha<1$
+and $\norm{\vv_t}\le V$.
+(c) Construct a two-dimensional example with $\norm{\vk_t}=2$, $\beta_t=1$ in which
+$\norm{\mS_t}$ grows geometrically.
+\end{exercise}
+
+\begin{exercise}[Discretization]\label{exe:c03-zoh}
+For a diagonal $\mA=\diag(\va)$ with $a_n<0$:
+(a) derive the ZOH formulas $\bar A_n=e^{\Delta a_n}$, $\bar b_n=(e^{\Delta a_n}-1)b_n/a_n$ from
+\cref{eq:c03-zoh};
+(b) show that $\bar b_n=\Delta b_n\,(1+\tfrac12\Delta a_n+\bigO(\Delta^2))$, so Mamba's choice
+$\bar\vb=\Delta\vb$ agrees with ZOH to first order;
+(c) compute the relative difference between $\Delta b_n$ and the ZOH $\bar b_n$ for
+$\Delta a_n=-0.1$ and $\Delta a_n=-2$, and discuss in which regime the approximation matters.
+\end{exercise}
+
+\begin{exercise}[A work-efficient scan]\label{exe:c03-blelloch}
+Implement Blelloch's up-sweep/down-sweep scan for the operator $\bullet$ of
+\cref{eq:c03-scan-op} and check it against \cref{lst:c03-scan} for diagonal and for delta-rule
+transitions. Count the applications of $\bullet$ and the cost of each for (i) scalar, (ii)
+diagonal and (iii) dense transitions, and compare with the chunkwise algorithms of this chapter.
+\end{exercise}
+
+\begin{exercise}[Chunkwise GLA, in code]\label{exe:c03-gla-code}
+Extend \cref{lst:c03-gated} to per-channel gates (\cref{eq:c03-gla}) using sub-chunks of size
+$C'$ and a reference point per query sub-chunk, as in \cref{lst:c03-fla-gla}. Verify it against
+a recurrent implementation in float64. Then run both your version and a version that factors the
+decay as $(\vq_r\had e^{\bm\lambda_r})\T(\vk_j\had e^{-\bm\lambda_j})$ without a reference point,
+in float32, with gates drawn from $(0.3,0.7)$, and report the largest chunk size $C$ for which the
+second version still produces finite outputs.
+\end{exercise}
+
+% restore the book-class default for the following chapters
+\flushbottom

@@ -1,3 +1,1779 @@
 \chapter{Multi-Timescale Memory and Stable Parametric Updates}\label{ch:multiscale}
 
-(Chapter in preparation.)
+\Cref{ch:ttt} introduced memories whose contents are \emph{parameters} written by gradient
+steps while the model reads: the Titans memory, the fast weights of TTT-E2E, the in-place
+down-projection of In-Place TTT. Once parameters become writable, two questions that implicit
+memory never had to answer move to the centre of the design. The first is \emph{when}: how often
+should each group of parameters be written? A Transformer has only two answers. Its KV cache is
+rewritten at every token, and its weights are rewritten only during training, after which they
+are frozen. Everything in between is unexplored. The second question is \emph{how}: a write into
+a weight matrix that already stores useful knowledge can destroy that knowledge. This is the old
+problem of catastrophic forgetting, now inside the model's memory. The survey of
+\citet{zhoubian2026memory} treats the first question in its \S IV-D (``the temporal dynamics of
+parameter evolution constitute an equally critical dimension'' of memory) and points, in
+\S IV-E(f), to geometric constraints on the update rule as one answer to the second.
+
+This chapter covers three 2025--2026 systems that answer these questions. \emph{Nested Learning}
+and its architecture \emph{HOPE} \citep{behrouz2025nested} view a model as a stack of
+optimization problems that run at different frequencies, and add a \emph{Continuum Memory
+System} of MLP blocks updated every $C^{(1)} < C^{(2)} < \dots$ tokens. \emph{OLieRA}
+\citep{cao2025olora} writes task-specific low-rank updates multiplicatively, inside a Lie group,
+and keeps the updates of different tasks orthogonal. \emph{Muon-OGD} \citep{lu2026muonogd}
+computes each update as the steepest-descent step under the spectral norm (the geometry of the
+Muon optimizer) subject to linear constraints that forbid moving along directions that earlier
+tasks rely on. \Cref{sec:c11-background} builds the background from scratch: forgetting, fast and
+slow weights, optimizers as memories, continual learning, LoRA, Lie groups, and the Muon
+optimizer with its Newton--Schulz iteration. One section per system follows
+(\cref{sec:c11-nested,sec:c11-olieRA,sec:c11-muonogd}); \cref{sec:c11-hybrid} places all of them
+in the survey's picture of multi-timescale hybrid memory, and \cref{sec:c11-comparison} compares
+them.
+
+A word on evidence. None of the three systems has an official code release that cites its
+paper. Nested Learning has only an unofficial reproduction; OLieRA has no public code; Muon-OGD
+has a repository on the first author's account whose README calls the method ``OSD'' and does
+not cite the paper. Throughout the chapter we therefore keep three things apart: what the papers
+state (from the survey, the abstracts, and a copy of the Nested Learning paper that ships with
+the reproduction), what the mirrored code does, and our own formalizations, which we mark as
+such.
+
+% ===========================================================================
+\section{Background: stability, plasticity and timescales}\label{sec:c11-background}
+% ===========================================================================
+
+\subsection{Catastrophic forgetting and the stability--plasticity dilemma}\label{sec:c11-forgetting}
+
+Let a model with parameters $\vtheta$ meet tasks $1, 2, \dots, N$ one after another, each with
+its own loss $\loss_n(\vtheta)$. After training on task $n$ we hold parameters $\vtheta_n$. The
+\emph{forgetting} of an earlier task $j<n$ is how much its loss has risen since it was learned,
+\begin{equation}
+  F_{j,n} = \loss_j(\vtheta_n) - \loss_j(\vtheta_j).
+  \label{eq:c11-forgetting}
+\end{equation}
+Neural networks trained by plain sequential gradient descent show large $F_{j,n}$, a
+phenomenon known as catastrophic forgetting or catastrophic interference
+\citep{c11-mccloskey1989catastrophic,c11-french1999catastrophic}. A second-order Taylor expansion
+shows where it comes from. A step $\bm{\Delta}$ taken for the new task changes an old loss by
+\begin{equation}
+  \loss_j(\vtheta + \bm{\Delta}) - \loss_j(\vtheta)
+  \approx \nabla\loss_j(\vtheta)\T\bm{\Delta} + \tfrac12\,\bm{\Delta}\T\mH_j\,\bm{\Delta},
+  \label{eq:c11-taylor}
+\end{equation}
+where $\mH_j$ is the Hessian of $\loss_j$. \emph{Plasticity} asks that the step reduce the new
+loss, $\nabla\loss_n\T\bm{\Delta} < 0$. \emph{Stability} asks that both terms of
+\cref{eq:c11-taylor} stay small for every $j<n$. Nothing forces the gradient of the new task to
+respect the old tasks, so a step that is good for $\loss_n$ is usually bad for some $\loss_j$.
+The \emph{stability--plasticity dilemma} names the trade-off: frequent, large updates adapt fast
+but overwrite; rare, small updates preserve but adapt slowly. The survey puts it in exactly these
+terms for explicit memory: ``frequent updates increase adaptability but risk overfitting to
+transient signals, whereas slower updates preserve stability at the cost of responsiveness''
+(\S IV-D(d)). Its remedy has three ingredients: regulate the \emph{magnitude}, the
+\emph{frequency} and the \emph{scope} of updates. This chapter is organized around the last two
+(frequency in \cref{sec:c11-nested}, scope and geometry in \cref{sec:c11-olieRA,sec:c11-muonogd}).
+
+\begin{example}[Forgetting in two dimensions]\label{ex:c11-forgetting}
+Take a linear model $\hat y = \vw\T\vx$ with $\vw \in \R^2$ and two one-example tasks,
+\[
+  \loss_A(\vw) = \tfrac12(\vw\T\va - 1)^2, \quad \va = \tfrac{1}{\sqrt2}(1,1)\T,
+  \qquad
+  \loss_B(\vw) = \tfrac12(\vw\T\vb - 1)^2, \quad \vb = (1,0)\T.
+\]
+Learn A first and stop at the minimum-norm solution $\vw_A = \va$, so $\vw_A\T\va = 1$. Now run
+gradient descent on B. Its gradient $(\vw\T\vb - 1)\vb$ always points along $\vb$, so only $w_1$
+moves, and descent converges to $\vw = (1, 1/\sqrt2)\T$. Task B is solved, but
+$\vw\T\va = (1 + 1/\sqrt2)/\sqrt2 \approx 1.207$, so $\loss_A$ rose from $0$ to
+$\tfrac12(0.207)^2 \approx 0.021$. Suppose instead that we remove from every B-gradient its
+component along $\va$, that is, we move only along
+$\vb - (\vb\T\va)\va = (\tfrac12, -\tfrac12)\T$. Along this direction $\vw\T\va$ never changes.
+Moving from $\vw_A$ by $s(\tfrac12,-\tfrac12)\T$ gives $\vw\T\vb = 1/\sqrt2 + s/2$, which
+equals $1$ at $s = 2-\sqrt2 \approx 0.586$. The result $\vw \approx (1, 0.414)\T$ solves both
+tasks exactly. This is orthogonal gradient projection, the idea behind
+\cref{sec:c11-cl,sec:c11-muonogd}.
+\end{example}
+
+\subsection{Fast weights and slow weights}\label{sec:c11-fastslow}
+
+Neural networks have long used parameters that change at different speeds.
+\citet{schmidhuber1992fastweights} proposed a \emph{slow} network, trained by gradient descent,
+that writes the weights of a second, \emph{fast} network while a sequence is processed; the fast
+weights act as a short-term memory. \citet{ba2016fastweights} revived the idea for recurrent
+networks: next to the slow recurrent weights they keep a fast matrix that decays and receives
+Hebbian outer-product writes of the hidden state,
+\begin{equation}
+  \mA_t = \lambda\,\mA_{t-1} + \eta\,\vh_t\vh_t\T, \qquad 0<\lambda<1,
+  \label{eq:c11-ba}
+\end{equation}
+and they read it as $\mA_t\vh$. With keys and values in place of $\vh_t$ this is linear attention
+with a constant decay (\cref{ch:linear}); \citet{c02-schlag2021linear} made the equivalence between
+linear Transformers and fast weight programmers explicit. The general pattern is a decomposition
+$\mW_{\text{eff}}(t) = \mW_{\text{slow}} + \mW_{\text{fast}}(t)$, where the slow part changes
+across training sequences and the fast part changes within one.
+
+How long does a fast weight remember? Unroll \cref{eq:c11-ba}:
+$\mA_t = \eta\sum_{s\le t}\lambda^{t-s}\vh_s\vh_s\T$. A write made $\tau$ steps ago is scaled by
+$\lambda^\tau$. For an exponential moving average $\vm_t = \beta\vm_{t-1} + (1-\beta)\vg_t$ the
+weights $(1-\beta)\beta^\tau$ sum to one, and the average age of what is stored is
+\begin{equation}
+  \bar\tau = \sum_{\tau\ge0}\tau(1-\beta)\beta^\tau
+  = (1-\beta)\,\beta\,\frac{d}{d\beta}\sum_{\tau\ge0}\beta^\tau
+  = (1-\beta)\frac{\beta}{(1-\beta)^2} = \frac{\beta}{1-\beta}.
+  \label{eq:c11-horizon}
+\end{equation}
+So $1/(1-\beta)$ is a natural \emph{timescale}: $\beta = 0.9$ remembers about $10$ steps,
+$\beta = 0.99$ about $100$, $\beta = 0.999$ about $1000$. A second way to set a timescale is to
+update a parameter only every $C$ steps, which gives it the \emph{update frequency}
+$f = 1/C$. A parameter that is written every $C$ tokens with decay $\beta$ per write remembers on
+the order of $C/(1-\beta)$ tokens. Both knobs appear in the systems below.
+
+\subsection{Optimizers are associative memories}\label{sec:c11-optmem}
+
+Nested Learning starts from a reinterpretation of ordinary training, which we now derive. Recall
+that an associative memory stores key--value pairs so that a key retrieves its value
+(\cref{ch:taxonomy}).
+
+\paragraph{Gradient descent writes key--value pairs.} One gradient step is the solution of a
+small optimization problem: move along the gradient but stay close to the current weights,
+\begin{equation}
+  \mW_{t+1} = \argmin_{\mW}\; \inner{\nabla\loss(\mW_t)}{\mW} + \frac{1}{2\eta}\norm{\mW - \mW_t}_F^2 .
+  \label{eq:c11-gd-prox}
+\end{equation}
+Setting the gradient of the objective to zero gives
+$\nabla\loss(\mW_t) + (\mW - \mW_t)/\eta = \bm{0}$, i.e.\ $\mW_{t+1} = \mW_t - \eta\nabla\loss(\mW_t)$.
+For a linear layer $\vy = \mW\vx$ the chain rule gives $\nabla_{\mW}\loss = \vu\vx\T$ with
+$\vu = \partial\loss/\partial\vy$, so
+\begin{equation}
+  \mW_{t+1} = \mW_t - \eta\,\vu_t\vx_t\T .
+  \label{eq:c11-gd-write}
+\end{equation}
+This is an outer-product write, the same form as a linear-attention write $\mS_t = \mS_{t-1} +
+\vv_t\vk_t\T$, with the input $\vx_t$ as the key and the scaled error $-\eta\vu_t$ as the value.
+Training therefore stores, in $\mW$, a map from inputs to the error signals they caused.
+\citet{behrouz2025nested} call $\vu_t$ the \emph{local surprise signal}: it measures how far the
+layer's output was from what the objective wanted.
+
+\paragraph{Momentum is a memory of past gradients.} Heavy-ball momentum keeps
+$\vm_t = \beta\vm_{t-1} + \vg_t$ and steps $\mW_t = \mW_{t-1} - \eta\vm_t$. Unrolling,
+$\vm_t = \sum_{s\le t}\beta^{t-s}\vg_s$: the momentum buffer is a decaying sum of all past
+gradients, a fast weight in the sense of \cref{eq:c11-ba} whose ``key'' is constant. It is also
+one gradient step (rate $1$) on its own small objective,
+\begin{equation}
+  \ell_t(\vm) = -\inner{\vm}{\vg_t} + \frac{1-\beta}{2}\norm{\vm}^2
+  \quad\Longrightarrow\quad
+  \vm_{t-1} - \nabla\ell_t(\vm_{t-1}) = \beta\vm_{t-1} + \vg_t = \vm_t .
+  \label{eq:c11-momentum-obj}
+\end{equation}
+The first term rewards alignment with the newest gradient; the second makes the memory forget at
+rate $1-\beta$. Training with momentum is thus a \emph{two-level} system: an inner memory
+($\vm$) written from the gradient stream, and an outer memory ($\mW$) written from the inner
+memory's output. Adam \citep{c01-kingma2015adam} adds a third memory, the moving average of
+squared gradients, with its own timescale: with the common defaults $\beta_1 = 0.9$ and
+$\beta_2 = 0.999$ the two moments remember roughly $10$ and $1000$ steps
+(\cref{eq:c11-horizon}). An ordinary optimizer is already a multi-timescale memory.
+
+\begin{keyidea}
+Every stateful component of a learning system---attention's KV cache, a recurrent state, the
+momentum buffer, the weights---is a memory that compresses some stream (tokens, gradients,
+batches) by its own update rule. Two numbers characterize it: how often it is written (its
+frequency) and how fast it forgets (its decay). Nested Learning makes these numbers explicit
+design choices.
+\end{keyidea}
+
+\subsection{Continual learning: regularize, replay, project}\label{sec:c11-cl}
+
+The continual-learning literature offers three families of defences against forgetting
+(\cref{ch:taxonomy} discusses why they matter for writable memory).
+
+\paragraph{Regularization.} Keep the parameters near the old solution, more strongly along
+directions the old task cares about. Elastic weight consolidation \citep{c02-kirkpatrick2017ewc}
+expands $\loss_A$ to second order around its optimum $\vtheta_A^*$, where the gradient vanishes,
+so \cref{eq:c11-taylor} leaves only $\tfrac12(\vtheta-\vtheta_A^*)\T\mH_A(\vtheta-\vtheta_A^*)$.
+Replacing the Hessian by the diagonal of the Fisher information $F_i$ gives the penalty
+\begin{equation}
+  \loss(\vtheta) = \loss_B(\vtheta) + \frac{\lambda}{2}\sum_i F_i\,(\theta_i - \theta^*_{A,i})^2 .
+  \label{eq:c11-ewc}
+\end{equation}
+
+\paragraph{Replay.} Store a few old examples and keep training on them. Gradient episodic memory
+\citep{c02-lopezpaz2017gem} uses the stored examples differently: it computes their gradient
+$\vg_{\text{old}}$ and, when the new gradient would increase the old loss
+($\inner{\vg}{\vg_{\text{old}}} < 0$), projects $\vg$ to the closest vector that does not.
+
+\paragraph{Projection.} Orthogonal gradient descent (OGD) \citep{c11-farajtabar2020ogd} removes
+the need to store examples during the new task. After each task it stores a set of directions in
+parameter space that the old task is sensitive to (gradients of the model's outputs on old
+examples), orthonormalized by Gram--Schmidt into the columns of $\mQ \in \R^{p\times k}$. On the
+new task it updates with the projected gradient
+\begin{equation}
+  \tilde\vg = (\mI - \mQ\mQ\T)\,\vg .
+  \label{eq:c11-ogd}
+\end{equation}
+Two facts make this work. First, $\mQ\T\tilde\vg = \mQ\T\vg - (\mQ\T\mQ)\mQ\T\vg = \bm{0}$, so
+for every stored direction $\vq$, a step $-\eta\tilde\vg$ changes the old quantity only at
+second order: the first term of \cref{eq:c11-taylor} vanishes when $\nabla\loss_j \in
+\operatorname{span}(\mQ)$. Second, $\tilde\vg$ is still a descent direction for the new task:
+$\mP = \mI - \mQ\mQ\T$ is symmetric and idempotent ($\mP^2 = \mP$), so
+$\vg\T\tilde\vg = \vg\T\mP\vg = \vg\T\mP\T\mP\vg = \norm{\tilde\vg}^2 \ge 0$. \Cref{ex:c11-forgetting}
+was OGD with a single stored direction.
+
+For a weight matrix a layer-wise variant is often more natural. Gradient projection memory (GPM)
+\citep{c11-saha2021gpm} stores, for each linear layer $\vy = \mW\vx$, an orthonormal basis
+$\mV \in \R^{n\times k}$ of the \emph{inputs} the layer saw on old tasks, and projects every
+weight gradient on the input side, $\mG \mapsto \mG(\mI - \mV\mV\T)$. Then for any old input
+$\vx \in \operatorname{span}(\mV)$,
+\begin{equation}
+  (\mW - \eta\mG(\mI - \mV\mV\T))\,\vx = \mW\vx - \eta\mG(\vx - \mV\mV\T\vx) = \mW\vx ,
+  \label{eq:c11-gpm}
+\end{equation}
+exactly, not only to first order. This \emph{one-sided} projection will turn out to be the case in
+which spectral-norm steepest descent with constraints has a closed form
+(\cref{prop:c11-onesided}).
+
+\subsection{Low-rank adaptation}\label{sec:c11-lora}
+
+Low-rank adaptation (LoRA) \citep{c11-hu2022lora} fine-tunes a pretrained weight
+$\mW_0 \in \R^{m\times n}$ by learning only a low-rank correction,
+\begin{equation}
+  \mW = \mW_0 + \mB\mA, \qquad \mB \in \R^{m\times r},\ \mA \in \R^{r\times n},\ r \ll \min(m,n),
+  \label{eq:c11-lora}
+\end{equation}
+with $\mB$ initialized to zero so that training starts at $\mW_0$. The trainable parameter count
+drops from $mn$ to $r(m+n)$: for $m = n = 4096$ and $r = 16$ that is $131{,}072$ instead of
+$16{,}777{,}216$, about $0.8\%$. Two properties matter here. During training the correction can
+be applied as $\mB(\mA\vx)$ in $\bigO((m+n)r)$ time per token without ever forming $\mB\mA$; after
+training it can be merged into $\mW_0$ at no inference cost.
+
+O-LoRA \citep{c11-wang2023olora} applies LoRA to continual learning. Each task $t$ gets its own
+adapter $(\mB_t, \mA_t)$; adapters of earlier tasks are frozen, and the new adapter is pushed
+into a subspace orthogonal to theirs by a penalty on the overlap of their factors. In our
+row-space convention one way to write it is
+\begin{equation}
+  \loss_{\text{orth}} = \sum_{s<t}\norm{\mA_s\mA_t\T}_F^2 ,
+  \label{eq:c11-olora}
+\end{equation}
+which vanishes exactly when the row spaces of $\mA_s$ and $\mA_t$ are orthogonal. Then
+$\mB_t\mA_t\vx = \bm{0}$ for every $\vx$ in the row space of $\mA_s$: the new adapter does not
+act on the input directions the old adapter used (the paper states the loss with its own factor
+naming; see it for details). O-LoRA needs neither replayed data nor a task identifier at
+inference, two properties OLieRA inherits (\cref{sec:c11-olieRA}).
+
+\subsection{Lie groups, the exponential map and the Cayley transform}\label{sec:c11-lie}
+
+OLieRA's central claim is that updates should be \emph{multiplicative} and live in a Lie group. We
+need only a teaching-level view of these objects.
+
+\paragraph{Groups of matrices.} A group is a set with an associative product, an identity and
+inverses. The invertible $n\times n$ matrices form the general linear group $\mathrm{GL}(n)$; the
+orthogonal matrices $\mathrm{O}(n) = \{\mQ : \mQ\T\mQ = \mI\}$ form a subgroup, and those with
+determinant $1$ form the rotation group $\mathrm{SO}(n)$. These are \emph{Lie groups}: besides
+being groups they are smooth surfaces (manifolds) inside the space of matrices, so one can move
+along them continuously.
+
+\paragraph{The Lie algebra.} The Lie algebra of a group is its tangent space at the identity: the
+set of velocities $\dot\mQ(0)$ of smooth curves $\mQ(t)$ in the group with $\mQ(0) = \mI$. For
+$\mathrm{O}(n)$, differentiate $\mQ(t)\T\mQ(t) = \mI$ at $t=0$:
+$\dot\mQ(0)\T + \dot\mQ(0) = \bm{0}$. The Lie algebra of $\mathrm{O}(n)$ (and of $\mathrm{SO}(n)$)
+is therefore the space of skew-symmetric matrices, $\{\mA : \mA\T = -\mA\}$, a vector space of
+dimension $n(n-1)/2$. The point of the Lie algebra is that it is \emph{flat}: one can add its
+elements and run unconstrained gradient descent on them.
+
+\paragraph{The exponential map.} The matrix exponential
+$\exp(\mA) = \sum_{k\ge0}\mA^k/k!$ carries the algebra into the group. For a skew-symmetric
+$\mA$, $\exp(\mA)\T = \exp(\mA\T) = \exp(-\mA)$, and because $\mA$ and $-\mA$ commute,
+$\exp(-\mA)\exp(\mA) = \exp(\bm{0}) = \mI$. So $\exp(\mA)$ is orthogonal, and
+$\det\exp(\mA) = e^{\tr\mA} = 1$ places it in $\mathrm{SO}(n)$.
+
+\begin{example}[Rotations in the plane]\label{ex:c11-rotation}
+Let $\mA = \begin{psmallmatrix}0 & -\theta\\ \theta & 0\end{psmallmatrix}$. Then
+$\mA^2 = -\theta^2\mI$, so the even powers are $(-1)^j\theta^{2j}\mI$ and the odd powers are
+$(-1)^j\theta^{2j}\mA$. Summing the series,
+$\exp(\mA) = \cos\theta\,\mI + \tfrac{\sin\theta}{\theta}\mA
+= \begin{psmallmatrix}\cos\theta & -\sin\theta\\ \sin\theta & \cos\theta\end{psmallmatrix}$, the
+rotation by $\theta$. One unconstrained number in the algebra gives exactly one rotation.
+\end{example}
+
+\paragraph{The Cayley transform.} Computing a matrix exponential is expensive. The Cayley
+transform
+\begin{equation}
+  \operatorname{cay}(\mA) = (\mI - \tfrac12\mA)^{-1}(\mI + \tfrac12\mA)
+  \label{eq:c11-cayley}
+\end{equation}
+is a cheaper map from skew-symmetric matrices to $\mathrm{SO}(n)$, needing one linear solve. It is
+well defined because a skew-symmetric matrix has purely imaginary eigenvalues, so
+$\mI - \tfrac12\mA$ is invertible. It is orthogonal: $\mI \pm \tfrac12\mA$ commute, and
+$(\mI + \tfrac12\mA)\T = \mI - \tfrac12\mA$, so
+$\operatorname{cay}(\mA)\T\operatorname{cay}(\mA) = (\mI - \tfrac12\mA)(\mI + \tfrac12\mA)^{-1}
+(\mI - \tfrac12\mA)^{-1}(\mI + \tfrac12\mA) = \mI$. Expanding
+$(\mI - \tfrac12\mA)^{-1} = \mI + \tfrac12\mA + \tfrac14\mA^2 + \tfrac18\mA^3 + \dots$ and multiplying
+by $\mI + \tfrac12\mA$ gives $\mI + \mA + \tfrac12\mA^2 + \tfrac14\mA^3 + \dots$, which agrees with
+$\exp(\mA) = \mI + \mA + \tfrac12\mA^2 + \tfrac16\mA^3 + \dots$ up to second order; the first
+difference is $\tfrac{1}{12}\mA^3$. (Our NumPy check confirms orthogonality to $10^{-15}$ and that
+the gap to $\exp$ shrinks by about $8\times$ each time $\mA$ is halved, as a third-order error
+should.)
+
+\paragraph{The Hadamard group.} The groups above act by matrix multiplication. A different Lie
+group, and the one that public descriptions of OLieRA build on, uses the element-wise (Hadamard)
+product $\had$. Let
+\begin{equation}
+  \mathcal{G}_{\had} = \{\mW \in \R^{m\times n} : W_{ij} \ne 0 \text{ for all } i,j\}.
+  \label{eq:c11-hadamard-group}
+\end{equation}
+Under $\had$ this set is a group: the identity is the all-ones matrix $\bm{1}$, the inverse of
+$\mW$ is its element-wise reciprocal, and the product is commutative. Curves through $\bm{1}$ can
+have any velocity, so the Lie algebra is all of $\R^{m\times n}$, and the exponential map is the
+element-wise exponential, $[\exp_{\had}(\bm{\Delta})]_{ij} = e^{\Delta_{ij}}$. Because the group is
+commutative, $\exp_{\had}(\bm{\Delta}_1)\had\exp_{\had}(\bm{\Delta}_2) = \exp_{\had}(\bm{\Delta}_1 +
+\bm{\Delta}_2)$: in log-coordinates the group product is plain addition. A multiplicative update
+$\mW' = \mW\had\exp_{\had}(\bm{\Delta})$ adds $\bm{\Delta}$ to $\log\abs{\mW}$ entry by entry and never
+changes the sign of an entry. (The set has one connected piece per sign pattern; the exponential
+map reaches only the positive piece, and multiplying by it keeps $\mW$ in its own piece.)
+
+\Cref{tab:c11-groups} summarizes what a multiplicative update preserves in each group.
+
+\begin{table}[t]
+\centering\small
+\caption{Three Lie groups and what a multiplicative update by a group element preserves.}
+\label{tab:c11-groups}
+\begin{tabularx}{\textwidth}{@{}ll>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+Group & Lie algebra & Exponential map & Update and what it preserves \\
+\midrule
+$\mathrm{GL}(n)$ & all $n\times n$ matrices & matrix exponential & $\mW' = \exp(\mA)\mW$; invertibility \\
+$\mathrm{SO}(n)$ & skew-symmetric matrices & matrix exponential or Cayley & $\mW' = \mQ\mW$; all singular values and norms $\norm{\mW\vx}$ \\
+$(\mathcal{G}_{\had}, \had)$ & all $m\times n$ matrices & element-wise $e^{\Delta_{ij}}$ & $\mW' = \mW\had e^{\bm{\Delta}}$; signs of entries, no entry reaches $0$, relative scale \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Steepest descent under a norm: Muon and Newton--Schulz}\label{sec:c11-muon}
+
+The optimizers of \cref{ch:foundations} (SGD, Adam) treat a weight matrix as a long vector. The
+Muon optimizer \citep{c01-jordan2024muon} treats it as a linear map. The cleanest way to see the
+difference is through \emph{steepest descent under a norm}: among all steps of size at most
+$\eta$ in some norm, take the one that decreases the linearized loss the most,
+\begin{equation}
+  \bm{\Delta}^\star = \argmin_{\norm{\bm{\Delta}} \le \eta}\; \inner{\mG}{\bm{\Delta}},
+  \qquad \inner{\mG}{\bm{\Delta}} = \tr(\mG\T\bm{\Delta}),
+  \label{eq:c11-steepest}
+\end{equation}
+where $\mG \in \R^{m\times n}$ is the gradient (or a momentum of gradients). The answer depends on
+the norm.
+\begin{itemize}
+  \item \textbf{Frobenius norm.} By Cauchy--Schwarz, $\inner{\mG}{\bm{\Delta}} \ge
+  -\norm{\mG}_F\norm{\bm{\Delta}}_F$, with equality at $\bm{\Delta}^\star = -\eta\,\mG/\norm{\mG}_F$:
+  normalized gradient descent.
+  \item \textbf{Element-wise max norm.} Each entry can move by $\eta$ independently, so
+  $\bm{\Delta}^\star = -\eta\operatorname{sign}(\mG)$: sign descent, the limit of Adam with no
+  averaging.
+  \item \textbf{Spectral norm} $\norm{\bm{\Delta}}_2 = \sigma_{\max}(\bm{\Delta})$, the largest factor
+  by which $\bm{\Delta}$ can stretch a vector. Write the thin SVD $\mG = \mU\mSigma\mV\T =
+  \sum_i\sigma_i\vu_i\vv_i\T$ over its $r$ nonzero singular values. (In this section $\mU,\mV$
+  denote singular vectors, not the stacked values of attention.) Then
+  \begin{equation}
+    \inner{\mG}{\bm{\Delta}} = \sum_i\sigma_i\,\vu_i\T\bm{\Delta}\vv_i \ge -\sum_i\sigma_i\norm{\bm{\Delta}}_2
+    = -\eta\norm{\mG}_* ,
+    \label{eq:c11-nuclear}
+  \end{equation}
+  because $\abs{\vu\T\bm{\Delta}\vv} \le \norm{\bm{\Delta}}_2$ for unit vectors. Here
+  $\norm{\mG}_* = \sum_i\sigma_i$ is the nuclear norm, the dual of the spectral norm. Equality holds
+  for $\bm{\Delta}^\star = -\eta\,\mU\mV\T$, since then $\vu_i\T\mU\mV\T\vv_i = 1$ for every $i$.
+\end{itemize}
+The matrix $\mU\mV\T$ (built from the nonzero singular values only) is the \emph{matrix sign}
+$\operatorname{msign}(\mG)$, also called the orthogonal polar factor, because
+$\mG = (\mU\mV\T)(\mV\mSigma\mV\T)$ splits $\mG$ into a partial isometry times a positive
+semidefinite matrix. Replacing $\mG$ by $\operatorname{msign}(\mG)$ sets every singular value to
+$1$: the update moves every input direction that the gradient touches by the same amount,
+instead of letting the few dominant directions of $\mG$ take almost all of the step.
+
+\paragraph{Muon.} For each 2-D weight matrix, Muon keeps a momentum
+$\mM_t = \mu\mM_{t-1} + \mG_t$ and steps $\mW_t = \mW_{t-1} - \eta\,s\,\operatorname{msign}(\mM_t)$,
+with a scale $s$ that depends on the shape. Embeddings, normalization gains and biases are left to
+AdamW. Computing an SVD at every step would be too slow, so Muon approximates
+$\operatorname{msign}$ with a few Newton--Schulz iterations \citep{c01-higham2008functions}.
+
+\paragraph{Newton--Schulz.} Start from $\mX_0 = \mG/\norm{\mG}_F$, whose singular values lie in
+$(0,1]$, and iterate
+\begin{equation}
+  \mX_{k+1} = \tfrac12\mX_k(3\mI - \mX_k\T\mX_k).
+  \label{eq:c11-ns3}
+\end{equation}
+If $\mX_k = \mU f_k(\mSigma)\mV\T$ then $\mX_k\T\mX_k = \mV f_k(\mSigma)^2\mV\T$ and
+$\mX_{k+1} = \mU\,\tfrac12 f_k(\mSigma)(3 - f_k(\mSigma)^2)\,\mV\T$. The singular vectors never
+change, and each singular value follows the scalar map
+$\varphi(\sigma) = \tfrac32\sigma - \tfrac12\sigma^3$. Its non-negative fixed points are $0$ and $1$. Near $1$,
+$\varphi(1+\epsilon) = 1 - \tfrac32\epsilon^2 - \tfrac12\epsilon^3$: the error is squared at each
+step (quadratic convergence). Near $0$, $\varphi(\sigma) \approx 1.5\,\sigma$: small singular
+values grow geometrically until they reach the fast regime. Any $\sigma \in (0, \sqrt3)$
+converges to $1$, and zero singular values stay at zero, which is why the iteration computes the
+canonical $\mU\mV\T$ over the nonzero singular values. In our NumPy check on a $64\times 32$
+Gaussian matrix, the distance to the exact polar factor is $0.23$ after $5$ iterations,
+$1.4\times10^{-6}$ after $10$, and at machine precision after $20$. Each iteration costs two
+matrix products, $\bigO(mn\min(m,n))$ operations, and runs well in low precision.
+
+Practical Muon uses a quintic iteration $\mX \leftarrow a\mX + b(\mX\mX\T)\mX + c(\mX\mX\T)^2\mX$
+whose coefficients are tuned to make small singular values grow as fast as possible
+(\cref{lst:c11-muon-ns5}). It deliberately does not converge to exactly $1$: on the same test
+matrix, five quintic steps leave the singular values in $[0.68, 1.11]$. According to the docstring
+of the excerpted function, this ``turns out not to hurt model performance at all'' relative to the
+exact $\mU\mV\T$.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak awslabs\_\_hybrid-model-factory/\allowbreak training/\allowbreak src/\allowbreak hmf/\allowbreak third\_party/\allowbreak muon/\allowbreak muon.py} (the widely used quintic Newton--Schulz of Muon; docstring elided)},label={lst:c11-muon-ns5}]
+def zeropower_via_newtonschulz5(G: "torch.Tensor", steps: int) -> "torch.Tensor":
+    # ...
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+\end{lstlisting}
+
+\begin{algorithm}[t]
+\caption{One Muon step for a weight matrix $\mW \in \R^{m\times n}$.}\label{alg:c11-muon}
+\begin{algorithmic}[1]
+\Require weight $\mW$, gradient $\mG$, momentum buffer $\mM$, rate $\eta$, momentum $\mu$, NS steps $K$
+\State $\mM \gets \mu\mM + \mG$ \Comment{memory of past gradients, timescale $1/(1-\mu)$}
+\State $\mX \gets \mM/\norm{\mM}_F$ \Comment{singular values now in $(0,1]$}
+\For{$k = 1,\dots,K$}
+  \State $\mX \gets \tfrac12\mX(3\mI - \mX\T\mX)$ \Comment{or the quintic variant of \cref{lst:c11-muon-ns5}}
+\EndFor
+\State $\mW \gets \mW - \eta\, s(m,n)\,\mX$ \Comment{$\mX \approx \operatorname{msign}(\mM)$}
+\Ensure updated $\mW$, $\mM$. Cost $\bigO(K\,mn\min(m,n))$; extra state: $\mM$ ($mn$ numbers).
+\end{algorithmic}
+\end{algorithm}
+
+% ===========================================================================
+\section{Nested Learning and HOPE}\label{sec:c11-nested}
+% ===========================================================================
+
+\begin{pitfall}[title={Unofficial code}]
+Google has not released code for Nested Learning \citep{behrouz2025nested}. The code we walk
+through, \repo{kmccleary3301__nested_learning}, is an \emph{unofficial} reproduction. Its README
+describes it as a ``mechanism-level reproduction'' and states that it does not aim at
+paper-scale results. It pins its equation references to a full-length copy of the paper
+(\code{google_papers/Nested_Learning_Full_Paper/...}) that is \emph{not} in our mirror; the mirror
+contains only the shorter NeurIPS camera-ready text at
+\repofile{repos/kmccleary3301__nested_learning/google_papers/Nested_Learning/Nested_Learning.md}.
+Where we describe the self-modifying Titans module in detail, we describe the reproduction's
+code, which cites the full paper's Eqs.~83--97 that we could not check.
+\end{pitfall}
+
+\subsection{Motivation}\label{sec:c11-nl-motivation}
+
+The paper motivates Nested Learning with an analogy to anterograde amnesia, a condition in which
+a person keeps old memories but cannot form new long-term ones. A deployed Transformer is in the
+same state: what it reads stays in the attention window (short-term memory) and never reaches
+the MLP weights (long-term memory), which were last written at the end of pre-training. The
+Titans memory of \cref{ch:ttt} adds one in-between level, a memory written at test time. Nested
+Learning generalizes this in three steps: (i) describe every component of a model and of its
+optimizer as an associative memory with its own \emph{context flow} (the stream it compresses)
+and its own update frequency; (ii) add a whole spectrum of levels between ``every token'' and
+``never'', the \emph{Continuum Memory System} (CMS); (iii) make the sequence model learn its own
+update rule (\emph{self-modifying Titans}). HOPE is self-modifying Titans followed by a CMS. The
+survey summarizes the idea as replacing ``a binary distinction between backbone and memory'' with
+``a spectrum of temporal plasticity'' (\S IV-D(b)).
+
+\begin{taxonomy}
+Following \citet{zhoubian2026memory}: \textbf{representation} explicit (designated parameter
+subsets---CMS blocks and Titans memories---are operated as writable memory);
+\textbf{update dynamics} online (these subsets are written during inference, at several
+frequencies); \textbf{persistence} long-term (Table~I lists Nested Learning as Online, Long-Term,
+``Multi-Timescale Updated Modules''); \textbf{update rule} optimization-based writing (Table~II,
+whose listed risks are drift, instability and objective mismatch).
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c11-nl-formulation}
+
+\paragraph{Levels.} The paper adopts a general definition of associative memory: given keys
+$\mathcal{K}$ and values $\mathcal{V}$, a memory is an operator $\mathcal{M}$ learned by
+$\mathcal{M}^* = \argmin_{\mathcal{M}}\tilde\loss(\mathcal{M}(\mathcal{K});\mathcal{V})$ for some
+inner objective $\tilde\loss$. Keys and values need not be tokens; they can be gradients, chunks,
+or error signals. To order the many memories inside a model it defines:
+
+\begin{definition}[Update frequency and levels \citep{behrouz2025nested}]\label{def:c11-frequency}
+Take one update step on one data point (one token) as the unit of time. The \emph{frequency}
+$f_A$ of a component $A$ is its number of updates per unit of time. $A$ is \emph{faster} than
+$B$, written $A \succ B$, if $f_A > f_B$, or if $f_A = f_B$ and computing $B$'s state at time
+$t$ requires $A$'s state at time $t$. Sorting components by $\succ$ groups them into
+\emph{levels}; components in one level share a frequency, and higher levels are slower.
+\end{definition}
+
+Each component optimizes its own objective over its own context with its own gradient flow; no
+gradient passes between levels inside this decomposition. \Cref{sec:c11-optmem} already gave
+three examples. Plain gradient descent is a one-level memory that maps inputs $\vx_t$ to their
+local surprise $\vu_t$ (\cref{eq:c11-gd-write}). Momentum adds a faster level, the momentum
+buffer (\cref{eq:c11-momentum-obj}): it is written as often as the weights, but computing the
+weights at step $t$ needs the momentum at step $t$, so it ranks as faster. A linear-attention layer trained by gradient descent is
+two levels: the inner memory $\mS_t = \mS_{t-1} + \vv_t\vk_t\T$ is one gradient step (rate $1$) on
+$\tilde\loss(\mS) = -\inner{\mS\vk_t}{\vv_t}$, whose gradient is $-\vv_t\vk_t\T$, and runs once per
+token; the outer projections $\mW_Q, \mW_K, \mW_V$ run once per training batch. At deployment the
+outer level stops: its frequency drops to zero.
+
+\paragraph{Deep optimizers.} Seeing the optimizer as a memory suggests better optimizers in the
+same way that better memories suggest better sequence models. The paper lists several. With a
+value matrix $\mP_i$ instead of a constant, the momentum objective becomes
+$\inner{\vm\,\nabla\loss\T}{\mP_i}$ and gradient descent on it gives preconditioned momentum,
+$\vm_{i+1} = \alpha\vm_i - \eta\mP_i\nabla\loss$. Replacing the dot-product objective by an
+$\ell_2$ regression objective gives a delta-rule momentum. Replacing the linear momentum by an
+MLP gives \emph{deep momentum gradient descent}. Applying a nonlinearity to the momentum's output
+and choosing Newton--Schulz as that nonlinearity recovers Muon (\cref{sec:c11-muon}). The same
+$\ell_2$ idea applied to the weights themselves gives the update HOPE uses inside its memories.
+Ask the layer to map its input $\vx_t$ to a target $\bm{c}_t$ with one unit-rate step on
+$\tfrac12\norm{\mW\vx_t - \bm{c}_t}^2$, whose gradient is $(\mW\vx_t - \bm{c}_t)\vx_t\T$:
+\begin{equation}
+  \mW_{t+1} = \mW_t - (\mW_t\vx_t - \bm{c}_t)\vx_t\T = \mW_t(\mI - \vx_t\vx_t\T) + \bm{c}_t\vx_t\T .
+  \label{eq:c11-dgd}
+\end{equation}
+With $\bm{c}_t = -\eta\vu_t$ this is the paper's variant of gradient descent,
+$\mW_{t+1} = \mW_t(\mI - \vx_t\vx_t\T) - \eta\nabla_{\vy}\loss\,\vx_t\T$. For a unit-norm $\vx_t$ the
+factor $\mI - \vx_t\vx_t\T$ first erases what $\mW$ currently returns for $\vx_t$, then writes the
+new association: it is the delta rule of \cref{ch:delta} applied to weights. With a retention gate
+$\alpha_t$ and a step $\eta_t$ the factor becomes $\alpha_t\mI - \eta_t\vx_t\vx_t\T$, the
+``rank-1 preconditioner'' of the reproduction.
+
+\paragraph{The Continuum Memory System.} A Transformer block has one MLP, written only in
+pre-training. The CMS replaces it by a chain of $k$ MLP blocks, one per frequency,
+\begin{equation}
+  \vy_t = \mathrm{MLP}^{(k)}\bigl(\mathrm{MLP}^{(k-1)}(\cdots\mathrm{MLP}^{(1)}(\vx_t))\bigr),
+  \label{eq:c11-cms-chain}
+\end{equation}
+(normalizations omitted) where block $\ell$ has parameters $\vtheta^{(\ell)}$ and an update period
+(chunk size) $C^{(1)} < C^{(2)} < \dots < C^{(k)}$ tokens, inversely proportional to its frequency.
+Block $\ell$ is written only at the end of each of its chunks, with the sum of the error terms
+of the tokens in that chunk:
+\begin{equation}
+  \vtheta^{(\ell)}_{i+1} = \vtheta^{(\ell)}_{i} -
+  \begin{cases}
+    \displaystyle\sum_{t=i-C^{(\ell)}+1}^{i}\eta_t^{(\ell)}\, f\bigl(\vtheta^{(\ell)}_{i};\vx_t\bigr)
+      & \text{if } i \equiv 0 \pmod{C^{(\ell)}},\\[2mm]
+    \bm{0} & \text{otherwise,}
+  \end{cases}
+  \label{eq:c11-cms-update}
+\end{equation}
+where $f$ is ``the error component of an arbitrary optimizer'', for example the gradient of a
+local loss. (The paper writes the sum from $i-C^{(\ell)}$; we index the $C^{(\ell)}$ tokens of the
+chunk.) A standard Transformer block is the special case $k = 1$ with the block never written
+after training. The paper's reading of \cref{eq:c11-cms-update} is that each block compresses its
+own context, at its own granularity, into its parameters: the slow blocks see the stream only
+through sums over long chunks and therefore hold more abstract, longer-lived knowledge; the fast
+blocks track the recent past.
+
+Two properties of \cref{eq:c11-cms-update} are worth making precise.
+
+\begin{proposition}[Recurrent and chunkwise forms agree]\label{prop:c11-cms-chunk}
+Within one chunk of level $\ell$ the parameters $\vtheta^{(\ell)}$ are constant. Hence (a) every
+token of the chunk is read with the start-of-chunk parameters, and (b) the error terms
+$f(\vtheta^{(\ell)}_i;\vx_t)$ of the chunk can be computed in parallel. For a linear layer
+$\vy = \mW\vx$ with per-token error signals $\bm{\delta}_t$, the accumulated update is a single
+matrix product: $\sum_{t\in\text{chunk}}\bm{\delta}_t\vx_t\T = \bm{\Delta}_{[c]}\T\mX_{[c]}$, where
+$\mX_{[c]}, \bm{\Delta}_{[c]} \in \R^{C\times d}$ stack the inputs and error signals as rows.
+\end{proposition}
+\begin{proof}
+(a) holds because \cref{eq:c11-cms-update} writes only at chunk ends. For (b), each term depends on
+$\vtheta^{(\ell)}_i$, which is fixed, and on token $t$'s own input, so the terms are independent.
+The matrix identity is the definition of the product: entry $(a,b)$ of $\bm{\Delta}_{[c]}\T\mX_{[c]}$
+is $\sum_t\delta_{t,a}x_{t,b}$, which is entry $(a,b)$ of $\sum_t\bm{\delta}_t\vx_t\T$.
+\end{proof}
+
+The chunkwise form is what makes CMS trainable on accelerators. One subtlety: the \emph{inputs}
+of a slow level are the outputs of faster levels, which may be written several times inside the
+slow level's chunk. A parallel implementation must therefore process the sequence in blocks of
+the \emph{smallest} period $C^{(1)}$, so that every level reads consistent parameters; the
+reproduction does exactly this. Our NumPy check runs a three-level CMS with periods $(2, 8, 32)$
+over $64$ tokens both token by token with buffers and in base-chunk blocks with one batched
+gradient per level chunk: the parameters agree to $6\times10^{-17}$ and the outputs to
+$4\times10^{-16}$, and the levels are written $32$, $8$ and $2$ times.
+
+\paragraph{Where the error signal comes from.} \Cref{eq:c11-cms-update} needs an error term for
+every token. The reproduction uses a \emph{teach signal}: the gradient of the language-modelling
+loss with respect to a hidden state. At the top of the network, with tied embeddings
+$\mW_E \in \R^{\abs{\mathcal{V}}\times d}$, logits $\vz_t = \mW_E\vh_t$ and mean cross-entropy over
+$N$ supervised positions, $\partial\loss/\partial\vz_t = (\bm{p}_t - \ve_{y_t})/N$ with
+$\bm{p}_t = \softmax(\vz_t)$ and $\ve_{y_t}$ the one-hot target, so
+\begin{equation}
+  \bm{\delta}_t = \frac{\partial\loss}{\partial\vh_t} = \frac{1}{N}\,\mW_E\T(\bm{p}_t - \ve_{y_t}).
+  \label{eq:c11-teach}
+\end{equation}
+With per-layer teach signals enabled, $\bm{\delta}^{(l)}_t$ is instead the autograd gradient of
+the loss with respect to the output of block $l$. A CMS level then takes one step on the local
+loss $\sum_t\norm{\hat\vy_t - \operatorname{sg}(\hat\vy_t - \bm{\delta}_t)}^2$, where
+$\hat\vy_t$ is the level's output and $\operatorname{sg}$ stops gradients. The loss value is just
+$\sum_t\norm{\bm{\delta}_t}^2$, but its gradient with respect to $\hat\vy_t$ is
+$2(\hat\vy_t - \hat\vy_t + \bm{\delta}_t) = 2\bm{\delta}_t$, so the parameter gradient is
+$2\sum_t\mathbf{J}_t\T\bm{\delta}_t$ with $\mathbf{J}_t$ the Jacobian of the level's output: the
+teach signal, back-propagated through this one block only. (Our finite-difference check agrees
+to $9\times10^{-11}$.) In the reproduction every CMS level of a block receives the \emph{same}
+$\bm{\delta}_t$, the error at the block output. Because each CMS level is residual,
+$\vx + \mathrm{MLP}(\vx)$, the identity path carries an output error unchanged to the levels below,
+so this is the approximation that ignores the MLP part of the higher levels' Jacobians.
+
+\paragraph{HOPE: self-modifying Titans plus CMS.} Recall Titans from \cref{ch:ttt}. Its neural
+memory $\mathcal{M}$ is an MLP written at test time by surprise-driven gradient steps with
+momentum and decay,
+\begin{equation}
+  \mathcal{M}_t = (1-\alpha_t)\mathcal{M}_{t-1} + \mS_t, \qquad
+  \mS_t = \eta_t\mS_{t-1} - \theta_t\nabla\ell(\mathcal{M}_{t-1};\vx_t), \qquad
+  \ell = \norm{\mathcal{M}(\vk_t) - \vv_t}^2 ,
+  \label{eq:c11-titans}
+\end{equation}
+with $\vk_t = \mW_K\vx_t$, $\vv_t = \mW_V\vx_t$ and read-out $\vo_t = \mathcal{M}_t(\vq_t)$
+\citep{behrouz2025titans}. The projections $\mW_K, \mW_V$ and the networks that produce the gates
+are slow parameters: they change only in pre-training. Self-modifying Titans makes them fast too.
+As implemented in the reproduction, it keeps one small memory per quantity,
+$\mathcal{M}_\square$ for $\square \in \{k, v, \eta, \alpha, \text{mem}\}$ (plus $q$ if the query is
+made adaptive), each a two-layer residual MLP
+$\mathcal{M}_\square(\vz) = \vz + \mW^\square_1\,\mathrm{GELU}(\mW^\square_2\vz)$ with hidden
+width $d$ (the scalar-output memories for $\eta$ and $\alpha$ have no residual path). For each
+token, after a causal depthwise convolution of width $4$ over the inputs,
+\begin{equation}
+\begin{gathered}
+  \vk_t = \mathcal{M}_k(\vx_t),\quad
+  \vv_t = \mathcal{M}_v(\vx_t),\quad
+  \eta_t = c\cdot\mathrm{softplus}(\mathcal{M}_\eta(\vx_t)),\quad
+  \alpha_t = \sigmoid(\mathcal{M}_\alpha(\vx_t)),\\
+  \vq_t = \mW_q\vx_t,\qquad
+  \vo_t = \mathcal{M}_{\text{mem}}(\vq_t),
+\end{gathered}
+  \label{eq:c11-selfmod-read}
+\end{equation}
+with a small constant $c$ (\code{eta_scale}, default $10^{-3}$); keys and queries are optionally
+normalized to unit length (\code{qk_l2_norm}), which makes the preconditioner below an exact erase. Every memory is trained in
+context on a target it generates itself, its own transform of the value,
+\begin{equation}
+  \ell_\square(\vtheta_\square) = \norm{\mathcal{M}_\square(\vk_t) - \operatorname{sg}(\mathcal{M}_\square(\vv_t))}^2 ,
+  \label{eq:c11-selfmod-loss}
+\end{equation}
+and is written with the delta-rule step of \cref{eq:c11-dgd} on its input-side matrix and a
+decayed gradient step on its output-side matrix:
+\begin{equation}
+  \mW^\square_2 \leftarrow \mW^\square_2(\alpha_t\mI - \eta_t\vk_t\vk_t\T) - \eta_t\nabla_{\mW_2}\ell_\square,
+  \qquad
+  \mW^\square_1 \leftarrow \alpha_t\mW^\square_1 - \eta_t\nabla_{\mW_1}\ell_\square .
+  \label{eq:c11-selfmod-update}
+\end{equation}
+The memory that produces the output, $\mathcal{M}_{\text{mem}}$, and the memories that produce its
+keys, values and gates are written on two different chunk schedules, $C_m$ and $C_o$; the
+reproduction's self-modifying preset uses $C_o = 8$ and $C_m = 64$ (``other memories update more
+often than $M_{\text{memory}}$''). Within a chunk, all per-token gradients are evaluated at the
+chunk-start state, in parallel, and then applied token by token with the preconditioner---the
+chunkwise trick of \cref{prop:c11-cms-chunk} applied to Titans. A HOPE block is this module
+followed by a CMS (\cref{fig:c11-hope}); a simpler HOPE-Attention block uses softmax attention
+followed by a CMS.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth,
+  box/.style={draw, rounded corners=2pt, minimum height=9mm, align=center, fill=blue!4, text width=21mm}]
+\node (x) {$\vx_t$};
+\node[box, right=5mm of x, text width=24mm] (sm) {self-modifying\\Titans};
+\node[box, right=5mm of sm] (c1) {CMS level 1\\$C^{(1)} = 8$};
+\node[box, right=5mm of c1] (c2) {CMS level 2\\$C^{(2)} = 32$};
+\node[box, right=5mm of c2] (c3) {CMS level 3\\$C^{(3)} = 128$};
+\node[right=5mm of c3] (y) {$\vy_t$};
+\draw[->] (x) -- (sm); \draw[->] (sm) -- (c1); \draw[->] (c1) -- (c2);
+\draw[->] (c2) -- (c3); \draw[->] (c3) -- (y);
+\begin{scope}[yshift=-18mm, xshift=10mm]
+  \draw[->, gray] (0,-1.15) -- (13.1,-1.15) node[right, black] {$t$};
+  \foreach \t in {0,32,64,96,128} \node[below, gray, font=\scriptsize] at ({\t*0.1},-1.15) {\t};
+  \node[anchor=east, font=\scriptsize] at (-0.1,0) {level 1};
+  \node[anchor=east, font=\scriptsize] at (-0.1,-0.4) {level 2};
+  \node[anchor=east, font=\scriptsize] at (-0.1,-0.8) {level 3};
+  \foreach \t in {8,16,...,128} \draw[thick, blue!60!black] ({\t*0.1},-0.12) -- ({\t*0.1},0.12);
+  \foreach \t in {32,64,96,128} \draw[thick, blue!60!black] ({\t*0.1},-0.52) -- ({\t*0.1},-0.28);
+  \draw[thick, blue!60!black] (12.8,-0.92) -- (12.8,-0.68);
+\end{scope}
+\end{tikzpicture}
+\caption{A HOPE block (top) and the write schedule of its three CMS levels over the first
+$128$ tokens (bottom; each tick is one write of that level). Reads happen at every token; level
+$\ell$ is written once per $C^{(\ell)}$ tokens with the sum of its chunk's error terms.}
+\label{fig:c11-hope}
+\end{figure}
+
+\subsection{Algorithms and complexity}\label{sec:c11-nl-alg}
+
+\Cref{alg:c11-cms} gives the CMS forward pass with online writes, in the buffered form the
+reproduction uses; \cref{alg:c11-two-pass} shows how such writes are combined with ordinary
+training.
+
+\begin{algorithm}[t]
+\caption{CMS forward pass with online multi-frequency writes (one sequence).}\label{alg:c11-cms}
+\begin{algorithmic}[1]
+\Require block inputs $\vx_{1:T}$; error signals $\bm{\delta}_{1:T}$; levels $\ell = 1..k$ with
+parameters $\vtheta^{(\ell)}$, periods $C^{(\ell)}$, level optimizers $\mathrm{Opt}^{(\ell)}$
+\State $C_{\min} \gets \min_\ell C^{(\ell)}$; empty buffers $\mathcal{B}^{(\ell)}$ for all $\ell$
+\For{$c = 0, C_{\min}, 2C_{\min}, \dots < T$}
+  \State $\mH \gets \vx_{c+1:c+C_{\min}}$
+  \For{$\ell = 1,\dots,k$} \Comment{read: all levels at their current parameters}
+    \State $\mZ^{(\ell)} \gets \mH$; \quad $\mH \gets \mH + \mathrm{MLP}(\mH;\vtheta^{(\ell)})$
+  \EndFor
+  \State emit $\vy_{c+1:c+C_{\min}} \gets \mH$
+  \For{$\ell = 1,\dots,k$} \Comment{write: only levels whose chunk is complete}
+    \State append $(\mZ^{(\ell)}, \bm{\delta}_{c+1:c+C_{\min}})$ to $\mathcal{B}^{(\ell)}$
+    \While{$\mathcal{B}^{(\ell)}$ holds at least $C^{(\ell)}$ tokens}
+      \State pop the oldest $C^{(\ell)}$ tokens $(\mZ, \bm{\Delta})$
+      \State $\vg \gets \nabla_{\vtheta}\sum_t\inner{\bm{\delta}_t}{\mathrm{MLP}(\vz_t;\vtheta)}\big|_{\vtheta = \vtheta^{(\ell)}}$ \Comment{parallel over the chunk}
+      \State $\vtheta^{(\ell)} \gets \vtheta^{(\ell)} - \eta^{(\ell)}\,\mathrm{Opt}^{(\ell)}(\vg)$
+    \EndWhile
+  \EndFor
+\EndFor
+\Ensure outputs $\vy_{1:T}$; leftover buffer contents are carried to the next call or flushed at the end
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{One outer training step with stop-gradient online writes (the reproduction's default \texttt{two\_pass\_stopgrad\_updates}).}\label{alg:c11-two-pass}
+\begin{algorithmic}[1]
+\Require sequence $\vx_{1:T}$; online chunk size $C$ (default $C_{\min}$ of the CMS); outer optimizer
+\State re-initialize fast state (per-context copies or deltas of the memories); zero outer gradients
+\For{each chunk $[c]$ of $C$ tokens}
+  \State forward with current fast state; loss $\loss_{[c]}$ \Comment{differentiable read}
+  \State per-layer teach signals $\bm{\delta}^{(l)} \gets \partial\loss_{[c]}/\partial(\text{block } l \text{ output})$
+  \State $\loss_{[c]}$.backward() \Comment{accumulate outer gradients across chunks}
+  \State \textbf{with no gradient:} run the blocks again with $\bm{\delta}^{(l)}$ \Comment{write: CMS (\cref{alg:c11-cms}) and Titans memories}
+\EndFor
+\State clip outer gradients; outer optimizer step (Muon hybrid, AdamW or M3)
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.} Let each CMS level be an MLP $d \to hd \to d$. Reading costs $\bigO(hd^2)$
+per token and level, so $\bigO(Tkhd^2)$ per sequence and layer. Writing level $\ell$ needs one
+backward pass through that level for every token in its chunks; since every token belongs to
+exactly one chunk of each level, writing also costs $\bigO(Tkhd^2)$, \emph{independent} of the
+periods. The periods change only how many parameter writes happen ($T/C^{(\ell)}$ per level) and
+how much the buffers hold ($\bigO(C^{(\ell)}d)$ inputs and error signals per level, which is what
+limits long periods in practice). The state is the CMS parameters themselves, $2khd^2$ numbers per
+layer, plus optimizer state. Self-modifying Titans with hidden width $d$ costs $\bigO(d^2)$ per
+token and memory for the read, the per-token gradients and the preconditioned write
+($\mW_2(\alpha\mI - \eta\vk\vk\T)$ is a rank-one correction, computed in $\bigO(d^2)$), so
+$\bigO(Td^2)$ per layer with about $6\times2d^2$ numbers of state. Decoding is the same
+computation with $T = 1$ per step.
+
+\subsection{Implementation walkthrough}\label{sec:c11-nl-code}
+
+\begin{implnote}[title={In the code: layout of the reproduction}]
+Under \repofile{repos/kmccleary3301__nested_learning/src/nested_learning/}: \code{levels.py}
+(levels and clocks), \code{cms.py}, \code{hope/block.py} (HOPE blocks and online updates),
+\code{titan/self_modifying.py}, \code{optim/} (level optimizers, M3), \code{training.py} (teach
+signals, training loop) and \code{model.py}. \code{model.block_variant} selects \code{hope_attention} (attention $\to$ CMS),
+\code{hope_selfmod} (self-modifying Titans $\to$ CMS), \code{transformer}, or the legacy
+\code{hope_hybrid} (attention + Titans memory + CMS), which is still the default in
+\code{ModelConfig}. Configs are Hydra YAML files under \code{configs/}.
+\end{implnote}
+
+\begin{implnote}[title={In the code: two cadence mechanisms}]
+A level is a \code{LevelSpec(name, update_period, warmup_steps, jitter, optimizer_key)}. Its
+\code{LevelClock} (\code{levels.py}) counts \emph{calls}: every block forward ends with
+\code{level_manager.tick()}, and \code{should_update} returns true once \code{update_period} ticks
+have passed since the level's last write (after \code{warmup_steps}, optionally with jitter). The
+Titans level of the \code{hope_hybrid} block is written only then. The CMS levels are gated differently, by \emph{token
+counts}: \code{_cms_forward_online} in \code{hope/block.py} processes the sequence in base chunks
+of $C_{\min}$ tokens, appends each level's inputs and teach signals to a buffer, and pops exactly
+\code{update_period} tokens whenever enough have accumulated (\cref{lst:c11-cms-online}); these
+writes call the optimizer with \code{force=True}, bypassing the clock. Buffers persist across
+calls when a per-context fast state is used, and \code{cms_flush_partial_at_end} writes a final
+partial chunk at the end of a sequence.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak kmccleary3301\_\_nested\_learning/\allowbreak src/\allowbreak nested\_learning/\allowbreak hope/\allowbreak block.py} (\texttt{HOPEAttentionBlock.\_cms\_forward\_online}): read every base chunk, write each level when its buffer holds \texttt{update\_period} tokens},label={lst:c11-cms-online}]
+        for start in range(0, seq_len, base_chunk):
+            end = min(start + base_chunk, seq_len)
+            chunk_in = x[:, start:end, :]
+            chunk_teach = teach_signal[:, start:end, :]
+            chunk_active = active_mask[:, start:end]
+
+            current = chunk_in
+            level_inputs: dict[str, torch.Tensor] = {}
+            for spec in self.config.cms_levels:
+                level_name = spec.name
+                level_inputs[level_name] = current
+                current = self.cms.blocks[level_name](current)
+            outputs.append(current)
+
+            for spec in self.config.cms_levels:
+                level_name = spec.name
+                buffer = buffers[level_name]
+                buffer.inputs.append(level_inputs[level_name].detach())
+                buffer.teach.append(chunk_teach)
+                buffer.active.append(chunk_active)
+                buffer.count += end - start
+                update_period = int(spec.update_period)
+                while update_period > 0 and buffer.count >= update_period:
+                    chunk_inputs, chunk_teach, chunk_active = _pop_buffer_chunk(
+                        buffer, update_period
+                    )
+                    buffer.count -= update_period
+                    # ...
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the CMS block and its local objective}]
+\code{CMSBlock} in \code{cms.py} is \code{LayerNorm} $\to$ \code{Linear(d, 4d)} $\to$
+\code{GELU} $\to$ \code{Linear(4d, d)} with a residual connection; during training the MLP output
+of each token is rescaled to norm at most $1$ (\code{grad_clip=1.0}). A level write
+(\code{_update_cms_chunk}) evaluates the block on the popped chunk, forms the loss of
+\cref{lst:c11-chunkloss} with the default \code{cms_chunk_reduction="sum"} (the sum over the chunk
+in \cref{eq:c11-cms-update}), and hands the gradient to that level's optimizer together with a
+\emph{context vector}, the mean input of the chunk. Tokens whose teach signal is all zero are
+masked out.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak kmccleary3301\_\_nested\_learning/\allowbreak src/\allowbreak nested\_learning/\allowbreak hope/\allowbreak block.py}: the gradient-shaping loss whose gradient with respect to the prediction is $2\bm{\delta}$},label={lst:c11-chunkloss}]
+def _chunk_loss(
+    prediction: torch.Tensor,
+    delta_target: torch.Tensor,
+    mask_f: torch.Tensor,
+    *,
+    reduction: str,
+    differentiable_target: bool = False,
+) -> torch.Tensor:
+    if differentiable_target:
+        target = prediction.detach() - delta_target
+    else:
+        target = (prediction.detach() - delta_target).detach()
+    diff_sq = (prediction - target).pow(2)
+    masked = diff_sq * mask_f
+    if reduction == "mean":
+        return masked.sum() / mask_f.sum().clamp(min=1.0)
+    if reduction == "sum":
+        return masked.sum()
+    raise ValueError(f"Unsupported cms_chunk_reduction={reduction}")
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the level optimizer projects out the context direction}]
+Each level's optimizer is a \code{DeepMomentum} module (\code{optim/deep.py}) applied through
+\code{LevelOptimizerManager}, which subtracts \code{lr * update} from each parameter. The pilot
+configs select \code{variant: nl_l2_precond}, which the docs call a ``best-effort'' mapping of the
+paper's $\ell_2$ optimizer: the gradient is projected orthogonally to the unit context vector
+$\hat\vx$ along its last dimension, $\mG \mapsto \mG(\mI - \hat\vx\hat\vx\T)$
+(\cref{lst:c11-nlprecond}), and then averaged by an EMA with $\beta = 0.9$
+(\code{grad_avg = beta * grad_avg + (1 - beta) * update}). The projection is applied only to
+tensors whose last dimension equals $d$: the input-side matrix of \code{Linear(d, 4d)}, but also
+$d$-dimensional vectors such as the LayerNorm parameters and the output bias; the output-side
+matrix and the hidden bias skip it. Note that this is the input-side, GPM-style projection of
+\cref{eq:c11-gpm} with a single direction (the chunk's mean input), applied to the gradient, which
+is not the same operation as the weight-side factor $\mW(\mI - \vx\vx\T)$ of \cref{eq:c11-dgd}.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak kmccleary3301\_\_nested\_learning/\allowbreak src/\allowbreak nested\_learning/\allowbreak optim/\allowbreak deep.py} (\texttt{DeepMomentum.\_nl\_precondition})},label={lst:c11-nlprecond}]
+        if ctx_norm > 0:
+            if grad.ndim == 0 or grad.shape[-1] != ctx.shape[-1]:
+                metrics["proj_skipped"] = 1.0
+                return grad, metrics
+            unit = ctx / (ctx_norm + self.eps)
+            # Project grad orthogonal to context (rank-1 projector).
+            projection = (grad * unit).sum(dim=-1, keepdim=True) * unit
+            update = grad - projection
+            metrics["proj_norm"] = torch.norm(update).item()
+            return update, metrics
+        return grad, metrics
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: self-modifying Titans}]
+\code{SelfModifyingTitans} in \code{titan/self_modifying.py} holds the memories
+\code{m_k, m_v, m_q, m_eta, m_alpha, m_memory}, each a \code{ResidualMLPMemory} with weights
+\code{w2} ($d\times d$, input side) and \code{w1} ($d\times d$, output side); \code{m_eta} and
+\code{m_alpha} output a scalar. \code{forward_with_updates} walks the sequence; at each boundary
+of the ``other'' chunk ($C_o$) it writes \code{k, v, eta} (and \code{alpha}, and \code{q} if
+adaptive), and at each boundary of the memory chunk ($C_m$) it writes \code{memory}.
+\code{_memory_grads_chunk} computes all per-token gradients of \cref{eq:c11-selfmod-loss} at the
+chunk-start state with \code{torch.func.vmap} over \code{grad}; \code{_apply_param_update}
+(\cref{lst:c11-selfmod-update}) then applies them token by token with
+\code{precond} $= \alpha_t\mI - \eta_t\vk_t\vk_t\T$. Optional momentum on the per-token gradients
+(\code{self_mod_momentum}) is off by default. When no per-context fast state is passed,
+\code{apply_updates_inplace} runs the same procedure on a fresh copy and writes the batch-mean of
+the updated weights back into the module.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak kmccleary3301\_\_nested\_learning/\allowbreak src/\allowbreak nested\_learning/\allowbreak titan/\allowbreak self\_modifying.py} (\texttt{\_apply\_param\_update}), the update of \cref{eq:c11-selfmod-update}},label={lst:c11-selfmod-update}]
+        g1, g2, gskip = grads
+        g1 = self._apply_momentum(fast, "m_w1", g1)
+        g2 = self._apply_momentum(fast, "m_w2", g2)
+        if self.config.use_rank1_precond:
+            fast.w2 = torch.matmul(fast.w2, precond) - eta_t[:, None, None] * g2
+        else:
+            fast.w2 = alpha_t[:, None, None] * fast.w2 - eta_t[:, None, None] * g2
+        fast.w1 = alpha_t[:, None, None] * fast.w1 - eta_t[:, None, None] * g1
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: training loop, teach signal and configs}]
+\code{compute_teach_signal} in \code{training.py} implements \cref{eq:c11-teach}: softmax of the
+detached logits, minus one at the target index, divided by the number of active targets, times
+the (tied) LM-head weight. With \code{train.per_layer_teach_signal=true},
+\code{_compute_layer_teach_signals} instead takes autograd gradients with respect to each block's
+output. With \code{train.online_updates=true} the loop follows \cref{alg:c11-two-pass} (chunk
+size defaults to the smallest CMS period; one outer step per sequence); the experimental
+\code{boundary_state_grad_through_write} mode keeps writes differentiable. The pilot config (\code{configs/pilot.yaml}) uses $d = 512$, $12$ layers, CMS periods
+$1/4/32/128$ tokens, a Titans level with period $8$, level learning rates $3\times10^{-4}$ (CMS)
+and $6\times10^{-4}$ (Titans), a teach-signal scale of $0.1$, a surprise threshold of $0.02$ on the
+teach-signal norm, and PyTorch's \code{torch.optim.Muon} as the outer optimizer for 2-D weights
+(AdamW for the rest). The ablation \code{configs/ablations/cms_sparse.yaml} uses periods
+$8/32/128/512$; the self-modifying preset sets $C_o = 8$, $C_m = 64$.
+\end{implnote}
+
+The reproduction also implements the paper's optimizer \emph{M3} (``Multi-scale Momentum Muon'',
+cited as the paper's Algorithm~1; \code{optim.type=m3}), itself a two-timescale memory: a fast
+momentum used at every step and a slow momentum, built from gradient sums over chunks of
+\code{slow_chunk} steps and refreshed only at chunk ends; both are orthogonalized by cubic
+Newton--Schulz (\code{ns_steps=3}) and divided by an Adam-style second moment (\cref{lst:c11-m3}).
+As written, the fast momentum accumulates \code{m1 += beta1 * grad} without decay; the paper's
+Algorithm~1 is not in the mirror, so we cannot compare.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak kmccleary3301\_\_nested\_learning/\allowbreak src/\allowbreak nested\_learning/\allowbreak optim/\allowbreak m3.py} (\texttt{M3.step}): fast and slow momenta},label={lst:c11-m3}]
+                m1.add_(grad, alpha=beta1)
+                v.addcmul_(grad, grad, value=beta2)
+                slow_buffer.add_(grad)
+
+                o1 = _orthogonalize(m1, steps=ns_steps, eps=eps)
+                o2 = state["o2"]
+                denom = v.sqrt().add_(eps)
+                update = (o1 + alpha * o2) / denom
+                p.add_(update, alpha=-lr)
+
+                if slow_chunk > 0 and state["step"] % slow_chunk == 0:
+                    # Paper Algorithm 1 uses the updated slow momentum term in the *next* chunk.
+                    # Compute it after applying the current step update to avoid off-by-one usage.
+                    m2.add_(slow_buffer, alpha=beta3)
+                    slow_buffer.zero_()
+                    state["o2"] = _orthogonalize(m2, steps=ns_steps, eps=eps)
+\end{lstlisting}
+
+\subsection{Reference implementation}\label{sec:c11-nl-ref}
+
+\Cref{lst:c11-cms-ref} is a minimal three-level CMS with online writes, following
+\cref{alg:c11-cms}. It uses the plain inner-product objective
+$\sum_t\inner{\bm{\delta}_t}{\hat\vy_t}$, whose gradient $\sum_t\mathbf{J}_t\T\bm{\delta}_t$ is half
+that of the shaped loss of \cref{lst:c11-chunkloss}, and plain SGD per level.
+
+\begin{lstlisting}[caption={Reference implementation (ours): a three-level Continuum Memory System with a multi-frequency write schedule},label={lst:c11-cms-ref}]
+import torch, torch.nn as nn
+
+class Level(nn.Module):                      # one CMS level: x + MLP(x)
+    def __init__(self, d, h):
+        super().__init__()
+        self.up, self.down = nn.Linear(d, h), nn.Linear(h, d)
+    def forward(self, x):
+        return x + self.down(torch.nn.functional.gelu(self.up(x)))
+
+class CMS(nn.Module):
+    def __init__(self, d, periods=(8, 32, 128), lrs=(1e-2, 3e-3, 1e-3), h_mult=4):
+        super().__init__()
+        self.levels = nn.ModuleList(Level(d, h_mult * d) for _ in periods)
+        self.periods, self.lrs = periods, lrs
+        self.buf = [[] for _ in periods]     # (inputs, deltas) awaiting a write
+
+    @torch.no_grad()
+    def step(self, x, delta):
+        """x, delta: (C_min, d) for one base chunk. Read, then write due levels."""
+        h, ins = x, []
+        for lvl in self.levels:              # read with current parameters
+            ins.append(h)
+            h = lvl(h)
+        for l, (lvl, C, lr) in enumerate(zip(self.levels, self.periods, self.lrs)):
+            self.buf[l].append((ins[l], delta))
+            n = sum(z.shape[0] for z, _ in self.buf[l])
+            if n < C:
+                continue                     # level l is not due yet
+            Z = torch.cat([z for z, _ in self.buf[l]])[:C]
+            D = torch.cat([g for _, g in self.buf[l]])[:C]
+            self.buf[l] = []                 # (assumes C is a multiple of C_min)
+            with torch.enable_grad():        # one parallel gradient over the chunk
+                params = list(lvl.parameters())
+                obj = (lvl(Z) * D).sum()     # sum_t <delta_t, MLP(z_t)>
+                grads = torch.autograd.grad(obj, params)
+            for p, g in zip(params, grads):  # level-specific optimizer (SGD here)
+                p -= lr * g
+        return h
+
+# streaming use: delta_t is the error signal at the block output
+cms = CMS(d=64)
+for x_chunk, d_chunk in zip(torch.randn(16, 8, 64), torch.randn(16, 8, 64)):
+    y_chunk = cms.step(x_chunk, 1e-2 * d_chunk)
+\end{lstlisting}
+
+\paragraph{Numerical checks.} Besides the schedule, chunkwise and gradient-shaping checks reported
+above, our NumPy check confirms that the rank-1 preconditioner with $\alpha_t = \eta_t = 1$ and a
+unit key erases exactly the key direction ($\norm{\mW(\mI - \vk\vk\T)\vk} = 5\times10^{-16}$) and
+leaves inputs orthogonal to $\vk$ untouched.
+
+\subsection{Reported results}\label{sec:c11-nl-results}
+
+\begin{results}
+\textbf{Paper (as transcribed in the reproduction repository).} Table~1 of
+\repofile{repos/kmccleary3301__nested_learning/google_papers/Nested_Learning/Nested_Learning.md},
+a Markdown transcription of the NeurIPS camera-ready paper, reports language modelling and
+common-sense reasoning. At 1.3B parameters and 100B training tokens: WikiText perplexity $15.11$
+for HOPE, $15.60$ for Titans (LMM) and $18.53$ for Transformer++, with average accuracy over the
+listed tasks of $57.23$, $56.82$ and $52.25$. At 760M parameters and 30B tokens: perplexity
+$20.53$ (HOPE), $20.04$ (Titans) and $25.21$ (Transformer++), average accuracy $52.26$, $51.56$
+and $48.69$. The table also lists RetNet, DeltaNet, TTT and Samba. (The transcription has one
+unlabelled HOPE row above the 760M block, presumably a smaller model; we do not quote it.) The
+paper defers its continual-learning and long-context results to an appendix that is not in the
+mirror; see the paper. The transcription was made by the reproduction's author, not by the
+paper's authors, so check these values against the published paper before relying on them.
+
+\textbf{Reproduction.} The README and \code{docs/PAPER_COMPLIANCE.md} state that the repository
+targets ``mechanism-auditing fidelity, not full paper-scale results parity''.
+\code{reports/ablations.md} records small pilot runs (a few thousand steps for most ablations,
+evaluation sets of 128--256 examples, single seeds, differing optimizers); we do not draw
+conclusions from those numbers.
+\end{results}
+
+\subsection{Discussion}\label{sec:c11-nl-discussion}
+
+\paragraph{Strengths.} Nested Learning gives one vocabulary for things usually treated
+separately: attention, recurrent states, test-time training, optimizer states and pre-training
+are all memories differing in context flow, objective and frequency. That lens produces concrete
+designs. The CMS turns the period $C^{(\ell)}$ into a single, interpretable knob for the
+timescale of a block of persistent memory, and the chunkwise form keeps it parallel. M3 shows the
+same idea inside an optimizer. HOPE combines the most plastic memory (self-modifying Titans, whose
+keys, values and learning rates themselves adapt in context) with a graded persistent memory.
+
+\paragraph{Limitations.} The evidence is thin: there is no official code; the main-text table
+shows HOPE close to Titans (better average accuracy at both sizes, worse perplexity at 760M); the
+reproduction does not attempt result parity. The mechanism is intricate. Writes inside the
+forward pass require two-pass training with stop-gradient writes, so the outer level does not
+learn \emph{through} the inner writes unless one pays for the experimental differentiable mode;
+TTT-E2E (\cref{ch:ttt}) instead meta-learns through its inner loop. Online writes during
+inference mean that a model's behaviour depends on what it has read, and the reproduction's
+per-context ``fast state'' is shared across a batch unless the batch size is $1$; when such
+writes should be reset, and whether slow levels should persist across users, are exactly the
+``consistency across episodes'' questions of the survey (\S IV-E(d)). Finally, a slow CMS level
+written with plain gradients is still exposed to interference: sums over long chunks average out
+noise but do not protect old knowledge, which is where the geometric methods of the next two
+sections come in.
+
+\paragraph{Relations.} The self-modifying memory is a Titans memory (\cref{ch:ttt}) whose
+projections are also fast weights; its weight update is the delta rule of \cref{ch:delta}.
+Log-Linear Attention (\cref{ch:structured}) also keeps memories at several timescales, but as a
+hierarchy of recurrent \emph{states} over a Fenwick tree rather than as parameters written at
+different frequencies; Memory Caching (\cref{ch:routing}) checkpoints recurrent memories at
+segment boundaries.
+
+% ===========================================================================
+\section{OLieRA: orthogonal low-rank adaptation in Lie groups}\label{sec:c11-olieRA}
+% ===========================================================================
+
+\begin{pitfall}[title={No public code}]
+We found no code for OLieRA \citep{cao2025olora}. This section explains the method from the
+survey's description (\S IV-E(f)) and from what the authors state publicly in their abstract.
+Where we write equations beyond that, they are \emph{our formalization}; the paper's exact
+parameterization may differ.
+\end{pitfall}
+
+\subsection{Motivation}\label{sec:c11-ol-motivation}
+
+The systems of \cref{sec:c11-nested,ch:ttt} write memory parameters online. A slower but equally
+important kind of write is the sequential fine-tuning of a deployed LLM on a stream of tasks:
+each task writes new knowledge into the backbone, the model's long-term parametric memory, and
+each write can erase earlier ones. O-LoRA (\cref{sec:c11-lora}) limits interference by giving
+every task its own low-rank adapter in a subspace orthogonal to earlier adapters. The OLieRA
+abstract identifies a remaining problem: such updates are \emph{additive}, and, the authors argue,
+additive updates distort the intrinsic geometry of the pretrained parameters. OLieRA instead writes
+each task as a \emph{multiplicative} update inside a Lie group, which preserves that geometry, and
+keeps orthogonality across task subspaces. It keeps O-LoRA's practical properties: no replay
+buffer and no task identifier at inference. The survey places it under geometric constraints for
+parametric stability, as ``constraining low-rank updates on structured manifolds''. Such methods
+are not explicit memory modules, but the survey notes that ``as more architectures introduce
+writable parameter subsets, the geometry of the update rule may become as important as the
+storage form itself'' (\S IV-E(f)).
+
+\begin{taxonomy}
+OLieRA is not in Table~I or Table~II of \citet{zhoubian2026memory}; the survey discusses it in
+\S IV-E(f) as an adaptation method relevant to the stability of long-term parametric memory. Our
+placement: \textbf{representation} implicit knowledge in the backbone weights, written through
+explicit per-task parameter subsets (the adapters); \textbf{update dynamics} offline (task by task
+during fine-tuning, fixed at inference); \textbf{persistence} long-term; \textbf{update rule}
+optimization-based writing under a geometric (Lie-group and orthogonality) constraint.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c11-ol-formulation}
+
+Public descriptions of OLieRA build the Lie group from tensors with no zero entries under the
+Hadamard product, perform updates in the Lie algebra, and map them back with the exponential map
+(\cref{sec:c11-lie}); they mention first- and second-order Taylor expansions of the exponential.
+One way to formalize this for a weight $\mW_0 \in \mathcal{G}_{\had}$ and a task sequence
+$t = 1,\dots,N$ is
+\begin{equation}
+  \mW_t = \mW_{t-1}\had\exp_{\had}(\mB_t\mA_t),
+  \qquad \mB_t \in \R^{m\times r},\ \mA_t \in \R^{r\times n},
+  \label{eq:c11-olie-update}
+\end{equation}
+where each task's Lie-algebra element $\bm{\Delta}_t = \mB_t\mA_t$ is low-rank, exactly as in LoRA,
+with the same $r(m+n)$ trainable numbers. Four consequences follow directly from the group
+structure.
+
+\paragraph{Composition is addition in the algebra.} Because $\mathcal{G}_{\had}$ is commutative,
+\begin{equation}
+  \mW_N = \mW_0\had\exp_{\had}\Bigl(\sum_{t=1}^N\mB_t\mA_t\Bigr),
+  \qquad
+  \log\abs{\mW_N} = \log\abs{\mW_0} + \sum_{t=1}^N\mB_t\mA_t ,
+  \label{eq:c11-olie-compose}
+\end{equation}
+independent of the order of the tasks, and the sign of every entry of $\mW_0$ is kept forever.
+In log-magnitude coordinates OLieRA is an additive low-rank method; in weight coordinates it is
+multiplicative.
+
+\paragraph{The additive change is entry-proportional.} Expanding
+$\exp_{\had}(\bm{\Delta}) = \bm{1} + \bm{\Delta} + \tfrac12\bm{\Delta}\had\bm{\Delta} + \dots$,
+\begin{equation}
+  \mW\had\exp_{\had}(\bm{\Delta}) = \mW + \mW\had\bm{\Delta} + \tfrac12\mW\had\bm{\Delta}\had\bm{\Delta} + \bigO(\norm{\bm{\Delta}}^3).
+  \label{eq:c11-olie-taylor}
+\end{equation}
+To first order the weight moves by $\mW\had\bm{\Delta}$: every entry changes in proportion to its own
+size. Large weights move more in absolute terms, small weights less, and no entry can cross
+zero. This is the concrete sense in which, in our formalization, the update ``respects'' the
+pretrained parameters: it changes their magnitudes by relative factors $e^{\Delta_{ij}}$ instead
+of adding a pattern that ignores them.
+
+\paragraph{Low rank in the algebra is not low rank in the weights.} For a rank-one element,
+$\mW\had(\vb\va\T) = \diag(\vb)\,\mW\diag(\va)$: a rescaling of rows and columns, which has the
+same rank as $\mW$ whenever $\va$ and $\vb$ have no zero entries. For rank $r$, $\mW\had(\mB\mA) = \sum_{j=1}^r\diag(\vb_j)\,\mW\diag(\va_j)$, where
+$\vb_j$ and $\va_j\T$ are the columns of $\mB$ and rows of $\mA$. So a rank-$r$ multiplicative
+adapter produces a first-order additive change of rank up to $\min(m,n)$ with only $r(m+n)$
+parameters. (Our NumPy check: for a random $20\times16$ $\mW$ and $r \in \{1,2,4\}$ both
+$\mW\had(\mB\mA)$ and $\mW\had(\exp_{\had}(\mB\mA) - \bm{1})$ have full rank $16$.)
+
+\paragraph{Gradients in the algebra.} Write $\mW_{\text{eff}} = \mW\had\exp_{\had}(\mB\mA)$ and let
+$\mG = \partial\loss/\partial\mW_{\text{eff}}$. Each entry of $\mW_{\text{eff}}$ depends only on the
+matching entry of $\bm{\Delta} = \mB\mA$, with derivative
+$\partial W_{\text{eff},ij}/\partial\Delta_{ij} = W_{\text{eff},ij}$, so the chain rule gives
+\begin{equation}
+  \frac{\partial\loss}{\partial\bm{\Delta}} = \mG\had\mW_{\text{eff}}, \qquad
+  \nabla_{\mB} = (\mG\had\mW_{\text{eff}})\mA\T, \qquad
+  \nabla_{\mA} = \mB\T(\mG\had\mW_{\text{eff}}).
+  \label{eq:c11-olie-grad}
+\end{equation}
+The Euclidean gradient is reweighted entry by entry by the current weights, as in multiplicative
+(exponentiated-gradient) updates. With the LoRA initialization $\mB = \bm{0}$, $\mW_{\text{eff}} =
+\mW$ at the start of each task, $\nabla_{\mA} = \bm{0}$ and $\nabla_{\mB} \neq \bm{0}$, as in LoRA.
+
+\paragraph{Orthogonality across tasks.} To limit interference, the update of task $t$ is kept
+orthogonal to those of earlier tasks. Secondary descriptions of the paper say that, unlike O-LoRA,
+which constrains the low-rank factors, OLieRA enforces orthogonality on the \emph{entire} updated
+parameter subspaces, represented through $\exp(\Delta\mW_t)$. We do not know its exact form. A
+simple version that is cheap to compute, and that we use in our reference implementation, applies
+the O-LoRA penalty of \cref{eq:c11-olora} in the Lie algebra:
+\begin{equation}
+  \min_{\mB_t, \mA_t}\; \loss_t\bigl(\mW_{t-1}\had\exp_{\had}(\mB_t\mA_t)\bigr) + \lambda\sum_{s<t}\norm{\mA_s\mA_t\T}_F^2 .
+  \label{eq:c11-olie-objective}
+\end{equation}
+This choice has a weakness, which may be one reason the paper constrains more than the factors. For an
+additive adapter, $\mA_s\mA_t\T = \bm{0}$ guarantees $\mB_t\mA_t\vx = \bm{0}$ on old input directions
+$\vx \in \operatorname{row}(\mA_s)$ (\cref{sec:c11-lora}). For the multiplicative adapter the
+first-order change acts as $(\mW\had\mB_t\mA_t)\vx = \sum_j\vb_j\had\bigl(\mW(\va_j\had\vx)\bigr)$:
+it depends on the element-wise products $\va_j\had\vx$, not on the inner products $\va_j\T\vx$.
+Factor orthogonality therefore no longer implies non-interference (in our check the output change
+on such an $\vx$ has norm $3.5$, against $2\times10^{-15}$ for the additive adapter).
+
+\subsection{Algorithm and complexity}\label{sec:c11-ol-alg}
+
+\begin{algorithm}[t]
+\caption{Continual fine-tuning with multiplicative low-rank updates (our formalization of OLieRA).}\label{alg:c11-olie}
+\begin{algorithmic}[1]
+\Require pretrained weights $\{\mW\}$ of the adapted layers; tasks $1..N$; rank $r$; penalty $\lambda$
+\For{$t = 1,\dots,N$}
+  \State $\mB_t \gets \bm{0}$, $\mA_t \gets$ small random \Comment{start at $\mW_{\text{eff}} = \mW$}
+  \For{each mini-batch of task $t$}
+    \State $\mW_{\text{eff}} \gets \mW\had\exp_{\had}(\mB_t\mA_t)$ \Comment{or the Taylor form of \cref{eq:c11-olie-taylor}}
+    \State $\loss \gets \loss_t(\mW_{\text{eff}}) + \lambda\sum_{s<t}\norm{\mA_s\mA_t\T}_F^2$
+    \State update $\mB_t, \mA_t$ with \cref{eq:c11-olie-grad} and any optimizer
+  \EndFor
+  \State $\mW \gets \mW\had\exp_{\had}(\mB_t\mA_t)$; store $\mA_t$ for later penalties \Comment{merge}
+\EndFor
+\Ensure merged weights; inference needs no adapters and no task identifier
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.} Unlike LoRA, the multiplicative adapter cannot be applied as $\mB(\mA\vx)$:
+the effective weight must be formed, $\bigO(mnr)$ for $\mB\mA$ plus $\bigO(mn)$ element-wise work
+per layer and step, and the backward pass of \cref{eq:c11-olie-grad} costs another $\bigO(mnr)$
+and an $m\times n$ temporary. Training memory therefore scales like full fine-tuning for the
+activations of the weight, while optimizer state stays at LoRA's $r(m+n)$. The penalty costs
+$\bigO(r^2n)$ per earlier task; storing old factors costs $\bigO(Nrn)$. After merging, inference
+costs nothing extra.
+
+\subsection{Reference implementation}\label{sec:c11-ol-ref}
+
+\begin{lstlisting}[caption={Reference implementation (ours): a multiplicative low-rank adapter in the Hadamard Lie group with an O-LoRA-style orthogonality penalty},label={lst:c11-olie-ref}]
+import torch, torch.nn as nn
+
+class HadamardLieAdapter(nn.Module):
+    """W_eff = W (.) exp(B A): low-rank update in the Lie algebra of
+    (nonzero matrices, Hadamard product). Our formalization, not the paper's code."""
+    def __init__(self, W0, r=8, order=None):
+        super().__init__()
+        m, n = W0.shape
+        self.register_buffer("W", W0.clone())          # frozen; no entry may be 0
+        self.B = nn.Parameter(torch.zeros(m, r))       # LoRA-style start: W_eff = W
+        self.A = nn.Parameter(torch.randn(r, n) / n ** 0.5)
+        self.order = order                             # None = exact exp, 1 or 2 = Taylor
+        self.old_A = []                                # factors of earlier tasks
+
+    def effective_weight(self):
+        D = self.B @ self.A                            # element of the Lie algebra
+        if self.order == 1:
+            return self.W * (1 + D)
+        if self.order == 2:
+            return self.W * (1 + D + 0.5 * D * D)
+        return self.W * torch.exp(D)                   # exponential map, element-wise
+
+    def forward(self, x):                              # x: (..., n)
+        return x @ self.effective_weight().T
+
+    def orth_penalty(self):                            # sum_s ||A_s A_t^T||_F^2
+        return sum(((A_s @ self.A.T) ** 2).sum() for A_s in self.old_A)
+
+    @torch.no_grad()
+    def finish_task(self):                             # merge into W, start a new task
+        self.W.mul_(torch.exp(self.B @ self.A))        # group product: signs kept
+        self.old_A.append(self.A.detach().clone())
+        self.B.zero_()
+        self.A.normal_(0.0, self.A.shape[1] ** -0.5)
+
+# per task: loss = task_loss(layer) + lam * layer.orth_penalty(); after it: layer.finish_task()
+\end{lstlisting}
+
+\paragraph{Numerical checks.} Besides the checks quoted above, NumPy confirms that
+$\mW\had e^{\bm{\Delta}_1}\had e^{\bm{\Delta}_2} = \mW\had e^{\bm{\Delta}_1+\bm{\Delta}_2}$ in either order (to
+$5\times10^{-15}$), with every sign of $\mW$ preserved.
+
+\subsection{Reported results}\label{sec:c11-ol-results}
+
+\begin{results}
+No code and no result files for OLieRA exist in this repository, so we quote no numbers. The
+authors state in their abstract that OLieRA achieves state-of-the-art results on the Standard CL
+benchmark, remains competitive with the best methods in the setting with a large number of tasks,
+and keeps the replay-free and task-ID-free inference of O-LoRA. See
+the paper for numbers, models and baselines.
+\end{results}
+
+\subsection{Discussion}\label{sec:c11-ol-discussion}
+
+\paragraph{Strengths.} Multiplicative updates give each task a relative, sign-preserving change
+of every weight from only $r(m+n)$ parameters, which is more expressive than an additive rank-$r$
+update. The group structure makes task updates commute and compose by addition in the algebra,
+which is a clean basis for reasoning about many tasks, and merged weights cost nothing at
+inference.
+
+\paragraph{Limitations.} The Hadamard group excludes zeros: a weight that is exactly zero (after
+pruning or some quantization schemes) can never move, and a weight near zero can barely move, so
+the method assumes that small weights should stay small. Training is more expensive than LoRA
+because the full effective weight is formed. Orthogonality in the algebra does not by itself
+imply functional non-interference, as shown above. Most important for this book, the evidence
+consists of an abstract and secondary descriptions; with no code, the exact constraint cannot be
+checked.
+
+\paragraph{Relations.} OLieRA protects the backbone's long-term memory by \emph{where} it lets
+updates go (orthogonal subspaces) and \emph{how} they act (multiplicatively). Muon-OGD, next,
+protects it by choosing the geometry of the step itself. Both address the survey's question of
+how to write long-lived parametric memory without drift (\S VI-B, \S VI-C).
+
+% ===========================================================================
+\section{Muon-OGD: spectral orthogonal gradient projection}\label{sec:c11-muonogd}
+% ===========================================================================
+
+\begin{pitfall}[title={Probably official, incomplete code}]
+The repository \repo{jeremylu916__OSD} is on the first author's account. Its README calls the
+method ``OSD'' (``OSD for LLM Continual Learning''), uses the name ``Muon-OGD'' only for one of
+the pipelines it runs, and does not cite the paper \citep{lu2026muonogd}; it has no license
+file. Several files that the code imports or runs are missing from the snapshot (see the
+implementation notes), so we can inspect the core update but not the full training setup.
+\end{pitfall}
+
+\subsection{Motivation}\label{sec:c11-mo-motivation}
+
+OGD (\cref{sec:c11-cl}) protects old tasks by projecting the gradient, a construction that lives
+in Euclidean (Frobenius) geometry: it treats a weight matrix as a vector. The success of Muon
+(\cref{sec:c11-muon}) suggests that, for matrix-valued LLM parameters, the spectral norm is a
+better geometry for steps. Muon-OGD combines the two. According to its abstract, it formulates
+each update as an optimization problem with a spectral-norm constraint and linear
+non-interference constraints, solves it with dual iterations and Newton--Schulz approximations of
+the matrix sign, and so applies orthogonalized momentum updates that avoid protected directions
+associated with earlier tasks. The survey describes it as ``imposing spectral-norm-aware
+orthogonal gradient projections'' (\S IV-E(f)).
+
+\begin{taxonomy}
+Not in Table~I or Table~II of \citet{zhoubian2026memory}; discussed in \S IV-E(f) as a constrained
+update rule for long-term parametric memory. Our placement: \textbf{representation} implicit
+(knowledge in the backbone weights); \textbf{update dynamics} offline (sequential fine-tuning
+stages); \textbf{persistence} long-term; \textbf{update rule} optimization-based writing with
+linear non-interference constraints in spectral geometry.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c11-mo-formulation}
+
+For one weight matrix $\mW \in \R^{m\times n}$ with (momentum) gradient $\mG$ and protected
+directions $\mC_1,\dots,\mC_k \in \R^{m\times n}$, the step solves
+\begin{equation}
+  \min_{\bm{\Delta}}\; \inner{\mG}{\bm{\Delta}}
+  \quad\text{s.t.}\quad \norm{\bm{\Delta}}_2 \le \eta, \qquad \inner{\mC_i}{\bm{\Delta}} = 0,\ i = 1,\dots,k .
+  \label{eq:c11-mo-primal}
+\end{equation}
+It is a convex problem: a linear objective, a norm ball and affine constraints.
+
+\paragraph{In Frobenius geometry this is OGD.} Replace $\norm{\cdot}_2$ by $\norm{\cdot}_F$ and let
+$\mP$ be the orthogonal projector onto $\{\bm{\Delta} : \inner{\mC_i}{\bm{\Delta}} = 0\ \forall i\}$. For
+feasible $\bm{\Delta}$, $\mP\bm{\Delta} = \bm{\Delta}$, so $\inner{\mG}{\bm{\Delta}} = \inner{\mP\mG}{\bm{\Delta}} \ge
+-\eta\norm{\mP\mG}_F$, with equality at $\bm{\Delta}^\star = -\eta\,\mP\mG/\norm{\mP\mG}_F$: the
+projected, normalized gradient of \cref{eq:c11-ogd}.
+
+\paragraph{In spectral geometry, project-then-orthogonalize fails.} The natural guess
+$-\eta\operatorname{msign}(\mP\mG)$ is generally \emph{infeasible}: orthogonalization rotates the
+step back into protected directions. In our NumPy check with $k = 3$ rank-one constraints on a
+$12\times8$ matrix, $\mP\mG$ satisfies the constraints to $10^{-15}$ but
+$\operatorname{msign}(\mP\mG)$ violates them by up to $0.75$. Two ways out follow.
+
+\paragraph{Dual ascent.} Attach multipliers $\lambda_i$ to the equalities. The Lagrangian is
+$\inner{\mH(\bm{\lambda})}{\bm{\Delta}}$ with $\mH(\bm{\lambda}) = \mG + \sum_i\lambda_i\mC_i$. For fixed
+$\bm{\lambda}$, minimizing over the spectral ball is the unconstrained Muon problem of
+\cref{eq:c11-nuclear}:
+\begin{equation}
+  \bm{\Delta}(\bm{\lambda}) = -\eta\operatorname{msign}\bigl(\mH(\bm{\lambda})\bigr),
+  \qquad
+  g(\bm{\lambda}) = -\eta\norm{\mG + \textstyle\sum_i\lambda_i\mC_i}_* .
+  \label{eq:c11-mo-dual}
+\end{equation}
+The dual function $g$ is concave (a negated norm of an affine function). Where $\mH$ has full
+rank, the nuclear norm is differentiable with gradient
+$\operatorname{msign}(\mH)$, so $\partial g/\partial\lambda_i = -\eta\inner{\mC_i}{\operatorname{msign}(\mH)}$:
+the dual gradient is exactly the constraint violation of the current primal step. Dual gradient
+ascent with step $\eta_\lambda$ (absorbing $\eta$) is
+\begin{equation}
+  \lambda_i \leftarrow \lambda_i - \eta_\lambda\,\inner{\mC_i}{\operatorname{msign}(\mH(\bm{\lambda}))} .
+  \label{eq:c11-mo-ascent}
+\end{equation}
+Strong duality holds by Slater's condition ($\bm{\Delta} = \bm{0}$ is feasible and strictly inside the
+ball), so if $\mH(\bm{\lambda}^*)$ has full rank at the dual optimum $\bm{\lambda}^*$, the primal
+minimizer there is unique, feasible and optimal. Each dual iteration costs
+one matrix sign, which Newton--Schulz computes. For $k^2$ \emph{bilinear} constraints
+$\mU\T\bm{\Delta}\mV = \bm{0}$ with $\mU \in \R^{m\times k}$, $\mV \in \R^{n\times k}$, the multiplier
+is a matrix $\mLambda \in \R^{k\times k}$, $\mH = \mG + \mU\mLambda\mV\T$, and the ascent step is
+$\mLambda \leftarrow \mLambda - \eta_\lambda\,\mU\T\operatorname{msign}(\mH)\mV$. In our check the
+violation of rank-one constraints falls from $0.50$ ($T = 0$) to $0.43$, $0.096$ and
+$1.6\times10^{-9}$ after $T = 10$, $100$ and $1000$ iterations, and at convergence the primal value
+equals the dual value ($-20.2967$); the unconstrained Muon step reaches $-20.914$, so protection
+costs about $3\%$ of the first-order decrease in this example. The bilinear version converges in
+the same way ($\norm{\mU\T\bm{\Delta}\mV}_F$ from $0.71$ to $7\times10^{-15}$).
+
+\paragraph{Closed form for one-sided protection.} If whole subspaces are protected on one side,
+no iteration is needed.
+
+\begin{proposition}[One-sided constraints]\label{prop:c11-onesided}
+Let $\mU \in \R^{m\times k}$ have orthonormal columns and $\mP = \mI - \mU\mU\T$. The solution of
+$\min\inner{\mG}{\bm{\Delta}}$ subject to $\norm{\bm{\Delta}}_2 \le \eta$ and $\mU\T\bm{\Delta} = \bm{0}$ is
+$\bm{\Delta}^\star = -\eta\operatorname{msign}(\mP\mG)$. Symmetrically, with $\mV \in \R^{n\times k}$
+orthonormal and the constraint $\bm{\Delta}\mV = \bm{0}$, it is $-\eta\operatorname{msign}(\mG(\mI - \mV\mV\T))$.
+\end{proposition}
+\begin{proof}
+Feasibility: write the thin SVD $\mP\mG = \tilde\mU\tilde\mSigma\tilde\mV\T$ over the nonzero
+singular values. Every column of $\tilde\mU$ lies in the range of $\mP\mG$, hence in the range of
+$\mP$, so $\mU\T\tilde\mU = \bm{0}$ and $\mU\T\operatorname{msign}(\mP\mG) = \mU\T\tilde\mU\tilde\mV\T = \bm{0}$.
+Optimality: any feasible $\bm{\Delta}$ has $\mP\bm{\Delta} = \bm{\Delta}$, so
+$\inner{\mG}{\bm{\Delta}} = \inner{\mG}{\mP\bm{\Delta}} = \inner{\mP\mG}{\bm{\Delta}} \ge -\eta\norm{\mP\mG}_*$ by
+\cref{eq:c11-nuclear}, and $\bm{\Delta}^\star$ attains this bound. The right-sided case is the
+transpose.
+\end{proof}
+
+The right-sided case is exactly the GPM projection of \cref{eq:c11-gpm} followed by Muon's
+orthogonalization: \emph{input-subspace} protection is compatible with spectral steps. The proof
+relies on $\operatorname{msign}$ mapping zero singular values to zero; an SVD-based
+$\operatorname{msign}$ that keeps them reintroduces arbitrary directions (our first NumPy attempt
+did exactly that), whereas Newton--Schulz keeps them at zero automatically.
+
+\paragraph{Which directions to protect.} The three constraint types protect increasingly much.
+A rank-one constraint $\inner{\sigma_i\vu_i\vv_i\T}{\bm{\Delta}} = \sigma_i\vu_i\T\bm{\Delta}\vv_i = 0$ built
+from a singular triplet of $\mW$ has a clean meaning. Differentiating $\sigma_i = \vu_i\T\mW\vv_i$
+and using $\mW\vv_i = \sigma_i\vu_i$, $\mW\T\vu_i = \sigma_i\vv_i$ and $\vu_i\T d\vu_i = \vv_i\T d\vv_i = 0$
+(unit vectors) gives $d\sigma_i = \vu_i\T(d\mW)\vv_i$. So such a constraint keeps the $i$-th
+singular value of the layer unchanged to first order. Bilinear constraints $\mU_k\T\bm{\Delta}\mV_k =
+\bm{0}$ additionally freeze the interactions between the top-$k$ singular pairs; one-sided constraints
+freeze a whole output (or input) subspace and leave the least room for learning. The repository
+builds protected directions from the top-$k$ singular triplets of the weights at the start of a
+stage (default) or of gradients accumulated on replayed old-task examples.
+
+\subsection{Algorithm and complexity}\label{sec:c11-mo-alg}
+
+\begin{algorithm}[t]
+\caption{One Muon-OGD step for a weight matrix (rank-one constraints, warm-started duals).}\label{alg:c11-muonogd}
+\begin{algorithmic}[1]
+\Require $\mW$, gradient $\mG$, momentum $\mM$, protected $\mC_i = \sigma_i\vu_i\vv_i\T$ ($i\le k$),
+duals $\bm{\lambda}$ (kept across steps), rates $\eta, \eta_\lambda$, dual iterations $T$
+\State $\mM \gets \mu\mM + \mG$ \Comment{optional momentum}
+\For{$\tau = 1,\dots,T$}
+  \State $\mS \gets \operatorname{msign}(\mM + \sum_i\lambda_i\mC_i)$ \Comment{Newton--Schulz}
+  \State $\lambda_i \gets \lambda_i - \eta_\lambda\,\sigma_i\vu_i\T\mS\vv_i$ for all $i$ \Comment{constraint violations}
+\EndFor
+\State $\mW \gets (1 - \eta\,\mathrm{wd})\mW - \eta\operatorname{msign}(\mM + \sum_i\lambda_i\mC_i)$
+\Ensure $\mW$, $\mM$, $\bm{\lambda}$. Cost $(T+1)$ matrix signs $+\ \bigO(kmn)$; state $\mM$, $k(m+n+1)$ factor numbers, $k$ duals
+\end{algorithmic}
+\end{algorithm}
+
+Each step costs $T+1$ matrix signs, i.e.\ $(T+1)K$ Newton--Schulz iterations of
+$\bigO(mn\min(m,n))$, plus $\bigO(kmn)$ to add the rank-one terms and evaluate the violations;
+with $T = 1$ it is about twice the optimizer cost of Muon, still small next to the forward and
+backward passes of a large batch. Extracting protected directions needs a truncated SVD once per
+stage. With $T = 1$ the constraints are met only approximately at each step; warm-starting the
+duals lets them accumulate across optimizer steps, so the duals act as a slowly updated memory of
+how strongly each protected direction is being pushed.
+
+\subsection{Implementation walkthrough}\label{sec:c11-mo-code}
+
+\begin{implnote}[title={In the code: what is in the snapshot}]
+\repo{jeremylu916__OSD} contains a runner, \code{llama-3B.sh}, three ``OSD'' training scripts
+(\code{train_coding_bigcodebench_OSD.py}, \code{train_math_OSD.py}, \code{train_medical_OSD.py}),
+three baseline scripts and a vLLM evaluation backend. The runner trains
+\code{unsloth/Llama-3.2-3B-Instruct} through three stages, coding $\to$ math $\to$ medical, and
+compares sequential AdamW fine-tuning, O-LoRA, a ``Sculpting Subspace'' baseline and Muon-OGD.
+But it calls scripts named \code{train_coding_bigcodebench_muon_ogd.py},
+\code{train_math_sft_svd.py}, \code{train_medical_muon_ogd.py} and \code{eval_*.py}, which are not
+in the snapshot, and every training script imports \code{MuonOGDOptimizer} from a missing module
+\code{muon_ogd_optimizer} (and a missing \code{chat_template_utils}). The runner selects that class
+(\code{--muon_use_optimizer_class}), so its exact update cannot be inspected. The scripts also
+contain a manual per-layer path, \code{_muon_ogd_apply_on_weight_factorized}, which we walk through.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak jeremylu916\_\_OSD/\allowbreak train\_math\_OSD.py} (\texttt{\_muon\_ogd\_apply\_on\_weight\_factorized}): dual ascent of \cref{eq:c11-mo-ascent} with rank-one constraints},label={lst:c11-osd-dual}]
+    for _ in range(T):
+        H = G_fp32.clone()
+        _add_rank1_shift_(H, Cs, lam)
+        S = _msgn(H, method=msign_method, ns_iters=ns_iters).to(torch.float32)
+        inner = _rank1_inner_products(Cs, S)  # (k,)
+        lam = lam - eta_dual * inner
+
+    H_final = G_fp32.clone()
+    _add_rank1_shift_(H_final, Cs, lam)
+    S_final = _msgn(H_final, method=msign_method, ns_iters=ns_iters).to(torch.float32)
+    Delta = (-eta) * S_final
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the update path}]
+Each protected direction is a \code{Rank1C(sigma, u, v)}; \code{_add_rank1_shift_} adds
+$\lambda_i\sigma_i\vu_i\vv_i\T$ to $\mH$ without forming a $k\times m\times n$ tensor, and
+\code{_rank1_inner_products} returns $\sigma_i\vu_i\T\mS\vv_i$, the violations in
+\cref{lst:c11-osd-dual}. \code{_extract_rank1_factors_from_matrix} takes the top-$k$ triplets with
+\code{torch.svd_lowrank} ($q = k + 8$, two power iterations) of either a snapshot of the
+reference model's weights (default; \code{--ci_model_id} points to the previous stage's output in
+the runner) or, with \code{--ci_from_grads}, of gradients summed over $128$ replayed old-task
+examples. The coding script also has \code{_muon_ogd_apply_bilinear} with constraints
+$\mU\T\bm{\Delta}\mV = \bm{0}$ and a $k\times k$ dual, updated as
+\code{lam = lam - eta_dual * U^T S V} with \code{S = msign(G + U lam V^T)}; the optimizer state
+the math script prepares for the missing class (\code{muon_uv}, a $k\times k$ \code{lam_uv})
+suggests that the class uses this bilinear form. Training is hybrid: Muon-OGD updates the
+selected 2-D weights (the runner selects \code{gate_proj,up_proj,down_proj}), AdamW updates
+everything else, gradient clipping applies only to the AdamW parameters, and weight decay of the
+Muon-OGD weights is applied by hand as $\mW \leftarrow (1-\eta\,\mathrm{wd})\mW$. The runner's
+defaults are $k = 3$, $T = 1$, $\eta = 10^{-6}$, $\eta_\lambda = 5\times10^{-5}$, momentum $0.95$,
+warm-started duals, and AdamW learning rate $5\times10^{-5}$.
+\end{implnote}
+
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/\allowbreak jeremylu916\_\_OSD/\allowbreak train\_math\_OSD.py} (\texttt{\_polar\_newton\_schulz}, tall case)},label={lst:c11-osd-ns}]
+    A = A / (frob + eps)
+
+    if m >= n:
+        Y = A
+        I = torch.eye(n, device=dev, dtype=torch.float32)
+        Z = I.clone()
+        for _ in range(iters):
+            ZY = Z @ Y.transpose(0, 1) @ Y
+            T = 0.5 * (3.0 * I - ZY)
+            Y = Y @ T
+            Z = T @ Z
+        P = Y
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the matrix sign is not the polar factor as written}]
+\code{_msgn} uses either an exact SVD (\code{U @ Vh}) or the coupled iteration of
+\cref{lst:c11-osd-ns} (default \code{"ns"}, $4$ iterations from the command line, $6$ as the
+function default). Unrolling it, $\mY_k = \mA\mZ_k$ and every matrix is a polynomial in
+$\mA\T\mA$, so per eigenvalue $x = \sigma^2$ of $\mA\T\mA$ the scalars obey
+$z \leftarrow \tfrac12 z(3 - z^3x)$, because $\mZ\mY\T\mY = \mZ^3\mA\T\mA$. The fixed point is
+$z = x^{-1/3}$, so the output's singular values tend to $\sigma z = \sigma^{1/3}$, not to $1$: the
+iteration converges to $\mU\tilde\mSigma^{1/3}\mV\T$ with $\tilde\mSigma$ the singular values of the
+Frobenius-normalized input. The classical iteration \cref{eq:c11-ns3} uses $\mY\T\mY$ in place of
+$\mZ\mY\T\mY$. We checked this by transcribing the update into NumPy (we did not run the
+repository's code): on a $64\times32$ Gaussian matrix the singular values after $4$ iterations lie
+in $[0.31, 0.65]$ and after $50$ iterations match $\tilde\sigma^{1/3}$ to $5\times10^{-9}$, with the
+singular vectors exact. The result still compresses the spectrum (it maps a condition number
+$\kappa$ to $\kappa^{1/3}$) and still has the right singular vectors, but it is not
+$\operatorname{msign}$, the constraint violations it feeds to the dual step are those of a
+different matrix, and the effective step is smaller than $\eta$. Whether the missing optimizer
+class uses this routine cannot be checked.
+\end{implnote}
+
+\subsection{Reference implementation}\label{sec:c11-mo-ref}
+
+\begin{lstlisting}[caption={Reference implementation (ours): a Muon step with Newton--Schulz orthogonalization and orthogonal protection, exact for one-sided subspaces and by dual ascent for general linear constraints},label={lst:c11-muonogd-ref}]
+import torch
+
+def newton_schulz(G, steps=20):
+    """msign(G) = U V^T over nonzero singular values; zero ones stay zero."""
+    X = G / (G.norm() + 1e-12)                 # singular values in (0, 1]
+    tall = X.shape[0] >= X.shape[1]
+    X = X if tall else X.T
+    I = torch.eye(X.shape[1], dtype=X.dtype)
+    for _ in range(steps):
+        X = 0.5 * X @ (3 * I - X.T @ X)        # sigma -> 1.5 sigma - 0.5 sigma^3
+    return X if tall else X.T
+
+def muon_step_projected(W, M, G, U=None, V=None, lr=0.02, mu=0.95):
+    """One-sided protection (Prop.): U^T dW = 0 (outputs) and/or dW V = 0 (inputs)."""
+    M.mul_(mu).add_(G)                         # momentum: memory of past gradients
+    H = M
+    if U is not None:
+        H = H - U @ (U.T @ H)                  # project out protected output subspace
+    if V is not None:
+        H = H - (H @ V) @ V.T                  # project out protected input subspace
+    W.sub_(lr * newton_schulz(H))              # exact constrained steepest step
+    return W, M
+
+def muon_ogd_step(W, M, G, Cs, lam, lr=0.02, lr_dual=0.05, T=1, mu=0.95):
+    """General constraints <C_i, dW> = 0 by dual ascent; lam is warm-started."""
+    M.mul_(mu).add_(G)
+    for _ in range(T):
+        H = M + sum(l * C for l, C in zip(lam, Cs))
+        S = newton_schulz(H)
+        viol = torch.stack([(C * S).sum() for C in Cs])  # dual gradient
+        lam = lam - lr_dual * viol
+    H = M + sum(l * C for l, C in zip(lam, Cs))
+    W.sub_(lr * newton_schulz(H))
+    return W, M, lam
+\end{lstlisting}
+
+\paragraph{Numerical checks.} Besides the results already quoted, NumPy confirms that cubic
+Newton--Schulz maps zero singular values to zero (error $7\times10^{-10}$ against $\mU_r\mV_r\T$ on a
+rank-$3$ $10\times6$ matrix), that both one-sided steps of \cref{prop:c11-onesided} satisfy their
+constraints to $10^{-15}$ and attain $-\eta\norm{\mP\mG}_*$, and that warm-started duals ($T = 50$
+per step) cut the violation from $0.23$ to about $0.01$--$0.02$ within five slowly drifting steps.
+
+\subsection{Reported results}\label{sec:c11-mo-results}
+
+\begin{results}
+\repofile{repos/jeremylu916__OSD/README.md} reports no numbers; the runner writes a summary file
+(\code{summary_mean_std_all.json}) that is not included. We therefore quote no numbers. The paper's
+abstract states that Muon-OGD consistently improves over sequential fine-tuning and over
+competitive orthogonal-gradient baselines while remaining computationally scalable. See the
+paper for numbers.
+\end{results}
+
+\subsection{Discussion}\label{sec:c11-mo-discussion}
+
+\paragraph{Strengths.} Muon-OGD states precisely what an update may and may not do: it is the best
+first-order step in the geometry that works well for matrices, among steps that do not touch
+protected directions. The dual view explains when projection is enough (one-sided subspaces,
+\cref{prop:c11-onesided}) and when it is not, and the dual variables can be warm-started so that
+the extra cost is one or two matrix signs per step.
+
+\paragraph{Limitations.} Protection is only first order: the constraints remove the linear term of
+\cref{eq:c11-taylor}, not the curvature term, so many small steps can still drift. Weight-SVD
+directions are a proxy for what old tasks need; gradient-based directions need replayed data.
+With $T = 1$ the constraints hold only approximately. The snapshot is incomplete and its default
+matrix-sign routine, as written, computes a different matrix function. Finally, the protected set
+faces the stability--plasticity dilemma again: if directions are accumulated over stages, the set
+grows and plasticity shrinks; if they are recomputed from the latest weights, as the repository
+does ($k$ per layer per stage), directions that mattered only for older tasks can drop out.
+
+\paragraph{Relations.} Muon-OGD is OGD \citep{c11-farajtabar2020ogd} in Muon's geometry; with
+input-side subspaces it reduces to GPM \citep{c11-saha2021gpm} plus orthogonalization. Its rank-one
+constraints from singular triplets connect to the low-rank structure that OLieRA and O-LoRA
+exploit, and the same constrained step could be used to write the slow levels of a CMS
+(\cref{sec:c11-hybrid}).
+
+% ===========================================================================
+\section{Multi-timescale hybridization}\label{sec:c11-hybrid}
+% ===========================================================================
+
+Hybrid models usually combine memories that differ in \emph{representation}, such as attention
+and a recurrent state (\cref{ch:hybrid}). The survey notes that they also differ in \emph{update
+timescale}: ``when integrated into larger architectures, these mechanisms create memory
+hierarchies in which activation states evolve at token-level granularity, explicit memory modules
+update at interaction or batch level, and backbone parameters remain frozen or adapt slowly''
+(\S V-A(d)). \Cref{tab:c11-timescales} lays out this hierarchy with the systems of this book, and
+\cref{fig:c11-tiers} draws it on a time axis.
+
+\begin{table}[t]
+\centering\small
+\caption{A memory hierarchy ordered by update period (one unit = one token).}
+\label{tab:c11-timescales}
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}Xl@{}}
+\toprule
+Tier & Component (written by) & Update period and persistence & See \\
+\midrule
+Token-level activation & KV cache (append); recurrent state (gated delta rule) & every token; window or decay $1/(1-\alpha)$ & Ch.~\ref{ch:linear}, \ref{ch:delta} \\
+Interaction-level explicit & Titans memory (surprise-gated gradient steps); self-modifying memories & every token or chunk ($C_o$, $C_m$); within an episode & Ch.~\ref{ch:ttt}; \S\ref{sec:c11-nested} \\
+ & TTT-E2E fast weights (next-token gradient steps on the context) & every mini-batch of context tokens; within an episode & Ch.~\ref{ch:ttt} \\
+ & CMS levels & every $C^{(\ell)}$ tokens; until overwritten & \S\ref{sec:c11-nested} \\
+Slow backbone & pre-trained weights; continual fine-tuning (OLieRA, Muon-OGD) & per training batch, per task, or never; long-term & \S\ref{sec:c11-olieRA}, \ref{sec:c11-muonogd} \\
+Optimizer & momentum, second moment, M3 slow momentum & every step, or every \code{slow\_chunk} steps; $1/(1-\beta)$ steps & \S\ref{sec:c11-optmem} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize, >=Stealth]
+  \draw[->, gray] (0,0) -- (13.2,0) node[right, black] {tokens};
+  \foreach \x/\lab in {0/{$1$}, 3/{$10^2$}, 6/{$10^4$}, 9/{$10^6$}, 12/{$10^8$}} {
+    \draw[gray] (\x,0.08) -- (\x,-0.08); \node[below, gray] at (\x,-0.08) {\lab};
+  }
+  \fill[blue!25] (0,0.35) rectangle (3.6,0.75);   \node[anchor=west] at (0.05,0.55) {KV cache / recurrent state};
+  \fill[teal!30] (0.9,0.95) rectangle (6.3,1.35);   \node[anchor=west] at (0.95,1.15) {Titans / TTT-E2E / self-mod.\ memories};
+  \fill[orange!30] (1.2,1.55) rectangle (8.4,1.95); \node[anchor=west] at (1.25,1.75) {CMS levels $C^{(1)}, \dots, C^{(k)}$};
+  \fill[red!20] (7.5,2.15) rectangle (13.0,2.55);   \node[anchor=west] at (7.55,2.35) {backbone (OLieRA, Muon-OGD)};
+\end{tikzpicture}
+\caption{Schematic span of the tiers of \cref{tab:c11-timescales} on a logarithmic token axis
+(from update period to retention horizon). The positions are illustrative, not measured.}
+\label{fig:c11-tiers}
+\end{figure}
+
+\paragraph{The known systems as nested levels.} In the language of \cref{def:c11-frequency}, Titans
+has three levels: attention over a window (non-parametric, every token), the neural memory
+(\cref{eq:c11-titans}, every token, forgetting at rate $\alpha_t$), and the projections and
+persistent-memory tokens (written in pre-training only). TTT-E2E \citep{tandon2025ttte2e} has two:
+a sliding-window Transformer that ``continues learning at test time via next-token prediction on
+the given context, compressing the context it reads into its weights'' (inner level, one step per
+mini-batch of context), and a meta-learned initialization trained ``via meta-learning at training
+time'' (outer level, one step per training batch). HOPE fills the gap between them with CMS levels,
+so that information can be held for hundreds or thousands of tokens in parameters that are
+neither reset with the episode nor frozen. OLieRA and Muon-OGD act at the slowest tier, where
+writes are rare but must not erase.
+
+\paragraph{How long does each tier remember?} By \cref{eq:c11-horizon}, a state with decay $\alpha$
+per token remembers about $1/(1-\alpha)$ tokens, and a memory written every $C$ tokens with
+retention $\beta$ per write about $C/(1-\beta)$ tokens ($C = 128$, $\beta = 0.99$: about $12{,}800$).
+Without decay, interference from later writes, not decay, sets the horizon.
+
+\paragraph{Design rules.} Putting the chapter together suggests five rules for multi-timescale
+memory. (1) \emph{Separate timescales explicitly}, by update period and by decay, rather than
+letting one memory serve all horizons. (2) \emph{Let slow levels average}: chunk sums
+(\cref{eq:c11-cms-update}) and slow momenta (M3) filter out token-level noise. (3) \emph{Gate writes}
+by a surprise signal, as Titans and the reproduction's surprise threshold do, so that slow levels
+are written only when there is something to learn. (4) \emph{Constrain the geometry of slow
+writes}, because slow levels hold long-lived knowledge; the constrained steps of OLieRA and
+Muon-OGD are candidates for writing slow CMS levels. (5) \emph{Decide reset policy per tier}: which
+levels are per-episode, per-user or global is the ``consistency across episodes'' question of
+the survey (\S IV-E(d)), and it determines what an online memory may leak or forget.
+
+% ===========================================================================
+\section{Comparison and discussion}\label{sec:c11-comparison}
+% ===========================================================================
+
+\Cref{tab:c11-compare} compares the three systems. They answer different halves of the chapter's
+question: Nested Learning decides \emph{when} each part of a model is written; OLieRA and
+Muon-OGD decide \emph{how} a write may move the parameters. They are complementary rather than
+competing. The survey's open problems frame what is missing (\S VI-B, \S VI-C): update protocols
+that are stable over long horizons, modular isolation of what each write may touch, consolidation
+that moves knowledge from fast to slow levels, and update rules that are diagnosable and, where
+needed, reversible. None of the three systems has yet been tested at the scale or with the
+openness (official code, released checkpoints) of the recurrent and test-time-training models in
+\cref{ch:delta,ch:ttt}.
+
+\begin{table}[t]
+\centering\small
+\caption{The three systems of this chapter.}
+\label{tab:c11-compare}
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & Nested Learning / HOPE & OLieRA & Muon-OGD \\
+\midrule
+What is written & self-modifying Titans memories; CMS MLP levels & low-rank multiplicative adapters, merged into backbone & backbone weight matrices \\
+When & online: every token or chunk; level $\ell$ every $C^{(\ell)}$ tokens & offline, task by task & offline, stage by stage, every optimizer step \\
+Update rule & gradient of a local (teach-signal) objective, delta-rule preconditioner & $\mW \leftarrow \mW\had\exp(\mB\mA)$ & $-\eta\operatorname{msign}(\mG + \sum_i\lambda_i\mC_i)$ \\
+Protection of old content & timescale separation, decay, chunk averaging & orthogonality across task subspaces; sign-preserving updates & linear non-interference constraints in spectral geometry \\
+Extra cost & per-token memory updates; buffers of $C^{(\ell)}$ tokens & forming $\mW_{\text{eff}}$: $\bigO(mnr)$ per step & $T+1$ matrix signs per step \\
+Code & unofficial reproduction & none & probably official, incomplete \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Writable parametric memory raises two questions: how often each parameter group is written
+  (its \emph{frequency}) and how a write may move parameters without erasing old content (its
+  \emph{geometry}). Forgetting is a first-order term $\nabla\loss_j\T\bm{\Delta}$ plus curvature
+  (\cref{eq:c11-taylor}).
+  \item Every stateful component is an associative memory with a frequency and a decay: gradient
+  descent writes input--error outer products, momentum is a decaying memory of gradients, Adam has
+  two timescales.
+  \item \textbf{Nested Learning} orders components into levels by update frequency; the
+  \textbf{Continuum Memory System} chains MLP levels written every $C^{(\ell)}$ tokens with chunk sums
+  of error terms, exactly parallel within a chunk (\cref{prop:c11-cms-chunk}); \textbf{HOPE} =
+  self-modifying Titans + CMS. Only an unofficial, mechanism-level reproduction exists.
+  \item \textbf{OLieRA} writes each task as $\mW \leftarrow \mW\had\exp(\mB\mA)$ in the Hadamard Lie
+  group with orthogonality across tasks: sign-preserving, order-independent, full additive rank from
+  $r(m+n)$ parameters. No code; our formalization.
+  \item \textbf{Muon-OGD} takes the spectral-norm steepest step subject to $\inner{\mC_i}{\bm{\Delta}} = 0$,
+  by dual ascent on $-\eta\norm{\mG + \sum_i\lambda_i\mC_i}_*$ with Newton--Schulz; one-sided
+  constraints give $-\eta\operatorname{msign}(\mP\mG)$ (\cref{prop:c11-onesided}). The probably-official
+  code is incomplete, and its default Newton--Schulz variant, as written, converges to
+  $\mU\tilde\mSigma^{1/3}\mV\T$, not $\mU\mV\T$.
+  \item Multi-timescale hybrids stack token-level states, interaction-level explicit memories and a
+  slow backbone (\cref{tab:c11-timescales}); timescale separation and constrained geometry are
+  complementary defences against the stability--plasticity dilemma.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+\addcontentsline{toc}{section}{Exercises}
+
+\begin{exercise}[Momentum as a memory]\label{exr:c11-momentum}
+(a) Verify \cref{eq:c11-momentum-obj}. (b) Show that Adam's first moment
+$\vm_t = \beta_1\vm_{t-1} + (1-\beta_1)\vg_t$ is one gradient step on
+$\ell_t(\vm) = \tfrac12\norm{\vm - \vg_t}^2$ with rate $1-\beta_1$, and compute its mean lag with
+\cref{eq:c11-horizon}. (c) M3 (\cref{lst:c11-m3}) adds a slow momentum refreshed every $C$ steps
+from the sum of the last $C$ gradients. Write its impulse response (the weight a gradient from
+$s$ steps ago receives in the update) and compare the two timescales.
+\end{exercise}
+
+\begin{exercise}[Spectral steepest descent]\label{exr:c11-spectral}
+(a) Prove $\abs{\vu\T\bm{\Delta}\vv} \le \norm{\bm{\Delta}}_2$ for unit $\vu,\vv$ and complete the proof
+of \cref{eq:c11-nuclear}. (b) Find a $2\times2$ matrix $\mG$ and a single constraint matrix $\mC$
+such that $\inner{\mC}{\mP\mG} = 0$ but $\inner{\mC}{\operatorname{msign}(\mP\mG)} \neq 0$, where
+$\mP$ is the Frobenius projector onto $\mC^\perp$. (c) For two-sided constraints
+$\mU\T\bm{\Delta} = \bm{0}$ \emph{and} $\bm{\Delta}\mV = \bm{0}$, show that
+$-\eta\operatorname{msign}((\mI-\mU\mU\T)\mG(\mI-\mV\mV\T))$ is optimal.
+\end{exercise}
+
+\begin{exercise}[Newton--Schulz]\label{exr:c11-ns}
+(a) Show that the scalar map $\varphi(\sigma) = \tfrac32\sigma - \tfrac12\sigma^3$ sends
+$(0,\sqrt3)$ into $(0, 1]$ after one step from any $\sigma \in (0,1]$ and converges quadratically
+to $1$. Estimate how many steps a singular value $\sigma = 10^{-3}$ needs. (b) For the coupled
+iteration of \cref{lst:c11-osd-ns}, prove that $\mY_k = \mA\mZ_k$, derive the scalar recursion
+$z \leftarrow \tfrac12z(3 - z^3x)$, and show that its fixed point $x^{-1/3}$ is attracting
+($\abs{\text{derivative}} = \tfrac12$). Modify one line so that the iteration converges to the polar
+factor.
+\end{exercise}
+
+\begin{exercise}[Lie groups]\label{exr:c11-lie}
+(a) Show that $\det\exp(\mA) = e^{\tr\mA}$ for diagonalizable $\mA$, and conclude that $\exp$ maps
+skew-symmetric matrices into $\mathrm{SO}(n)$. (b) Compute $\exp(\mA) - \operatorname{cay}(\mA)$ to
+third order. (c) In the Hadamard group, prove $\rank(\mW\had\mB\mA) \le r\,\rank(\mW)$ using
+$\mW\had(\vb\va\T) = \diag(\vb)\mW\diag(\va)$. (d) Propose an orthogonality penalty for
+multiplicative adapters that does imply first-order non-interference on a stored set of old
+inputs $\{\vx\}$, and give its cost.
+\end{exercise}
+
+\begin{exercise}[Coding: forgetting across timescales]\label{exr:c11-coding}
+Using \cref{lst:c11-cms-ref}, build a one-layer CMS with periods $(1, 16, 256)$ that is trained
+online to map random keys to values (error signal $\bm{\delta}_t = \hat\vy_t - \vv_t$). Stream $5000$
+pairs from association set A, then $5000$ from set B. Measure the recall error on A over time for
+(i) the full CMS, (ii) only the fastest level, (iii) only the slowest level. Then replace the plain
+SGD write of the slowest level by the input-side projected Muon step of
+\cref{lst:c11-muonogd-ref}, protecting the top-$4$ principal directions of the A keys, and repeat.
+\end{exercise}
+
+\begin{exercise}[Dual ascent]\label{exr:c11-dual}
+Implement \code{muon_ogd_step} from \cref{lst:c11-muonogd-ref} in NumPy with an exact SVD-based
+$\operatorname{msign}$. For random $64\times32$ $\mG$ and $k = 4$ random constraints, plot the
+violation $\max_i\abs{\inner{\mC_i}{\bm{\Delta}}}$ and the duality gap against $T$ for several dual
+steps $\eta_\lambda$. Then warm-start $\bm{\lambda}$ with $T = 1$ over slowly drifting gradients
+$\mG_s = \mG + 0.05\,\mathbf{N}_s$ ($\mathbf{N}_s$ Gaussian) and report when the violation falls
+below $10^{-3}$.
+\end{exercise}

@@ -1,3 +1,1906 @@
 \chapter{Adaptive Memory Routing and Memory Management}\label{ch:routing}
 
-(Chapter in preparation.)
+The hybrids of \cref{ch:hybrid} combine two kinds of working memory: a recurrent state of fixed size
+(\cref{ch:linear,ch:delta}) and a softmax-attention KV cache that grows with every token
+(\cref{ch:foundations}). They make the split once, at design time. Some layers or heads are attention
+and the rest are recurrent, often in a ratio such as $3{:}1$. Two questions are left open. First,
+\emph{which tokens} need the expensive, high-resolution memory? A fixed layout sends every token
+through the attention layers and writes every token into their caches, although most tokens are
+predicted well by the cheap recurrent path. Second, once something is in working memory, \emph{how
+should that memory be managed}? A cache entry can be stored in fewer bits, a recurrent state can be
+copied and kept for later, and a stored entry can be rewritten after the model has seen more.
+
+This chapter covers both questions and has two halves. \textbf{Part A} (adaptive routing) covers
+systems that decide per token which memory pathway is used. AMOR~\citep{zheng2026amor} runs a
+recurrent language model and turns on an attention refinement only where the model's own predictive
+entropy is high. HAM~\citep{lufkin2026ham} lets a recurrent state see every token, but writes into a
+KV cache only the tokens the recurrent state predicts poorly. The survey~\citep{zhoubian2026memory}
+calls this signal-gated routing an emerging direction in hybrid design: the question is not only
+\emph{where} attention sits, but \emph{which tokens} receive high-resolution storage or refinement.
+\textbf{Part B} (memory management) treats the working memory itself as something to engineer.
+CommVQ~\citep{li2025commvq} vector-quantizes the KV cache to one or two bits per channel, using a
+codebook that commutes with the rotary position embedding. Memory Caching~\citep{behrouz2026memorycaching}
+keeps snapshots of a recurrent memory at segment boundaries, so a recurrent model's memory grows
+with the sequence. Bottlenecked Transformers~\citep{oomerjee2026bottlenecked} rewrite KV entries in
+place at reasoning-step boundaries, a form of consolidation.
+
+\paragraph{Roadmap.} \Cref{sec:c13-signals} builds the background for Part A: predictive entropy,
+surprise and prediction error, admission and eviction policies, and how to train through hard
+decisions. \Cref{sec:c13-amor,sec:c13-ham} cover AMOR and HAM. \Cref{sec:c13-mgmt-bg} builds the
+background for Part B: the size of the KV cache, scalar and vector quantization (codebooks, $k$-means,
+EM, residual and additive VQ), a recap of RoPE and why quantization must respect it, and
+checkpointing a recurrent state. \Cref{sec:c13-commvq,sec:c13-mc,sec:c13-bottleneck} cover CommVQ,
+Memory Caching and Bottlenecked Transformers. \Cref{sec:c13-compare} compares the five systems.
+
+% ===========================================================================
+\section{Background I: signals and policies for adaptive memory}\label{sec:c13-signals}
+% ===========================================================================
+
+\subsection{What a hybrid layer costs}\label{sec:c13-cost}
+
+Recall the two working memories. A softmax-attention head keeps every past key and value. At step
+$t$ its cache holds $t$ keys $\vk_s\in\R^{d_k}$ and $t$ values $\vv_s\in\R^{d_v}$, and producing one
+output costs $\bigO(t(d_k+d_v))$ multiply-adds. A linear-attention or delta-rule head keeps a matrix
+$\mS_t\in\R^{d_v\times d_k}$, so its memory and per-token cost are $\bigO(d_kd_v)$, independent of $t$.
+Consider a model with $L$ layers, of which a fraction $\rho$ are attention layers with $H_{kv}$ key-value
+heads each, and the rest are recurrent layers with $H$ heads. With $b$ bytes per stored number, the
+memory after $T$ tokens is
+\begin{equation}\label{eq:c13-hybrid-mem}
+  \underbrace{\rho L \cdot 2\,T\,H_{kv}\,d_k\cdot b}_{\text{KV caches, grows with }T}
+  \;+\; \underbrace{(1-\rho)L\cdot H\,d_k d_v\cdot b}_{\text{recurrent states, constant}},
+\end{equation}
+where we took $d_v=d_k$ in the KV term. A fixed-ratio hybrid (\cref{ch:hybrid}) lowers $\rho$, but
+every attention layer still pays for all $T$ tokens. An \emph{adaptive} design replaces $T$ in the
+first term by the number of tokens actually admitted, $N_T=\sum_{t\le T} g_t$, where $g_t\in\{0,1\}$ is
+a per-token decision. A design that saves compute but not memory instead replaces the per-token
+attention cost $\bigO(t\,d_k)$ by $g_t\cdot\bigO(t\,d_k)$. AMOR is of the second kind and HAM of the
+first, and the decision $g_t$ is the subject of this section.
+
+\subsection{Predictive entropy}\label{sec:c13-entropy}
+
+A language model ends each position with logits $\vz_t\in\R^{\abs{\mathcal{V}}}$ and the next-token
+distribution $\vec{p}_t=\softmax(\vz_t)$. The \emph{entropy} of this distribution~\citep{c13-shannon1948} is
+\begin{equation}\label{eq:c13-entropy}
+  \mathrm{H}(\vec{p}_t) = -\sum_{i=1}^{\abs{\mathcal{V}}} p_{t,i}\log p_{t,i}
+  \qquad(\text{with } 0\log 0 \defeq 0).
+\end{equation}
+It is the \emph{expected surprise}: if the next token $x_{t+1}$ is drawn from $\vec{p}_t$, then
+$\E[-\log p_{t,x_{t+1}}]=\mathrm{H}(\vec{p}_t)$. It measures how unsure the model is \emph{before} it sees
+the token, so a model can use it at inference time to decide how much work to spend on position~$t$.
+
+\paragraph{Bounds and normalization.} Each term $-p\log p$ is non-negative for $p\in[0,1]$, so
+$\mathrm{H}\ge 0$, with equality only for a one-hot distribution. For the upper bound, use Jensen's inequality on the
+concave function $\log$:
+\[
+  \mathrm{H}(\vec{p}) = \sum_i p_i \log\frac{1}{p_i} \le \log\Bigl(\sum_i p_i\cdot\frac{1}{p_i}\Bigr)
+  = \log \abs{\{i: p_i>0\}} \le \log\abs{\mathcal{V}},
+\]
+with equality for the uniform distribution. Dividing by $\log\abs{\mathcal{V}}$ therefore gives a
+\emph{normalized entropy} $\bar{\mathrm{H}}_t = \mathrm{H}(\vec{p}_t)/\log\abs{\mathcal{V}}\in[0,1]$, which can be compared
+across vocabularies and is what AMOR thresholds.
+
+\begin{example}[A four-token vocabulary]\label{ex:c13-entropy}
+Let $\abs{\mathcal{V}}=4$ and $\vec{p}=(0.7,0.1,0.1,0.1)$. Then
+$\mathrm{H}=-0.7\log 0.7-3\cdot 0.1\log 0.1 = 0.2497+0.6908=0.9404$ nats, and $\log 4=1.3863$, so
+$\bar{\mathrm{H}}=0.678$. For the two-way tie $\vec{p}=(0.4,0.4,0.1,0.1)$ we get $\mathrm{H}=1.1935$ and
+$\bar{\mathrm{H}}=0.861$. The tie is ``more uncertain'' even though its top probability is only a little lower.
+Entropy looks at the whole distribution, not only at the top probability.
+\end{example}
+
+\paragraph{Computing it stably.} Write $\log p_i = z_i-\operatorname{lse}(\vz)$ with
+$\operatorname{lse}(\vz)=\log\sum_j e^{z_j}$. Substituting into \eqref{eq:c13-entropy},
+\begin{equation}\label{eq:c13-entropy-lse}
+  \mathrm{H}(\vec{p}) = -\sum_i p_i\bigl(z_i-\operatorname{lse}(\vz)\bigr) = \operatorname{lse}(\vz)-\sum_i p_i z_i,
+\end{equation}
+because $\sum_i p_i=1$. The log-sum-exp is computed with the usual max-shift, and no $\log 0$ appears.
+In practice the logits are cast to fp32 first, because $\abs{\mathcal{V}}$ is large and low-precision
+sums lose accuracy.
+
+\paragraph{What it costs.} The entropy needs the full logit vector, i.e.\ a product with the
+$\abs{\mathcal{V}}\times d$ output matrix. For $d=768$ and $\abs{\mathcal{V}}=128256$ (the AMOR 180M
+configuration, \cref{sec:c13-amor}) this is $768\cdot 128256\approx 9.85\times 10^{7}$ multiply-adds per
+token. One attention read over $t$ cached tokens costs about $2td$ multiply-adds, so the gate costs more
+than the attention it may skip unless the context is longer than about $64{,}000$ tokens. AMOR's answer, a small
+fitted network that predicts the entropy, appears in \cref{sec:c13-amor-router}.
+
+\paragraph{Uncertainty is not the same as need.} High entropy has two sources. The model may lack
+information that is present in the context (it ``forgot'' a name seen 2000 tokens ago). This
+uncertainty can be reduced by looking back. Or the next token may be genuinely unpredictable (the
+first word of a new sentence). This uncertainty cannot be reduced by any amount of memory. The
+entropy signal cannot tell the two apart. Systems that gate on it accept some wasted refinement on the
+second kind.
+
+\subsection{Surprise and prediction error}\label{sec:c13-surprise}
+
+Entropy is a property of a prediction. \emph{Surprise} is a property of an outcome: once $x_{t+1}$ is
+known, its surprise is $-\log p_{t,x_{t+1}}$. The same idea applies inside a memory. An associative
+memory $\mS_{t-1}$ ``predicts'' the value of a new key as $\hat{\vv}_t=\mS_{t-1}\vk_t$. The
+\emph{prediction error}, or innovation,
+\begin{equation}\label{eq:c13-innovation}
+  \ve_t = \vv_t-\mS_{t-1}\vk_t ,
+\end{equation}
+is the part of the new association the memory does not already contain. This is exactly the quantity
+the delta rule writes (\cref{ch:delta}): with write strength $\beta_t$,
+$\mS_t=\mS_{t-1}+\beta_t\ve_t\vk_t\T$. If we model the value as Gaussian around the memory's
+prediction, $\vv_t\sim\mathcal{N}(\mS_{t-1}\vk_t,\sigma^2\mI)$, then
+\[
+  -\log p(\vv_t\mid\vk_t) = \frac{\norm{\ve_t}^2}{2\sigma^2} + \frac{d_v}{2}\log(2\pi\sigma^2),
+\]
+so the squared prediction error \emph{is} the surprise up to an affine map. A scale-free version that
+does not depend on the size of $\vv_t$ is the normalized error
+\begin{equation}\label{eq:c13-normerr}
+  \varepsilon_t = \frac{\norm{\vv_t-\mS_{t-1}\vk_t}^2}{\norm{\vv_t}^2+\epsilon}.
+\end{equation}
+$\varepsilon_t=0$ means the memory already recalls $\vv_t$ perfectly, and $\varepsilon_t\approx 1$ means it
+recalls nothing useful (for example, $\mS_{t-1}\vk_t\approx\bm{0}$). Titans (\cref{ch:ttt}) uses the
+gradient of such an error to modulate parametric writes. HAM (\cref{sec:c13-ham}) uses it to decide
+which tokens deserve an exact copy in a KV cache.
+
+\subsection{Admission and eviction policies}\label{sec:c13-policies}
+
+Let the store after step $t$ be a set of positions $\mathcal{C}_t\subseteq\{1,\dots,t\}$ whose
+keys and values are kept. A \emph{policy} decides how $\mathcal{C}_t$ evolves. Two kinds of decisions
+are useful to separate.
+\begin{itemize}
+  \item An \textbf{admission} decision is made once, when token $t$ is written:
+        $\mathcal{C}_t=\mathcal{C}_{t-1}\cup\{t\}$ if $g_t=1$ and $\mathcal{C}_t=\mathcal{C}_{t-1}$ otherwise.
+        A token that is not admitted can never be recalled exactly later, although a summary
+        of it may survive in a recurrent state.
+  \item An \textbf{eviction} decision removes an entry already in the store, usually because a
+        budget $\abs{\mathcal{C}_t}\le B$ is exceeded.
+\end{itemize}
+Classical cache policies are eviction policies: FIFO (a sliding window), least-recently-used, and the
+offline optimum of \citet{c13-belady1966}, which evicts the entry whose next use is furthest in the
+future and is therefore not implementable online. LLM-specific policies keep a few initial ``attention
+sink'' tokens plus a recent window~\citep{xiao2023streamingllm}, or keep ``heavy hitters'' with large
+accumulated attention~\citep{c13-zhang2023h2o}. The survey (Table~II) lists admission, eviction and
+consolidation as one update-rule family, with ``irreversible loss and retrieval bias'' as its main
+risk~\citep{zhoubian2026memory}.
+
+\paragraph{Threshold policies and budget control.} The simplest admission policy compares a score
+$s_t$ with a threshold: $g_t=\mathbf{1}[s_t>\tau]$. The expected number of admitted tokens is
+\begin{equation}\label{eq:c13-expected-cache}
+  \E\bigl[\abs{\mathcal{C}_T}\bigr] = \sum_{t=1}^{T}\Pr(s_t>\tau),
+\end{equation}
+so $\tau$ directly controls the growth rate of the cache: if the scores are identically distributed,
+the cache grows like $rT$ with \emph{admission rate} $r=\Pr(s>\tau)$. To hit a target rate $r$, choose
+$\tau$ as the $(1-r)$-quantile of the score distribution. Quantiles drift during training, so systems
+track them with an exponential moving average (EMA). AMOR uses the median plus a multiple of the
+standard deviation. If the scores were Gaussian, $s\sim\mathcal{N}(\mu,\sigma^2)$, then the median is
+$\mu$ and $\tau=\mu+\kappa\sigma$ gives
+\begin{equation}\label{eq:c13-fire-rate}
+  r = \Pr\Bigl(\frac{s-\mu}{\sigma}>\kappa\Bigr) = 1-\Phi(\kappa),
+\end{equation}
+with $\Phi$ the standard normal CDF. For $\kappa=0.2$ this is $r\approx 0.42$. A small NumPy
+simulation of the EMA tracker (in our scratch space) settles at the same value. Real entropy
+distributions are skewed, so this is a guide, not a guarantee.
+
+\subsection{Training through hard decisions}\label{sec:c13-hard}
+
+The indicator $\mathbf{1}[s>\tau]$ has zero derivative almost everywhere, so a gate cannot be learned
+by plain backpropagation. Four standard responses appear in this chapter.
+\begin{enumerate}
+  \item \textbf{Detach the gate.} Treat $g_t$ as a constant and train only the computation it
+        selects. Gradients reach the model through the outputs it gates, not through the decision.
+        AMOR does this.
+  \item \textbf{Straight-through estimator}~\citep{c10-bengio2013ste}. Use the hard value in the
+        forward pass and pretend it was the identity (or a sigmoid) in the backward pass:
+        $y = y_{\text{hard}} + y_{\text{soft}} - \operatorname{sg}(y_{\text{soft}})$, where $\operatorname{sg}$
+        stops the gradient. The forward value is $y_{\text{hard}}$ and the gradient is that of $y_{\text{soft}}$.
+  \item \textbf{Gumbel-softmax}~\citep{c10-jang2017gumbel,c10-maddison2017concrete}. To sample a
+        category from probabilities $\pi_1,\dots,\pi_K$, add independent Gumbel noise
+        $\gamma_i=-\log(-\log u_i)$, $u_i\sim\mathrm{U}(0,1)$, and take $\argmax_i(\log\pi_i+\gamma_i)$.
+        This is an exact sample. The relaxation replaces the $\argmax$ by
+        $\softmax((\log\pi+\vec{\gamma})/\tau_g)$, which is differentiable and tends to a one-hot vector
+        as $\tau_g\to 0$. The ``hard'' variant combines it with the straight-through trick. CommVQ
+        trains its value encoder this way.
+  \item \textbf{No gradient needed.} If the score is a fixed function of quantities that are trained
+        anyway (an entropy or a prediction error) and $\tau$ is a hyperparameter, nothing about the
+        gate itself needs to be learned. Only the threshold has to be chosen.
+\end{enumerate}
+
+% ===========================================================================
+\section{AMOR: entropy-gated attention refinement}\label{sec:c13-amor}
+% ===========================================================================
+
+\subsection{Motivation}
+
+A recurrent language model such as Mamba-2 or Gated DeltaNet (\cref{ch:linear,ch:delta}) is cheap
+and handles most tokens well, but its fixed-size state cannot recall an arbitrary detail exactly
+(\cref{ch:hybrid}). Fixed hybrids fix this by putting attention in some layers for \emph{every}
+token. AMOR~\citep{zheng2026amor}, the Adaptive Metacognitive Output Router, takes the view of
+dual-process theories of cognition~\citep{c13-kahneman2011}: a fast system handles routine input, and
+a slow, deliberate system is engaged only when the fast one signals difficulty. The fast system is a
+complete recurrent language model. The slow system is a small stack of causal attention blocks placed
+\emph{after} the backbone. The ``metacognitive'' signal is the normalized entropy of the model's own
+next-token prediction (\cref{sec:c13-entropy}). In the survey's words, AMOR appends ``post-hoc attention
+refinement blocks to a recurrent backbone'' and activates them ``only for positions with high
+normalized output entropy''~\citep{zhoubian2026memory}.
+
+\begin{pitfall}[title={Which version of AMOR? Provenance of the code}]
+The mirrored repository \repo{HaoranZhengRaul__AMOR} is on the first author's GitHub account, but
+its README does not cite the paper and may follow a revised version. An earlier arXiv version of the
+paper was titled ``Entropy-Based Metacognitive Gate for Dynamic SSM-Attention Switching'' and
+described ``Ghost KV'': keys and values projected from the SSM \emph{hidden states}, reusing the
+backbone's linear-time computation. The README states instead that ``K, V are standard linear
+projections of the residual stream --- not SSM internal state'' (\repofile{repos/HaoranZhengRaul__AMOR/README.md}).
+This chapter follows the code. The gating mechanism is the same in both descriptions.
+\end{pitfall}
+
+\begin{taxonomy}
+\textbf{Representation:} implicit; the memory is the backbone's recurrent state plus the KV
+caches of the AMOR attention blocks. \textbf{Update dynamics:} online. \textbf{Persistence:} long-term
+(survey Table~I lists AMOR as ``Entropy-Gated Attention Refinement'', online, long-term).
+\textbf{Update rule:} signal-gated routing (survey Table~II): an uncertainty signal decides whether the
+expensive memory path is activated~\citep{zhoubian2026memory}. Note that AMOR gates the \emph{read}
+(whether attention runs), not the write: as we will see, every token's key and value is still stored.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c13-amor-form}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,
+  box/.style={draw,rounded corners=2pt,minimum height=7mm,align=center,inner sep=3pt},
+  op/.style={draw,circle,inner sep=1pt,minimum size=5mm}]
+\node[box] (bb) at (0,0.3) {recurrent\\backbone};
+\node[box] (hin) at (2.0,0.3) {$\hat{\vh}_t$};
+\node[box] (lm) at (4.2,1.3) {LM head $\mW_E$\\(no gradient)};
+\node[box] (ent) at (6.8,1.3) {$\bar{\mathrm{H}}_t$};
+\node[box] (g) at (9.3,1.3) {$g_t=\mathbf{1}[\bar{\mathrm{H}}_t>\tau]$};
+\node[box] (att) at (5.0,-0.6) {causal attention\\$\mQ,\mK,\mV$ from $\hat{\vh}$, RoPE};
+\node[op] (mul) at (9.3,-0.6) {$\times$};
+\node[op] (add) at (10.6,-0.6) {$+$};
+\node[box] (out) at (12.4,-0.6) {next block\\or LM head};
+\draw[->] (bb) -- (hin);
+\draw[->] (hin) |- (lm);
+\draw[->] (hin) |- (att);
+\draw[->] (lm) -- (ent);
+\draw[->] (ent) -- (g);
+\draw[->] (g) -- (mul);
+\draw[->] (att) -- (mul);
+\draw[->] (mul) -- node[above]{$\valpha\had$} (add);
+\draw[->] (add) -- (out);
+\draw[->] (hin.south) -- (2.0,-1.7) -| (add.south);
+\end{tikzpicture}
+\caption{One AMOR block. The block reads the normalized residual stream, measures the normalized
+entropy of the prediction the LM head would make from it, and adds an attention update only where
+the entropy exceeds a running threshold. $K$ such blocks are stacked after the backbone.}
+\label{fig:c13-amor}
+\end{figure}
+
+\paragraph{Backbone.} Token embeddings pass through $N$ backbone blocks, each a recurrent mixer
+(Mamba-2 or Gated DeltaNet) followed by a pre-norm SwiGLU MLP. Call the result $\vh_t\in\R^d$. In the
+default (\code{classic}) residual mode it is normalized once, $\vh^{(0)}_t=\RMSNorm_f(\vh_t)$.
+
+\paragraph{The entropy gate.} AMOR block $i\in\{1,\dots,K\}$ reads a normalized stream
+$\hat{\vh}^{(i)}_t$ (equal to $\vh^{(0)}_t$ for $i=1$ and to $\RMSNorm_i(\vh^{(i-1)}_t)$ for $i>1$). It
+applies the tied LM head $\mW_E\in\R^{\abs{\mathcal{V}}\times d}$ (the embedding matrix) and measures
+the normalized entropy of the resulting distribution:
+\begin{equation}\label{eq:c13-amor-entropy}
+  \vz^{(i)}_t = \mW_E\,\hat{\vh}^{(i)}_t,\qquad
+  \bar{\mathrm{H}}^{(i)}_t = \frac{\mathrm{H}\bigl(\softmax(\vz^{(i)}_t)\bigr)}{\log\abs{\mathcal{V}}}\in[0,1].
+\end{equation}
+This is the ``logit lens'': the prediction the model would make if it stopped at this point. The
+gate compares it with a threshold that tracks the entropy distribution during training,
+\begin{align}
+  \bar\mu^{(i)} &\leftarrow m\,\bar\mu^{(i)} + (1-m)\,\operatorname{median}_{\text{batch}}\bar{\mathrm{H}}^{(i)},\qquad
+  \bar\sigma^{(i)} \leftarrow m\,\bar\sigma^{(i)} + (1-m)\,\operatorname{std}_{\text{batch}}\bar{\mathrm{H}}^{(i)},\label{eq:c13-amor-ema}\\
+  \tau^{(i)} &= \bar\mu^{(i)} + \kappa\,\bar\sigma^{(i)},\qquad
+  g^{(i)}_t = \mathbf{1}\bigl[\bar{\mathrm{H}}^{(i)}_t>\tau^{(i)}\bigr],\label{eq:c13-amor-gate}
+\end{align}
+with momentum $m=0.99$, $\kappa=0.2$ and initial values $\bar\mu=0.3$, $\bar\sigma=0.1$ (the
+\code{adaptive} mode; a \code{fixed} mode uses $\tau=\bar\mu+0.03$). The EMAs are updated only in
+training and frozen at inference. The gate has no learnable parameters and is \emph{detached}: no
+gradient flows through \eqref{eq:c13-amor-entropy} (\cref{sec:c13-hard}, option~1). By
+\eqref{eq:c13-fire-rate}, the adaptive offset aims at a fire rate that does not depend on the scale of the
+entropies, which change across model sizes and during training.
+
+\paragraph{The refinement.} Where the gate fires, a causal multi-head attention over the block's own
+keys and values refines the stream. For head $n$ with head dimension $d_h$,
+\begin{equation}\label{eq:c13-amor-attn}
+  \vq_t = \bm{R}_t\mW_Q^{n}\hat{\vh}_t,\quad \vk_s = \bm{R}_s\mW_K^{n}\hat{\vh}_s,\quad \vv_s=\mW_V^{n}\hat{\vh}_s,\qquad
+  \vec{a}^{n}_t = \sum_{s\le t}\frac{\exp(\vq_t\T\vk_s/\sqrt{d_h})}{\sum_{s'\le t}\exp(\vq_t\T\vk_{s'}/\sqrt{d_h})}\,\vv_s,
+\end{equation}
+where $\bm{R}_t$ is the RoPE rotation (\cref{sec:c13-rope}) and the block index $i$ is dropped. The heads
+are concatenated and projected by $\mW_O$, and the stream is updated with a per-channel weight:
+\begin{equation}\label{eq:c13-amor-update}
+  \vh^{(i)}_t = \vh^{(i-1)}_t + \valpha^{(i)}\had\bigl(g^{(i)}_t\,\mW_O[\vec{a}^1_t;\dots;\vec{a}^{H}_t]\bigr),
+  \qquad \valpha^{(i)}=\sigmoid\bigl(\max(\vr^{(i)},-1)\bigr).
+\end{equation}
+$\mW_O$ starts at zero, so at initialization every AMOR block is the identity and the model is
+exactly the backbone language model. The raw weights $\vr$ start at $0$ ($\valpha=0.5$), and the clamp
+keeps each channel's $\alpha$ above $\sigmoid(-1)\approx 0.27$. The final logits are
+$\mW_E\RMSNorm_{\text{out}}(\vh^{(K)}_t)$.
+
+\paragraph{Stacking.} Each block recomputes its own entropy from the refined stream. Positions
+resolved by block~1 drop in entropy and stop firing in block~2, while positions that stay uncertain
+keep firing. Each block has its own EMAs, projections, RoPE and $\valpha$.
+
+\paragraph{Training.} The loss is the usual next-token cross-entropy on the final logits. Because
+$g_t$ is a constant for backpropagation, the attention parameters receive gradient only through the
+outputs of firing positions. Non-firing positions still matter: their keys and values are attended
+to by firing queries, and receive gradient that way. The backbone is trained ``exclusively through the
+final logits path, never through the gate'' (README).
+
+\paragraph{Dense-masked and sparse forms are equal.} Training multiplies a \emph{dense} causal
+attention by the gate, which is GPU-friendly. Inference computes attention only at firing positions.
+These agree.
+
+\begin{proposition}\label{prop:c13-amor-sparse}
+Let $\mA=\softmax(\mQ\mK\T/\sqrt{d_h}+\mM)\mV$ be causal attention and $\vg\in\{0,1\}^T$. Then
+$\diag(\vg)\mA$ equals the matrix whose row $t$ is $\softmax(\mK_{1:t}\vq_t/\sqrt{d_h})\T\mV_{1:t}$ if
+$g_t=1$ and $\bm{0}$ otherwise.
+\end{proposition}
+\begin{proof}
+Row $t$ of the score matrix is $\vq_t\T\mK\T/\sqrt{d_h}$ plus row $t$ of $\mM$, which is $-\infty$ for
+$s>t$. The softmax is taken row by row, so row $t$ of $\softmax(\cdot)$ is
+$\softmax(\mK_{1:t}\vq_t/\sqrt{d_h})$ padded with zeros, and row $t$ of $\mA$ depends only on
+$\vq_t,\mK_{1:t},\mV_{1:t}$. Multiplying on the left by $\diag(\vg)$ scales row $t$ by $g_t$. So rows
+with $g_t=0$ become zero and rows with $g_t=1$ are unchanged.
+\end{proof}
+
+The proof also shows what the sparse form must keep: row $t$ needs \emph{all} keys and values up to
+$t$, including those of positions that did not fire. This is why the released decoder stores every
+token's key and value (\cref{alg:c13-amor-decode}).
+
+\subsection{Algorithms and complexity}\label{sec:c13-amor-alg}
+
+\begin{algorithm}[t]
+\caption{AMOR forward pass (training and prefill), \texttt{classic} residual mode}
+\label{alg:c13-amor-forward}
+\begin{algorithmic}[1]
+\Require tokens $x_{1:T}$; backbone; $K$ AMOR blocks; tied LM head $\mW_E$
+\State $\mH\gets\RMSNorm_f(\text{Backbone}(x_{1:T}))\in\R^{T\times d}$
+\For{$i=1,\dots,K$}
+  \State $\hat{\mH}\gets\mH$ \textbf{if} $i=1$ \textbf{else} $\RMSNorm_i(\mH)$
+  \State $\bar{\mathrm{H}}_t\gets$ normalized entropy of $\softmax(\mW_E\hat{\vh}_t)$ for all $t$ \Comment{no gradient}
+  \If{training}
+    \State update $\bar\mu^{(i)},\bar\sigma^{(i)}$ by \eqref{eq:c13-amor-ema}
+  \EndIf
+  \State $g_t\gets\mathbf{1}[\bar{\mathrm{H}}_t>\bar\mu^{(i)}+\kappa\bar\sigma^{(i)}]$ for all $t$
+  \State $\mA\gets\mW_O\,\mathrm{CausalAttn}(\mathrm{RoPE}(\hat{\mH}\mW_Q),\mathrm{RoPE}(\hat{\mH}\mW_K),\hat{\mH}\mW_V)$ \Comment{dense}
+  \State $\mH\gets\mH+\diag(\vg)\,\mA\,\diag(\valpha^{(i)})$
+\EndFor
+\State \Return logits $\RMSNorm_{\text{out}}(\mH)\,\mW_E\T$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{AMOR decoding step at position $t$}
+\label{alg:c13-amor-decode}
+\begin{algorithmic}[1]
+\Require token $x_t$; backbone recurrent states; per-block caches $(\mK^{(i)},\mV^{(i)})$
+\State $\vh\gets\RMSNorm_f(\text{BackboneStep}(x_t))$ \Comment{updates the $\bigO(1)$ recurrent states}
+\For{$i=1,\dots,K$}
+  \State $\hat{\vh}\gets\vh$ \textbf{if} $i=1$ \textbf{else} $\RMSNorm_i(\vh)$
+  \State $e\gets$ entropy of $\softmax(\mW_E\hat{\vh})$, or the fitted router $r_i(\hat{\vh})$
+  \State append $\bm{R}_t\mW_K\hat{\vh}$ to $\mK^{(i)}$ and $\mW_V\hat{\vh}$ to $\mV^{(i)}$ \Comment{always}
+  \If{$e>\tau^{(i)}$}
+    \State $\vh\gets\vh+\valpha^{(i)}\had\mW_O\,\mathrm{Attn}(\bm{R}_t\mW_Q\hat{\vh},\mK^{(i)},\mV^{(i)})$
+  \EndIf
+\EndFor
+\State \Return logits $\mW_E\RMSNorm_{\text{out}}(\vh)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.} Let $f$ be the fraction of positions that fire. Per AMOR block, dense-masked training
+costs $\bigO(T^2d)$ for attention plus $\bigO(Td\abs{\mathcal{V}})$ for the gate's LM-head product (with
+$K=3$, the output layer is computed four times per position). Sparse inference costs $\bigO(Td^2)$ for the
+key and value projections of all positions and $\bigO(fT^2d)$ for the queries and attention of firing
+positions. The decoding memory is $2td$ numbers per block after $t$ tokens, independent of $f$: for the 180M
+configuration ($d=768$, $K=3$), $3\cdot2\cdot768=4608$ numbers per token, against $12\cdot2\cdot768=18432$ for
+a twelve-layer Transformer of the same width. So AMOR reduces attention \emph{compute} in proportion to
+the fire rate, and attention \emph{memory} only through the architectural choice of few attention blocks
+($K\ll L$), not through the gate.
+
+\subsection{Implementation walkthrough}\label{sec:c13-amor-impl}
+
+\begin{implnote}[title={In the code: map of \texttt{repos/HaoranZhengRaul\_\_AMOR}}]
+\begin{itemize}
+  \item \repofile{repos/HaoranZhengRaul__AMOR/amor.py}: building blocks (\code{RMSNorm},
+        \code{SwiGLUMLP}, \code{RotaryPositionEmbedding}, \code{KVProjection}), the gate
+        \code{EntropyGate}, the block \code{AMORBlock}, the Gated DeltaNet backbone block
+        \code{GDNBlock}, and the unified model \code{AMOR}.
+  \item \repofile{repos/HaoranZhengRaul__AMOR/amor_decode.py}: \code{AMORDecodeWrapper} with
+        \code{prefill} and \code{decode_step}, and \code{_chunked_gate}.
+  \item \repofile{repos/HaoranZhengRaul__AMOR/amor_router.py}: the fitted \code{EntropyRouter},
+        \code{attach_routers} and \code{detach_routers}. \code{load_model.py}, \code{generate.py}
+        and \code{weight_io.py} handle checksum-verified loading and greedy generation.
+\end{itemize}
+\textbf{Variants.} Six variants are flag combinations of one class: \code{backbone} in
+\{\code{'mamba2'}, \code{'gdn'}\}, \code{n_amor_blocks} in \{1, 3\} and \code{residual_mode} in
+\{\code{'classic'}, \code{'h'}\}. In \code{'h'} mode the backbone's final norm is used as block~1's
+pre-norm and the residual stream stays un-normalized until \code{final_norm}.
+\textbf{Backbones.} For Mamba-2 the code builds a \code{transformers} \code{Mamba2ForCausalLM},
+keeps its embeddings, SSD layers and \code{norm_f}, and adds a separate \code{RMSNorm} and
+\code{SwiGLUMLP} after each SSD layer. For GDN it wraps \code{fla.layers.GatedDeltaNet} with
+\texttt{num\_heads = int(0.75 * d\_model / head\_dim)} and \code{expand_v=2.0}.
+\textbf{Defaults} (\code{AMOR.__init__}): \code{vocab_size=128256}, \code{d_model=768},
+\code{n_layer=12}, \code{d_ff=1216}, \code{head_dim=64}, \code{n_heads=12}, \code{d_state=128},
+\code{init_threshold=0.3}, \code{gate_offset=0.03}, \code{offset_mode='adaptive'},
+\code{offset_k=0.2}, \code{attention_mode='full_with_mask'}, \code{max_seq_len=4096}. All weights
+are initialized from $\mathcal{N}(0,0.02^2)$, \code{out_proj} stays zero, and the LM head is tied to
+the embedding. The README lists 180M ($d=768$, 12 layers), 440M ($d=1024$, 24 layers) and 1.5B
+($d=2048$, 24 layers) scales, with a Llama-3.1-compatible tokenizer.
+\end{implnote}
+
+The gate is short. The excerpt omits the branch that calls a fitted router.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/HaoranZhengRaul\_\_AMOR/amor.py} (\texttt{EntropyGate.forward})},label={lst:c13-amor-gate}]
+    def forward(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # ...
+        else:
+            logits_f32 = logits.detach().float()
+            probs = F.softmax(logits_f32, dim=-1)
+            raw_entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)
+            entropy = raw_entropy / self.max_entropy
+
+        if self.training:
+            entropy_detached = entropy.detach()
+            batch_median = entropy_detached.median()
+            self.running_threshold.mul_(self.ema_momentum).add_(
+                batch_median, alpha=1.0 - self.ema_momentum
+            )
+            if self.offset_mode == 'adaptive':
+                batch_std = entropy_detached.std()
+                self.running_std.mul_(self.ema_momentum).add_(
+                    batch_std, alpha=1.0 - self.ema_momentum
+                )
+
+        if self.offset_mode == 'adaptive':
+            threshold = self.running_threshold + self.offset_k * self.running_std
+        else:
+            threshold = self.running_threshold + self.offset
+
+        gate = (entropy > threshold).float()
+        return gate, entropy
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: dense-masked and true-sparse attention}]
+\code{AMORBlock} has two attention paths. \code{_attention_full_with_mask} projects $\mQ,\mK,\mV$ to
+shape \texttt{[batch, n\_heads, seq, head\_dim]}, applies RoPE, calls
+\texttt{F.scaled\_dot\_product\_attention(Q, K, V, is\_causal=True)}, applies \code{out_proj} and multiplies
+by \code{gate.unsqueeze(-1)}: the left side of \cref{prop:c13-amor-sparse}.
+\code{_attention_true_sparse} computes $\mK,\mV$ for all positions, then gathers the firing rows with
+\texttt{active\_mask = gate > 0.5}, computes $\mQ$ only for them (with RoPE at their own positions,
+\code{cos_cached[seq_indices]}), builds the causal mask by comparing \texttt{key\_positions > positions},
+and scatters the outputs back: the right side. Its docstring calls the two ``bit-identical'', while the
+README more carefully says that ``small floating-point differences from dense attention can occur''
+(different kernels sum in different orders). The entropy itself is computed in fp32 with
+$\epsilon=10^{-10}$ inside the log, which is the direct form \eqref{eq:c13-entropy} rather than the
+log-sum-exp form \eqref{eq:c13-entropy-lse}.
+\end{implnote}
+
+The decoder follows \cref{alg:c13-amor-decode}. Note the comment in the excerpt's source file header:
+``K and V are projected and appended unconditionally so that the cache stays causal regardless of
+past gate decisions.''
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/HaoranZhengRaul\_\_AMOR/amor\_decode.py} (\texttt{decode\_step})},label={lst:c13-amor-decode}]
+            fired = gate.item() > 0.5
+
+            K_new, V_new = ab.kv_proj(h_normed)
+            K_new = K_new.view(batch, 1, n_heads, head_dim).transpose(1, 2)
+            V_new = V_new.view(batch, 1, n_heads, head_dim).transpose(1, 2)
+            cos = ab.rope.cos_cached[step_idx:step_idx + 1].unsqueeze(0).unsqueeze(0)
+            sin = ab.rope.sin_cached[step_idx:step_idx + 1].unsqueeze(0).unsqueeze(0)
+            K_new = RotaryPositionEmbedding._apply_rotary(K_new, cos, sin)
+
+            K_full = torch.cat([past_K, K_new], dim=2)
+            V_full = torch.cat([past_V, V_new], dim=2)
+            new_amor_kv_caches.append((K_full, V_full))
+
+            if fired:
+                Q = ab.q_proj(h_normed).view(batch, 1, n_heads, head_dim).transpose(1, 2)
+                Q = RotaryPositionEmbedding._apply_rotary(Q, cos, sin)
+                attn_out = F.scaled_dot_product_attention(Q, K_full, V_full, is_causal=False)
+                attn_out = attn_out.transpose(1, 2).contiguous().view(batch, 1, ab.d_model)
+                attn_out = ab.out_proj(attn_out)
+                alpha = ab.get_alpha()
+                h = self._residual_step(h, h_normed, alpha * attn_out, pre_norm)
+\end{lstlisting}
+
+\paragraph{The fitted router.}\label{sec:c13-amor-router} Each gate costs an LM-head product
+(\cref{sec:c13-entropy}). For inference, the repository can replace it by a small network that predicts
+the normalized entropy directly from the same normalized residual,
+\begin{equation}\label{eq:c13-amor-router}
+  r(\hat{\vh}) = \vw_2\T\SiLU(\mW_1\hat{\vh}+\vb_1)+b_2+\vw_s\T\hat{\vh},\qquad \mW_1\in\R^{512\times d},
+\end{equation}
+a width-512 SiLU MLP with a linear skip, compared with the \emph{same} frozen threshold. Its cost is
+about $512d+512+d$ multiply-adds, roughly $0.39\times 10^6$ for $d=768$, against $9.85\times10^{7}$ for
+the LM head: a factor of about $250$.
+
+\begin{implnote}[title={In the code: routers and chunked gates}]
+\code{EntropyRouter} (\repofile{repos/HaoranZhengRaul__AMOR/amor_router.py}) keeps \code{fc1},
+\code{fc2} and \code{skip} in fp32 even when the model is cast to bf16 (it overrides \code{_apply} and
+disables autocast). \code{attach_routers} accepts only an eval-mode model whose base-weight SHA-256 matches
+the router package (\code{variant} \code{"distill"}), and \code{EntropyGate.forward} refuses a router in
+training mode. Without routers, \code{_chunked_gate} evaluates the LM head over the prompt in chunks of
+4096 positions so that the full \texttt{[B, L, V]} logit tensor is never materialized.
+\end{implnote}
+
+\subsection{Reference implementation}
+
+\Cref{lst:c13-amor-ref} is a self-contained version of one AMOR block. It keeps the essential
+choices: the detached normalized entropy, the EMA median-plus-std threshold, dense causal attention
+multiplied by the gate, a zero-initialized output projection and the clamped per-channel $\valpha$.
+
+\begin{lstlisting}[caption={Reference implementation (ours): entropy-gated attention refinement},label={lst:c13-amor-ref}]
+import math, torch, torch.nn as nn, torch.nn.functional as F
+
+class EntropyGatedRefinement(nn.Module):
+    def __init__(self, d, n_heads, lm_head, momentum=0.99, k_off=0.2):
+        super().__init__()
+        self.h, self.dh = n_heads, d // n_heads
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.out = nn.Linear(d, d, bias=False)
+        nn.init.zeros_(self.out.weight)            # block starts as the identity
+        self.raw_alpha = nn.Parameter(torch.zeros(d))
+        self.lm_head = lm_head                     # tied output layer, shared
+        self.register_buffer("mu", torch.tensor(0.3))
+        self.register_buffer("sd", torch.tensor(0.1))
+        self.m, self.k_off = momentum, k_off
+
+    @torch.no_grad()
+    def gate(self, h):                             # h: [B, T, d], normalized
+        logp = torch.log_softmax(self.lm_head(h).float(), dim=-1)
+        ent = -(logp.exp() * logp).sum(-1) / math.log(logp.shape[-1])
+        if self.training:                          # track median and std
+            self.mu.mul_(self.m).add_((1 - self.m) * ent.median())
+            self.sd.mul_(self.m).add_((1 - self.m) * ent.std())
+        return (ent > self.mu + self.k_off * self.sd).float(), ent
+
+    def forward(self, h, rope):                    # rope: [B,H,T,dh] -> same
+        B, T, d = h.shape
+        g, ent = self.gate(h)
+        q, k, v = self.qkv(h).view(B, T, 3, self.h, self.dh).permute(2, 0, 3, 1, 4)
+        a = F.scaled_dot_product_attention(rope(q), rope(k), v, is_causal=True)
+        a = self.out(a.transpose(1, 2).reshape(B, T, d))
+        alpha = torch.sigmoid(self.raw_alpha.clamp(min=-1.0))
+        return h + alpha * a * g.unsqueeze(-1), g, ent
+\end{lstlisting}
+
+We checked \cref{prop:c13-amor-sparse} numerically in NumPy (dense masked attention against attention
+computed row by row at firing positions; maximum difference $10^{-16}$), and the bounds
+$0\le\bar{\mathrm{H}}\le 1$ on random logits.
+
+\begin{results}
+\textbf{Source:} \repofile{repos/HaoranZhengRaul__AMOR/README.md}. The repository contains no
+numerical results. It states that trained weights ``will be linked here after the review period'', and
+describes the design goal qualitatively: ``The entropy gate concentrates attention compute on positions
+where the backbone is least confident.'' The survey describes AMOR in the same terms and does not quote
+numbers~\citep{zhoubian2026memory}. The paper reports experiments on synthetic retrieval tasks and
+language modelling, comparing against recurrent-only and Transformer-only baselines; see the paper for
+numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\paragraph{Strengths.} AMOR leaves the backbone a complete language model and adds refinement as an
+option, so it degrades gracefully: at initialization, and wherever the gate is closed, the model is
+the backbone. The signal is interpretable (one can inspect where attention fired), and the compute it
+spends follows the model's own uncertainty.
+
+\paragraph{Limitations.} (i) In the released decoder, the KV memory of the attention blocks still grows
+with every token, so the gate saves compute, not memory. (ii) The native gate needs an LM-head product per
+block, which is why the fitted router exists. (iii) Entropy conflates reducible and irreducible
+uncertainty (\cref{sec:c13-entropy}). (iv) The threshold is calibrated on training batches; a shift in
+the input distribution at inference shifts the fire rate. (v) Attention sits only at the top, so the
+backbone's own layers never see retrieved information. Compare the fixed hybrids of \cref{ch:hybrid},
+which interleave attention throughout the depth.
+
+\paragraph{Relations.} AMOR is a form of conditional computation, related to adaptive computation
+time~\citep{c13-graves2016act} and to Mixture-of-Depths, which routes a fixed fraction of tokens through
+each block~\citep{c13-raposo2024mod}. Unlike these, its router is not learned but derived from the
+model's output distribution. HAM, next, moves the decision from the read to the write.
+
+% ===========================================================================
+\section{HAM: Hybrid Associative Memories}\label{sec:c13-ham}
+% ===========================================================================
+
+\subsection{Motivation}
+
+A recurrent layer and an attention layer store the past in opposite ways. The recurrent state
+compresses \emph{everything} into $d_k\times d_v$ numbers. The KV cache stores \emph{everything}
+verbatim. HAM~\citep{lufkin2026ham} (Zyphra) combines them inside one sequence-mixing layer by a
+division of labour. The authors state it as follows: the RNN compresses the entire sequence, while
+attention supplements it ``only with information that is difficult for the RNN to predict, which is
+hence the most valuable information to explicitly store.'' The survey describes the layer as ``a
+recurrent memory [that] processes every token, whereas a sparse KV cache stores only tokens that are
+difficult for the recurrent state to predict, with the cache growth controlled by a threshold or
+learned router''~\citep{zhoubian2026memory}. The cache therefore grows with how much \emph{novel}
+information the sequence contains, not with its length, and a single continuous threshold controls the
+trade-off between cache size and quality.
+
+The survey places HAM next to the hybrid quadratic-linear Transformer of
+\citet{irie2025blending} (\cref{ch:hybrid}), a ``fixed-budget precursor'' that blends a fast-weight
+memory with a bounded KV memory. HAM differs ``by making cache admission data-dependent and
+adjustable at runtime.'' The idea has a long history in neuroscience: complementary learning systems
+theory assigns fast, verbatim storage of surprising episodes to the hippocampus and slow statistical
+learning to the neocortex~\citep{c13-mcclelland1995cls}.
+
+\begin{taxonomy}
+\textbf{Representation:} implicit (recurrent state plus KV cache). \textbf{Update dynamics:}
+online. \textbf{Persistence:} long-term (survey Table~I: ``Surprise-Gated KV-RNN Hybrid Memory'').
+\textbf{Update rule:} HAM appears in two rows of survey Table~II, signal-gated writing and
+admission/eviction, because a prediction-error signal decides admission into the cache~\citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c13-ham-form}
+
+There is no public code, and the survey and abstract do not give equations. \emph{One way to
+formalize the layer is the following; the paper's exact parameterization may differ.}
+
+\paragraph{Recurrent memory.} Any recurrent memory from \cref{ch:linear,ch:delta} can serve. We use
+the gated delta rule, whose write is itself driven by prediction error:
+\begin{equation}\label{eq:c13-ham-rnn}
+  \mS_t = \alpha_t\mS_{t-1}\bigl(\mI-\beta_t\vk_t\vk_t\T\bigr)+\beta_t\vv_t\vk_t\T,
+  \qquad \norm{\vk_t}=1 .
+\end{equation}
+
+\paragraph{Surprise.} Before writing token $t$, measure how well the memory already recalls its value,
+using the normalized prediction error \eqref{eq:c13-normerr}:
+\begin{equation}\label{eq:c13-ham-surprise}
+  s_t = \frac{\norm{\vv_t-\mS_{t-1}\vk_t}^2}{\norm{\vv_t}^2+\epsilon}.
+\end{equation}
+A learned alternative is a router $s_t=\sigmoid(\vw\T\vx_t+b)$ on the layer input, trained with a
+straight-through estimator or an auxiliary sparsity loss (\cref{sec:c13-hard}). The survey mentions
+both a threshold and a learned router; we develop the threshold form.
+
+\paragraph{Admission and cache.} With threshold $\tau$,
+\begin{equation}\label{eq:c13-ham-admit}
+  g_t=\mathbf{1}[s_t>\tau],\qquad
+  \mathcal{C}_t=\begin{cases}\mathcal{C}_{t-1}\cup\{t\} & g_t=1,\\ \mathcal{C}_{t-1} & g_t=0.\end{cases}
+\end{equation}
+
+\paragraph{Read-out.} The output adds an attention read over the admitted entries to the recurrent
+read-out:
+\begin{equation}\label{eq:c13-ham-read}
+  \vo_t = \mS_t\vq_t + \lambda_t\sum_{s\in\mathcal{C}_t}
+  \frac{\exp(\vq_t\T\vk_s/\sqrt{d_k})}{\sum_{s'\in\mathcal{C}_t}\exp(\vq_t\T\vk_{s'}/\sqrt{d_k})}\,\vv_s ,
+\end{equation}
+with the attention term set to $\bm{0}$ while $\mathcal{C}_t$ is empty, and $\lambda_t$ a learned
+(possibly data-dependent) mixing weight. Other choices are possible, for example storing the
+innovation $\vv_s-\mS_{s-1}\vk_s$ instead of $\vv_s$, so that attention supplies exactly what the
+RNN misses.
+
+\paragraph{Why prediction error is the right signal.} Combine \eqref{eq:c13-ham-rnn} and
+\eqref{eq:c13-ham-surprise}. Take $\alpha_t=\beta_t=1$ and orthonormal keys. After writing
+$(\vk_t,\vv_t)$, the memory recalls $\mS_t\vk_t = \mS_{t-1}\vk_t-\mS_{t-1}\vk_t\vk_t\T\vk_t+\vv_t\vk_t\T\vk_t=\vv_t$
+exactly, and writes along other orthonormal keys leave this recall unchanged. So a pair that occurs again has
+$s=0$ and is never admitted twice. The cache \emph{deduplicates} what the RNN has already learned. When
+the RNN runs out of capacity (more than $d_k$ distinct keys, decay $\alpha_t<1$, or interference between
+non-orthogonal keys), recall degrades, $s_t$ rises, and more tokens are admitted. The cache grows exactly
+where the fixed-size state fails.
+
+\begin{example}[Deduplication]\label{ex:c13-ham-dedup}
+Take $d_k=d_v=8$, six orthonormal keys with random values, and the stream of item indices
+$0,1,2,0,3,1,4,0,5,2$, with $\alpha=\beta=1$ and $\tau=0.5$. The first occurrence of each item has
+$s_t=1$ (the memory recalls $\bm{0}$), and every repeat has $s_t=0$. The admitted positions are
+$\{0,1,2,4,6,8\}$, one per distinct item. We checked this in NumPy, together with the fact that the
+cache size is non-increasing in $\tau$ on a stream with decay and partial repetition.
+\end{example}
+
+\paragraph{Cache growth.} By \eqref{eq:c13-expected-cache}, $\E\abs{\mathcal{C}_T}=\sum_t\Pr(s_t>\tau)$.
+The two extremes are $\tau<0$, which admits every token and gives an RNN plus full attention, and
+$\tau\ge\max_t s_t$, which admits nothing and gives a pure RNN. Because $\tau$ enters only the
+admission test, it can be changed at inference time without retraining. How robust a trained model is
+to such changes depends on training (one option is to sample $\tau$ per training sequence); see the
+paper for how this is handled.
+
+\paragraph{Parallel training form.} Recurrence \eqref{eq:c13-ham-rnn} is trained with the chunkwise
+algorithms of \cref{ch:delta}. For the delta rule these already compute the pseudo-values
+$\vu_t=\beta_t(\vv_t-\mS_{t-1}\vk_t)$ for all $t$ in parallel (the WY/UT form), so the surprise
+$s_t=\norm{\vu_t}^2/(\beta_t^2\norm{\vv_t}^2)$ costs nothing extra in the ungated case. Given the mask
+$\vg$, the attention term of \eqref{eq:c13-ham-read} for all $t$ is a standard masked attention:
+\begin{equation}\label{eq:c13-ham-parallel}
+  \mA = \softmax\bigl(\mQ\mK\T/\sqrt{d_k}+\mM+\mM_{\vg}\bigr)\mV,\qquad
+  (\mM_{\vg})_{ts}=\begin{cases}0 & g_s=1,\\ -\infty & g_s=0,\end{cases}
+\end{equation}
+where rows with no admitted key are set to zero. The argument is the column version of
+\cref{prop:c13-amor-sparse}: a key with score $-\infty$ receives weight $e^{-\infty}=0$ and drops out of
+both numerator and denominator, so row $t$ is exactly the softmax over $\mathcal{C}_t$. During training
+this costs as much as full attention. The saving is at inference, where only admitted entries are stored.
+
+\subsection{Algorithm and complexity}
+
+\begin{algorithm}[t]
+\caption{HAM-style layer, recurrent form (our formalization)}\label{alg:c13-ham}
+\begin{algorithmic}[1]
+\Require $\vq_t,\vk_t\in\R^{d_k}$ ($\norm{\vk_t}=1$), $\vv_t\in\R^{d_v}$, gates $\alpha_t,\beta_t$, threshold $\tau$
+\State $\mS_0\gets\bm{0}$, $\mathcal{C}_0\gets\emptyset$
+\For{$t=1,\dots,T$}
+  \State $s_t\gets\norm{\vv_t-\mS_{t-1}\vk_t}^2/(\norm{\vv_t}^2+\epsilon)$ \Comment{surprise}
+  \If{$s_t>\tau$} \Comment{admit}
+    \State append $(\vk_t,\vv_t)$ to the cache $\mathcal{C}$
+  \EndIf
+  \State $\mS_t\gets\alpha_t\mS_{t-1}(\mI-\beta_t\vk_t\vk_t\T)+\beta_t\vv_t\vk_t\T$ \Comment{every token}
+  \State $\vo_t\gets\mS_t\vq_t+\lambda_t\,\mathrm{Attn}(\vq_t,\mathcal{C})$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Per token, the RNN costs $\bigO(d_kd_v)$, the surprise another $\bigO(d_kd_v)$ (one matrix-vector
+product), and the attention read $\bigO(\abs{\mathcal{C}_t}(d_k+d_v))$. The memory is
+$d_kd_v+\abs{\mathcal{C}_t}(d_k+d_v)$ numbers per head. With admission rate $r$, a HAM layer stores
+about $r$ times the KV cache of an attention layer. Unlike AMOR, the saving is in memory as well as in
+compute.
+
+\subsection{Reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): surprise-gated KV admission over a gated delta-rule memory},label={lst:c13-ham-ref}]
+import torch, torch.nn.functional as F
+
+def ham_layer(q, k, v, alpha, beta, tau, lam=1.0, eps=1e-6):
+    """q, k: [T, d_k]; v: [T, d_v]; alpha, beta: [T] gates in (0, 1).
+    Recurrent form of a surprise-gated KV-RNN hybrid (our formalization)."""
+    T, d_k = k.shape
+    S = k.new_zeros(v.shape[1], d_k)          # fixed-size recurrent memory
+    cache_k, cache_v, admitted, out = [], [], [], []
+    for t in range(T):
+        kt = F.normalize(k[t], dim=-1)
+        err = v[t] - S @ kt                     # what the memory fails to recall
+        s = err.pow(2).sum() / (v[t].pow(2).sum() + eps)
+        if s > tau:                             # admission: only surprising tokens
+            cache_k.append(kt); cache_v.append(v[t]); admitted.append(t)
+        # gated delta rule: S <- alpha * S (I - beta k k^T) + beta v k^T
+        S = alpha[t] * (S - beta[t] * torch.outer(S @ kt, kt)) \
+            + beta[t] * torch.outer(v[t], kt)
+        o = S @ q[t]
+        if cache_k:                             # exact recall from the sparse cache
+            K, V = torch.stack(cache_k), torch.stack(cache_v)
+            w = torch.softmax(K @ q[t] / d_k ** 0.5, dim=0)
+            o = o + lam * (w @ V)
+        out.append(o)
+    return torch.stack(out), admitted
+\end{lstlisting}
+
+\begin{results}
+\textbf{Source:} no public code was found (\repofile{README.md}, section~3), so there is no repository
+file with results. The authors state publicly that the hybrid ``offers strong, competitive performance
+relative to RNNs and Transformers even at substantially lower KV-cache usage'', and that controlling
+the cache growth rate with the threshold gives ``a smooth trade-off with loss and performance''. The
+survey makes the qualitative point that HAM makes ``cache admission data-dependent and adjustable at
+runtime''~\citep{zhoubian2026memory}. See the paper for numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\paragraph{Strengths.} Memory grows with novelty rather than with length, which is the right scaling
+for long inputs that are mostly predictable (code with repeated identifiers, long documents with
+recurring entities). One continuous knob trades memory for quality at deployment time. The signal is
+cheap and is a by-product of delta-rule training.
+
+\paragraph{Limitations.} (i) Admission is irreversible: a token that was predictable when written but
+becomes important later (a detail whose relevance is revealed by a later question) is lost to exact
+recall. The survey lists ``delayed relevance'' among the risks of signal-gated writing. (ii) Surprise is
+not utility: noise is surprising but useless, and a stream with many random tokens fills the cache.
+(iii) The surprise depends on the RNN's state, so one threshold may admit very different rates in
+different layers and heads. (iv) Different sequences in a batch admit different numbers of tokens, so
+caches are ragged. Paged KV memory~\citep{kwon2023paged} (\cref{ch:foundations}) handles this naturally.
+
+\paragraph{Relations.} AMOR gates the \emph{read} by output entropy, HAM gates the \emph{write} by
+memory prediction error. Titans (\cref{ch:ttt}) uses a surprise signal to scale \emph{parametric}
+writes, and HAM uses one to decide \emph{verbatim} storage. Expansion Span~\citep{nunez2025expansion}
+(\cref{ch:hybrid}) also reserves attention capacity for selected far-away tokens, chosen by retrieval
+rather than by surprise at write time.
+
+% ===========================================================================
+\section{Background II: managing the working memory}\label{sec:c13-mgmt-bg}
+% ===========================================================================
+
+Part B treats the working memory as a data structure to be engineered. This section builds the tools:
+how large the KV cache is, how quantization shrinks it, why rotary embeddings complicate this, and
+what it means to checkpoint a recurrent state.
+
+\subsection{How large is the KV cache?}\label{sec:c13-kvsize}
+
+A decoder with $L$ attention layers, $H_{kv}$ key-value heads of dimension $d_k$, and $b$ bytes per
+number stores, per token,
+\begin{equation}\label{eq:c13-kv-bytes}
+  \text{bytes per token} = 2\cdot L\cdot H_{kv}\cdot d_k\cdot b ,
+\end{equation}
+the factor $2$ counting keys and values (\cref{ch:foundations}). The CommVQ scripts target
+Llama-3.1-8B, with $L=32$ layers (\texttt{N = 32} in \repofile{repos/UMass-Embodied-AGI__CommVQ/training/make_scale.py})
+and $H_{kv}d_k=8\cdot128=1024$ (\texttt{KV\_DIM = 1024} and the reshape \texttt{view(N, 8, 2, 64)} in
+\repofile{repos/UMass-Embodied-AGI__CommVQ/training/quantize_key_cache.py}). In 16-bit precision,
+\eqref{eq:c13-kv-bytes} gives $2\cdot32\cdot1024\cdot2=131072$ bytes, i.e.\ 128~KiB per token, or 16~GiB
+for a single sequence of $2^{17}=131072$ tokens. That is the same order as the model's weights, and it
+is multiplied by the batch size.
+
+There are several independent levers, and the systems in this chapter pull different ones:
+\emph{fewer or smaller heads} (grouped-query attention~\citep{c01-ainslie2023gqa}, already in the
+$H_{kv}=8$ above, or low-rank latent caches~\citep{deepseek2024v2}); \emph{fewer tokens} (eviction and
+admission, \cref{sec:c13-policies}; HAM); \emph{fewer bits per number} (quantization; CommVQ);
+\emph{states instead of tokens} (recurrent layers; Memory Caching); \emph{better placement}
+(PagedAttention~\citep{kwon2023paged}, \cref{ch:foundations}, stores the cache in fixed-size blocks
+addressed through a block table, which removes fragmentation and lets sequences share prefix blocks; it
+does not shrink the cache, so it combines with all the others); and \emph{better content} (rewriting
+entries; Bottlenecked Transformers).
+
+\subsection{Scalar quantization}\label{sec:c13-sq}
+
+A $b$-bit \emph{uniform scalar quantizer} maps a real number $x$ to one of $2^b$ levels. With step
+(scale) $\Delta$ and offset $z$,
+\begin{equation}\label{eq:c13-sq}
+  Q(x) = \Delta\cdot\bigl(\operatorname{clip}(\lfloor x/\Delta\rceil+z,\,0,\,2^b-1)-z\bigr),
+\end{equation}
+where $\lfloor\cdot\rceil$ rounds to the nearest integer. Inside the clipping range the error is at most
+$\Delta/2$; if it is spread uniformly over $[-\Delta/2,\Delta/2]$ its mean square is
+$\int_{-\Delta/2}^{\Delta/2}e^2\,de/\Delta=\Delta^2/12$. To cover a range $[x_{\min},x_{\max}]$ one sets
+$\Delta=(x_{\max}-x_{\min})/(2^b-1)$, so a single outlier inflates the error of every other number in
+its group. KV-cache quantizers therefore use small groups with their own scale and offset, and choose
+the grouping per channel for keys (whose outliers sit in fixed channels) and per token for
+values~\citep{c13-liu2024kivi}. The scales cost bits too. A group of $G$ numbers with a 16-bit scale
+and a 16-bit offset costs $b+32/G$ bits per number. At $b=1$ or $2$ there are only two or four levels
+per number, and the error is large whatever the grouping.
+
+\subsection{Vector quantization, \texorpdfstring{$k$}{k}-means and EM}\label{sec:c13-vq}
+
+A \emph{vector quantizer} replaces a whole vector $\vx\in\R^m$ by one of $K$ codewords
+$\vec{c}_1,\dots,\vec{c}_K$ (the \emph{codebook}). The encoder stores only the index
+$i(\vx)=\argmin_i\norm{\vx-\vec{c}_i}$, and the decoder looks up $\vec{c}_{i(\vx)}$~\citep{c13-gray1984vq}.
+The rate is $\log_2K/m$ bits per coordinate. Scalar quantization of each coordinate with $b$ bits is the
+special case whose $K=2^{bm}$ codewords form a rectangular grid. VQ can place the same number of
+codewords anywhere, in particular where the data is and with shapes that follow correlations between
+coordinates, so at equal rate its distortion is never worse and usually much better.
+
+\paragraph{Lloyd's algorithm ($k$-means).} To fit a codebook to data $\vx_1,\dots,\vx_N$, minimize the
+distortion $J=\sum_n\norm{\vx_n-\vec{c}_{i_n}}^2$ over codewords and assignments by alternating two
+steps~\citep{c13-lloyd1982}. (1) With the codewords fixed, the best assignment of each $\vx_n$ is its
+nearest codeword. (2) With the assignments fixed, $J$ is a sum of separate quadratics, one per codeword,
+and setting $\partial J/\partial\vec{c}_i=-2\sum_{n:i_n=i}(\vx_n-\vec{c}_i)=\bm{0}$ gives the centroid
+$\vec{c}_i=\text{mean}\{\vx_n:i_n=i\}$. Neither step can increase $J$, and there are finitely many
+assignments, so the algorithm stops at a local minimum.
+
+\paragraph{EM and annealing.} Lloyd's hard assignments are the zero-temperature limit of
+expectation-maximization~\citep{c13-dempster1977} for a mixture of isotropic Gaussians with common
+variance. The E-step computes soft responsibilities
+\begin{equation}\label{eq:c13-estep}
+  w_{nc} = \frac{\exp(-d(\vx_n,\vec{c}_c)/\tau)}{\sum_{c'}\exp(-d(\vx_n,\vec{c}_{c'})/\tau)} ,
+\end{equation}
+with $d$ the squared distance and $\tau=2\sigma^2$. The M-step sets each codeword to the
+$w$-weighted mean. As $\tau\to0$ the softmax becomes the nearest-neighbour indicator and EM becomes
+$k$-means. \emph{Deterministic annealing}~\citep{c13-rose1998da} starts at a high $\tau$, where all
+codewords are pulled towards the data mean and poor local minima are smoothed away, and lowers $\tau$
+gradually. CommVQ's key codebook is trained this way, with one change (\cref{sec:c13-commvq}): its
+codewords are not free but constrained to a structured family.
+
+\paragraph{The M-step for a structured codebook.} Suppose every codeword is a fixed linear function of
+a parameter vector, $\vec{c}_c=\mT_c\vtheta$ (stack them as $\vec{c}=\mT\vtheta$). Let
+$N_c=\sum_nw_{nc}$ and $\vm_c=N_c^{-1}\sum_nw_{nc}\vx_n$ be the soft count and weighted mean of
+codeword $c$. Because $\sum_nw_{nc}(\vx_n-\vm_c)=\bm{0}$, the cross term vanishes in
+\[
+  \sum_n w_{nc}\norm{\vx_n-\vec{c}_c}^2 = \sum_n w_{nc}\norm{\vx_n-\vm_c}^2 + N_c\norm{\vm_c-\vec{c}_c}^2 ,
+\]
+so up to a constant the M-step objective is a weighted least-squares problem,
+\[
+  \sum_cN_c\norm{\vm_c-\mT_c\vtheta}^2=(\vm-\mT\vtheta)\T\mathbf{N}(\vm-\mT\vtheta),
+\]
+where $\mathbf{N}$ is diagonal with $N_c$ repeated over the coordinates of codeword $c$. Setting the gradient
+$-2\mT\T\mathbf{N}(\vm-\mT\vtheta)$ to zero gives
+\begin{equation}\label{eq:c13-structured-mstep}
+  \vtheta^\star = (\mT\T\mathbf{N}\mT)^{-1}\mT\T\mathbf{N}\,\vm .
+\end{equation}
+Free codewords are the case $\mT=\mI$, which gives back $\vec{c}_c=\vm_c$.
+
+\subsection{Large codebooks: product, residual and additive quantization}\label{sec:c13-rvq}
+
+At 1 bit per coordinate a 128-dimensional head vector needs $K=2^{128}$ codewords, which cannot be
+stored or searched. Three standard ways to get exponentially many codewords from a few small codebooks
+are the following.
+\begin{itemize}
+  \item \textbf{Product quantization}~\citep{c13-jegou2011pq} splits $\vx$ into $M$ sub-vectors and
+        quantizes each with its own codebook of size $K$. This gives $K^M$ codewords for $MK$ stored ones.
+  \item \textbf{Residual VQ}~\citep{c13-gray1984vq} quantizes in stages. Stage $r$ quantizes what the
+        earlier stages left over,
+        \[
+          \vec{\delta}^{(0)}=\vx,\qquad i_r=\argmin_i\norm{\vec{\delta}^{(r-1)}-\vec{c}^{(r)}_i},\qquad
+          \vec{\delta}^{(r)}=\vec{\delta}^{(r-1)}-\vec{c}^{(r)}_{i_r},
+        \]
+        and decodes $\hat{\vx}=\sum_{r=1}^R\vec{c}^{(r)}_{i_r}$ with $R\log_2K$ bits. Each stage refines
+        the previous ones. In a small NumPy test with unit vectors in $\R^4$ and three stages of 16
+        codewords, the mean squared error fell by roughly a factor of three per stage.
+  \item \textbf{Additive quantization}~\citep{c13-babenko2014aq} also decodes a sum of codewords, one per
+        codebook, but chooses all indices jointly rather than greedily. Exact joint encoding is a hard
+        combinatorial problem, so it is approximated by beam search or, as in CommVQ, by a \emph{learned
+        encoder} that predicts the indices directly.
+\end{itemize}
+A useful special case is \textbf{binary additive} coding: a codebook $\mathbf{E}\in\R^{B\times m}$ and a
+bit vector $\vb\in\{0,1\}^B$ decode to $\hat{\vx}=\vb\T\mathbf{E}$, i.e.\ each bit says whether to add one
+codeword. The decoder is \emph{linear in the code}, and this is what makes it cheap inside attention: for
+weights $a_t$,
+\begin{equation}\label{eq:c13-fold}
+  \sum_t a_t\,\hat{\vx}_t = \sum_t a_t\,\vb_t\T\mathbf{E} = \Bigl(\sum_t a_t\vb_t\Bigr)\T\mathbf{E}.
+\end{equation}
+The weighted sum is taken over bits, and the codebook is applied once, independently of the number of
+tokens.
+
+\subsection{RoPE, and why quantization must respect it}\label{sec:c13-rope}
+
+Rotary position embedding~\citep{c01-su2024roformer} (\cref{ch:foundations}) splits a $d_k$-dimensional
+query or key into $d_k/2$ pairs and rotates pair $j$ at position $t$ by the angle $t\omega_j$, with
+frequencies $\omega_j=\text{base}^{-2(j-1)/d_k}$:
+\[
+  \bm{R}_t=\operatorname{blockdiag}\bigl(R(t\omega_1),\dots,R(t\omega_{d_k/2})\bigr),\qquad
+  R(\varphi)=\begin{pmatrix}\cos\varphi&-\sin\varphi\\ \sin\varphi&\cos\varphi\end{pmatrix}.
+\]
+Which coordinates form a pair is a convention. The ``rotate-half'' layout of Llama-style code pairs
+coordinate $j$ with $j+d_k/2$ and implements the rotation as \texttt{x * cos + rotate\_half(x) * sin} with
+\texttt{rotate\_half(x) = cat(-x2, x1)}. Because $R(a)\T R(b)=R(b-a)$, the attention score depends only on
+the offset:
+\begin{equation}\label{eq:c13-rope-rel}
+  (\bm{R}_s\vq)\T(\bm{R}_t\vk) = \vq\T\bm{R}_s\T\bm{R}_t\vk = \vq\T\bm{R}_{t-s}\vk .
+\end{equation}
+It helps to read each pair $(x,y)$ as a complex number $x+iy$. Then $R(\varphi)$ is multiplication by
+$e^{i\varphi}$, and the matrix $aI+bJ$ with $J=\bigl(\begin{smallmatrix}0&-1\\1&0\end{smallmatrix}\bigr)$
+is multiplication by $a+ib$.
+
+\paragraph{Two bad options.} A KV quantizer can compress keys after or before the rotation. If it
+stores a code for $\bm{R}_t\vk_t$ (\emph{after} RoPE), the distribution of each pair depends on the position.
+High-frequency pairs are spread over all angles, and the codebook spends its codewords on rotations
+instead of on the structure of the keys. If it stores a code for $\vk_t$ (\emph{before} RoPE), the codebook
+sees the natural key distribution, but every cached key must be decoded and rotated at every decoding
+step. That materializes full-precision keys and wastes the bandwidth the compression was meant to save.
+
+\paragraph{The way out: codebooks that commute with rotations.} Suppose the decoder is linear,
+$\hat{\vk}=D(\vec{c})$, and commutes with every $\bm{R}_t$: $\bm{R}_tD(\vec{c})=D(\bm{R}_t\vec{c})$, where the
+rotation also acts on the (structured) code. Then the score is
+\[
+  \vq\T\bm{R}_t\hat{\vk}_t = \vq\T D(\bm{R}_t\vec{c}_t) = \bigl(D^{*}\vq\bigr)\T(\bm{R}_t\vec{c}_t),
+\]
+with $D^{*}$ the adjoint of $D$. The product $D^{*}\vq$ is computed once per query, and each cached key
+needs only its small code rotated. Which linear maps commute with rotations? On one pair the answer is
+exact.
+
+\begin{lemma}\label{lem:c13-commute}
+Let $\varphi\notin\pi\mathbb{Z}$. A real $2\times2$ matrix $X$ satisfies $XR(\varphi)=R(\varphi)X$ if and
+only if $X=aI+bJ$ for some $a,b\in\R$, i.e.\ $X$ is multiplication by a complex number.
+\end{lemma}
+\begin{proof}
+Write $R(\varphi)=\cos\varphi\,I+\sin\varphi\,J$. Every $X$ commutes with $I$, so
+$XR-RX=\sin\varphi\,(XJ-JX)$, and since $\sin\varphi\ne0$ the condition is $XJ=JX$. For
+$X=\bigl(\begin{smallmatrix}p&q\\r&s\end{smallmatrix}\bigr)$,
+$XJ=\bigl(\begin{smallmatrix}q&-p\\s&-r\end{smallmatrix}\bigr)$ and
+$JX=\bigl(\begin{smallmatrix}-r&-s\\p&q\end{smallmatrix}\bigr)$. These are equal if and only if $q=-r$ and
+$s=p$, i.e.\ $X=pI+rJ$. Conversely, $aI+bJ$ commutes with $R(\varphi)$ because both are polynomials in
+$J$ (in complex terms, multiplication is commutative).
+\end{proof}
+
+So a RoPE-commuting codebook is one built from $2\times2$ blocks of the form
+$\bigl(\begin{smallmatrix}a&-b\\b&a\end{smallmatrix}\bigr)$, one per rotary pair. A generic real
+$2\times2$ block does not commute (we confirmed this numerically, and also that the solution space of
+$XR=RX$ is two-dimensional). This is the design principle of CommVQ.
+
+\subsection{Checkpointing a recurrent state}\label{sec:c13-checkpoint}
+
+For a recurrent layer $\mS_t=f(\mS_{t-1},\vx_t)$ with read-out $\vo_t=g(\mS_t,\vx_t)$, the state $\mS_t$
+summarizes the prefix completely: all future outputs depend on $\vx_{1:t}$ only through $\mS_t$. A
+\emph{checkpoint} or \emph{snapshot} is a stored copy of $\mS_b$ at some boundary $b$. It costs one
+state ($H d_kd_v$ numbers per layer) and can be read later, after the live state has moved on and
+partly overwritten what it held at $b$.
+
+For ungated linear attention, $\mS_t=\sum_{s\le t}\vv_s\vk_s\T$, and snapshots taken at boundaries
+$b_1<b_2<\dots$ can be organized in two ways. \emph{Prefix} (or checkpoint) snapshots are
+$\mS_{b_i}$ themselves, each containing the whole prefix. \emph{Segment-local} (or restart) states
+$\mS^{\text{loc}}_i=\sum_{b_{i-1}<s\le b_i}\vv_s\vk_s\T$ start from zero in each segment. They are related by
+$\mS_{b_i}=\sum_{i'\le i}\mS^{\text{loc}}_{i'}$. With a decay gate the prefix form becomes
+$\mS_t=(\prod_{s=b+1}^{t}\alpha_s)\mS_b+\sum_{b<s\le t}(\prod_{r=s+1}^t\alpha_r)\vv_s\vk_s\T$. The
+old snapshot $\mS_b$ keeps what decay would otherwise erase. For nonlinear memories (an MLP updated by
+gradient steps, \cref{ch:ttt}) the two organizations are genuinely different, because the update from
+a nonzero starting state is not the update from zero plus an offset.
+
+\paragraph{How many snapshots?} With a fixed segment length $C$ there are $\lceil T/C\rceil$ snapshots
+and memory $\bigO((T/C)\,d_kd_v)$, between the $\bigO(d_kd_v)$ of an RNN and the $\bigO(T(d_k+d_v))$ of
+attention. With \emph{logarithmic} segmentation the prefix is split according to the binary expansion
+of its length, for example $23=16+4+2+1$. There are then at most $\lceil\log_2(T+1)\rceil$ segments, as
+in a Fenwick tree~\citep{c07-fenwick1994}, and this is the structure behind log-linear attention
+\citep{guo2025loglinear} (\cref{ch:structured}). The word ``checkpointing'' also names a different
+technique, gradient checkpointing~\citep{c01-chen2016checkpoint}, which discards activations during
+the forward pass and recomputes them for the backward pass. Here a checkpoint is part of the model's
+memory at inference time.
+
+% ===========================================================================
+\section{CommVQ: commutative vector quantization of the KV cache}\label{sec:c13-commvq}
+% ===========================================================================
+
+\subsection{Motivation}
+
+At one or two bits per number, scalar quantization has only two or four levels and the KV cache
+loses too much (\cref{sec:c13-sq}). Vector quantization does much better at equal rate
+(\cref{sec:c13-vq}), but two obstacles stand in the way. Encoding must be fast enough to run on every
+new token, and decoding must not undo the savings. As \cref{sec:c13-rope} showed, the second obstacle
+comes from RoPE: either the codebook must cover all rotations, or every key must be decoded and rotated
+at every step. CommVQ~\citep{li2025commvq} removes both obstacles. Values are encoded by a small learned
+network into a \emph{binary additive} code, whose linear decoder folds into the attention sum
+\eqref{eq:c13-fold}. Keys are encoded with a residual codebook whose $2\times2$ blocks are complex
+numbers, so by \cref{lem:c13-commute} the codebook \emph{commutes} with RoPE and attention scores can
+be computed from the codes without reconstructing the keys. The survey groups CommVQ under KV-cache
+compression and quantization; its one-sentence summary speaks of ``vector quantization of communication
+states''~\citep{zhoubian2026memory}, but the paper's title and the repository README make clear that
+``Comm'' stands for \emph{commutative} and that the object being compressed is the KV cache.
+
+\begin{taxonomy}
+The survey's Table~I does not list CommVQ; it is discussed in \S V-B (memory management and
+efficiency)~\citep{zhoubian2026memory}. In terms of the three axes (our classification):
+\textbf{representation} implicit (it compresses the KV cache, the working memory of attention);
+\textbf{update dynamics} online for the cache contents (every new token is encoded at inference) and
+offline for the codebooks and encoder (trained once); \textbf{persistence} short-term. The closest
+update-rule family in Table~II is ``admission, eviction, and consolidation'', in its compressive
+form: every entry is admitted but stored in compressed form.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c13-commvq-form}
+
+Quantization acts per layer and per token on the concatenation of all key-value heads, a vector of
+size $D=H_{kv}d_k$ ($D=1024$ for Llama-3.1-8B). Let $b\in\{1,2\}$ be the target bits per channel.
+
+\paragraph{Values: learned encoder, binary additive codebook.} Let $\vec{\lambda}\in\R^D$ be a frozen
+per-channel scale, the mean of $\abs{v}$ over calibration data. A value $\vv$ is normalized and encoded
+as follows:
+\begin{align}
+  \tilde{\vv}&=\vv\oslash\vec{\lambda},\qquad \rho=\norm{\tilde{\vv}},\nonumber\\
+  \vec{\ell} &= \mW_2\,\mathrm{GELU}\bigl(\mW_1\LayerNorm(\tilde{\vv}/\rho)+\vb_1\bigr)+\vb_2\in\R^{G\times4},
+  \qquad G=Db/2, \label{eq:c13-commvq-enc}\\
+  \vy_g &= \mathrm{GumbelSoftmax}_{\mathrm{hard}}(\vec{\ell}_g)\in\{\ve_0,\ve_1,\ve_2,\ve_3\},\nonumber\\
+  (b_{2g},b_{2g+1}) &= (y_{g,0}+y_{g,2},\;y_{g,1}+y_{g,2}). \label{eq:c13-commvq-bits}
+\end{align}
+Each group makes a four-way choice that is turned into two bits: category 0 gives $(1,0)$, 1 gives
+$(0,1)$, 2 gives $(1,1)$ and 3 gives $(0,0)$. A four-way softmax can express any joint distribution
+over two bits, which two independent sigmoids cannot. The code $\vb\in\{0,1\}^{Db}$ is decoded with a
+binary additive codebook $\mathbf{E}\in\R^{Db\times D}$, and the norm is restored:
+\begin{equation}\label{eq:c13-commvq-vdec}
+  \vec{x}=\vb\T\mathbf{E},\qquad \hat{\vv}=\vec{\lambda}\had\rho\,\frac{\vec{x}}{\norm{\vec{x}}}.
+\end{equation}
+The cost is $Db$ bits plus the scalar $\rho$ per token and layer. For $b=1$ that is one bit per
+channel, a factor of 16 below fp16 (the encoder asserts \texttt{int(16 / self.quant\_bits) == compression\_ratio}).
+The encoder and codebook are trained with the LLM \emph{frozen}, using the straight-through Gumbel-softmax of
+\cref{sec:c13-hard} and two losses: the mean squared error between $\hat{\vv}$ and $\vv$, and the mean
+squared error between each attention layer's output computed with quantized values and its original
+output.
+
+\paragraph{Keys: a residual codebook that commutes with RoPE.} Keys are quantized \emph{before}
+RoPE. Each token's pre-RoPE key $\vk\in\R^D$ is divided by its norm $\rho=\norm{\vk}$ (taken over all
+heads together). Within a head of dimension $d_k=128$, coordinates $j$ and $j+64$ form a rotary pair, written
+as one complex number $\kappa_{h,j}=k_{h,j}+i\,k_{h,j+64}$, $j=1,\dots,P$ with $P=64$. Stage $r$ of the
+residual codebook holds, for every head $h$ and pair $j$, a list of $C=64$ complex numbers
+$z^{(r,h,j)}_0,\dots,z^{(r,h,j)}_{63}$. A stage code is a pair of indices $(A_r,B_r)\in\{0,\dots,63\}^2$,
+i.e.\ 12 bits, \emph{shared by all 64 pairs of the head}. The decoder is
+\begin{equation}\label{eq:c13-commvq-key}
+  \hat{\kappa}_{h,j} = \rho\sum_{r=1}^{R}\Bigl(z^{(r,h,j)}_{A_r}+i\,z^{(r,h,j)}_{B_r}\Bigr).
+\end{equation}
+In real $2\times2$ form, with $M(z)=(\operatorname{Re}z)I+(\operatorname{Im}z)J$,
+\[
+  z_A+i\,z_B = M(z_A)\ve_1+M(z_B)\ve_2 = \begin{pmatrix}x_A-y_B\\ y_A+x_B\end{pmatrix},
+\]
+where $z=x+iy$. The code of a pair is the pair of unit vectors $(\ve_1,\ve_2)$ placed in the slots $A$
+and $B$, and the decoder applies the blocks $M(z)$ to it. Every $M(z)$ commutes with every rotation
+(\cref{lem:c13-commute}), so rotating the decoded key equals decoding a rotated code:
+\begin{equation}\label{eq:c13-commvq-commute}
+  R(\varphi)\bigl(M(z_A)\ve_1+M(z_B)\ve_2\bigr) = M(z_A)\bigl(R(\varphi)\ve_1\bigr)+M(z_B)\bigl(R(\varphi)\ve_2\bigr).
+\end{equation}
+With $R$ stages a head costs $12R$ bits for 128 channels. The training script's default is $R=21$
+(252 bits, about $1.97$ bits per channel). The released 1-bit and 2-bit codebooks are downloaded
+separately and fix their own number of stages. Encoding is greedy residual VQ (\cref{sec:c13-rvq}): at
+each stage, pick the nearest of the $64^2=4096$ codewords and subtract it.
+
+\paragraph{Training the key codebook by structured EM.} The codewords of one stage are
+$4096$ points that are all determined by the $64$ complex numbers $z_0,\dots,z_{63}$ (per pair). They are
+therefore a linear function $\vec{c}=\mT\vtheta$ of the parameters $\vtheta$ (the real and imaginary
+parts of the $z_a$), with each pair of rows of $\mT$ encoding $(x_A-y_B,\,x_B+y_A)$. EM proceeds as in
+\cref{sec:c13-vq}: soft assignments \eqref{eq:c13-estep} with an annealed temperature, weighted means
+$\vm_c$, and then the structured M-step \eqref{eq:c13-structured-mstep}, which projects the means onto the
+commuting family. For this $\mT$ one can check that $\mT\T\mT=2C\,\mI$ is diagonal (each parameter appears in
+$2C$ codewords with coefficient $\pm1$, and the cross term between $x_A$ and $y_B$ from codeword $(A,B)$
+cancels the one from codeword $(B,A)$). The repository asserts this.
+After a stage converges, the keys are replaced by their residuals and the next stage is fitted.
+
+\paragraph{Attention scores directly from the codes.} Let $\tilde{q}_{h,j}$ be the rotated query, in
+complex form, and $\varphi_{t,j}=t\,\omega_j$ the angle of pair $j$ at key position $t$. The real dot
+product of two pairs is $\operatorname{Re}(\bar a\,b)$, and RoPE multiplies the key pair by
+$e^{i\varphi}$. Substituting \eqref{eq:c13-commvq-key},
+\begin{equation}\label{eq:c13-commvq-score}
+\begin{aligned}
+  \tilde{\vq}\T\bm{R}_t\hat{\vk}_t
+  &= \sum_j\operatorname{Re}\bigl(\overline{\tilde q_j}\,e^{i\varphi_{t,j}}\,\hat\kappa_{t,j}\bigr)
+   = \rho_t\sum_j\operatorname{Re}\Bigl(e^{i\varphi_{t,j}}\bigl(W^{A}_{t,j}+i\,W^{B}_{t,j}\bigr)\Bigr),\\
+  W^{A}_{t,j}&=\sum_r U_{r,j,A_{r,t}},\qquad U_{r,j,a}=\overline{\tilde q_j}\,z^{(r,j)}_a ,
+\end{aligned}
+\end{equation}
+and $W^B$ likewise with the indices $B_{r,t}$. The table $U$ has $R\cdot P\cdot C$ entries and is
+computed once per query, independently of $T$. Each cached key then needs $2R$ table lookups per pair,
+a sum, one complex rotation and a real part. The full-precision key is never formed. Writing
+$\vu=M(z)\T\tilde{\vq}$ in real coordinates, the rotation step becomes
+$u^A_x\cos\varphi+u^A_y\sin\varphi+u^B_y\cos\varphi-u^B_x\sin\varphi$, which is the line that appears
+in the Triton kernel (\cref{lst:c13-commvq-kernel}).
+
+\paragraph{Value read-out from the codes.} With attention weights $a_t$ and $\rho'_t=\rho_t/\norm{\vb_t\T\mathbf{E}}$
+(precomputed when the token is encoded),
+\begin{equation}\label{eq:c13-commvq-vread}
+  \sum_t a_t\hat{\vv}_t = \vec{\lambda}\had\Bigl(\sum_t a_t\rho'_t\,\vb_t\Bigr)\T\mathbf{E},
+\end{equation}
+by \eqref{eq:c13-fold}: a weighted sum over bit vectors, then one product with the codebook.
+
+\paragraph{The recent window.} Tokens are quantized in blocks of 128. The most recent, incomplete block
+is kept in full precision (\texttt{residual\_length = 128}) and quantized when it fills up. The prompt is
+processed with full-precision attention, so quantization error enters only the decoding steps.
+
+\paragraph{Cost.} Per token and layer the cache holds $Db$ value bits, $12RH_{kv}$ key bits and two
+16-bit scales, against $2\cdot16D$ bits in fp16. Per decoding step and query head, the key path costs
+$\bigO(RPC)$ for the table plus $\bigO(TRP)$ lookups, and the value path $\bigO(TDb)$ bit-weighted additions
+plus one $Db\times d_k$ codebook product. This is not less arithmetic than fp16 attention. The gain is in
+memory capacity and memory traffic, which dominate the cost of decoding.
+
+\subsection{Algorithms}
+
+\begin{algorithm}[t]
+\caption{Training one stage-wise residual key codebook (one layer, one head), as in \texttt{quantize\_key\_cache.py}}
+\label{alg:c13-commvq-em}
+\begin{algorithmic}[1]
+\Require pre-RoPE keys $\{\vk_n\}$ from calibration text; stages $R$; EM steps $S$; temperatures $\tau_0>\tau_1$
+\State normalize: $\vk_n\gets\vk_n/\norm{\vk_n}$; reorder coordinates into rotary pairs; $s\gets1$
+\For{$r=1,\dots,R$}
+  \State initialize codewords from random data points; one E-step and structured M-step
+  \For{$i=0,\dots,S-1$}
+    \State $\tau\gets s\,\tau_0(\tau_1/\tau_0)^{i/(S-1)}$ \Comment{exponential annealing}
+    \State E-step: $w_{nc}\propto\exp(-\norm{\vk_n-\vec{c}_c}/\tau)$; record the hard-assignment error
+    \State keep the codebook with the lowest error; stop if the error stops improving
+    \State M-step: $\vm_c\gets$ weighted means; $\vtheta\gets(\mT\T\mathbf{N}\mT)^{-1}\mT\T\mathbf{N}\vm$; $\vec{c}\gets\mT\vtheta$
+  \EndFor
+  \State $\vk_n\gets\vk_n-\vec{c}_{i(\vk_n)}$ for all $n$ \Comment{residual for the next stage}
+  \State \textbf{if} $r\bmod 4=1$ \textbf{then} $s\gets s/10$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{One decoding step of attention over a CommVQ cache (one query head)}
+\label{alg:c13-commvq-decode}
+\begin{algorithmic}[1]
+\Require query $\vq$ at position $s$; codes $(A_{r,t},B_{r,t})$, scales $\rho_t,\rho'_t$, bits $\vb_t$ for $t\le T_q$; recent full-precision $(\vk_t,\vv_t)$ for $T_q<t\le s$
+\State $\tilde{\vq}\gets\bm{R}_s\vq$; table $U_{r,j,a}\gets\overline{\tilde q_j}z^{(r,j)}_a$ \Comment{independent of $T$}
+\For{$t=1,\dots,T_q$} \Comment{parallel over $t$}
+  \State $W^A_j\gets\sum_rU_{r,j,A_{r,t}}$, $W^B_j\gets\sum_rU_{r,j,B_{r,t}}$
+  \State $\text{score}_t\gets\rho_t\sum_j\operatorname{Re}(e^{it\omega_j}(W^A_j+iW^B_j))/\sqrt{d_k}$
+\EndFor
+\State $\text{score}_t\gets\tilde{\vq}\T\bm{R}_t\vk_t/\sqrt{d_k}$ for the recent window
+\State $\va\gets\softmax(\text{score})$
+\State $\vo\gets\vec{\lambda}\had(\sum_{t\le T_q}a_t\rho'_t\vb_t)\T\mathbf{E}+\sum_{t>T_q}a_t\vv_t$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Implementation walkthrough}\label{sec:c13-commvq-impl}
+
+\begin{implnote}[title={In the code: map of \texttt{repos/UMass-Embodied-AGI\_\_CommVQ}}]
+\textbf{Training pipeline} (\repofile{repos/UMass-Embodied-AGI__CommVQ/training/}): (1)
+\code{collect_kv.sh} runs \code{collect_kv.py} on Llama-3.1-8B-Instruct with
+\code{HuggingFaceFW/fineweb-edu} and sequence length 8192 to dump keys and values; (2)
+\code{make_scale.py} computes the per-channel mean of $\abs{x}$ for every layer's keys and values and
+saves \code{data/learnable_scale.pt} (the $\vec{\lambda}$ above); (3) \code{quantize_key_cache.sh} runs
+\code{quantize_key_cache.py} once per layer (0 to 31) to fit the key codebooks by EM; (4)
+\code{finetune/llama3.1_8b_int1.sh} (and siblings for 2 bits, Llama-3.1-70B, Mistral-7B and
+Qwen-7B) runs \code{finetune.py} with \texttt{--is\_stage1 True --use\_mse\_loss True --use\_vq\_loss True}.
+In stage 1 every parameter whose name does not contain \code{value_vq_model} is frozen, and
+\code{learnable_scale} is frozen as well.
+\textbf{Models} (\repofile{repos/UMass-Embodied-AGI__CommVQ/commvq/}): \code{modeling_llama_training.py}
+(training, with the two MSE losses), \code{modeling_llama_evaluation.py} (simulated quantization:
+codes are decoded back to dense keys and values before attention), \code{modeling_llama_triton.py}
+(attention computed from the codes with the Triton kernels in \code{triton_kernels.py}). The
+compressors are in \code{compress_training.py}, \code{compress_evaluation.py} and \code{compress_triton.py}.
+\end{implnote}
+
+The heart of the key codebook is the matrix $\mT$ and the structured M-step
+\eqref{eq:c13-structured-mstep}. The constants at the top of the script are \texttt{KV\_DIM = 1024},
+\texttt{N\_BITS = 12}, \texttt{M\_GROUP = 128} (one head), \texttt{RESIDUAL\_NUM = 21}, \texttt{N\_STEPS = 100}, and
+temperatures from $10^{-3}$ to $10^{-5}$.
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/UMass-Embodied-AGI\_\_CommVQ/training/quantize\_key\_cache.py}},label={lst:c13-commvq-mstep}]
+T = torch.zeros(2*POW_2_N_BITS_HALF*POW_2_N_BITS_HALF, 2*POW_2_N_BITS_HALF).cuda()
+for A in range(POW_2_N_BITS_HALF):
+    for B in range(POW_2_N_BITS_HALF):
+        T[2*(A*POW_2_N_BITS_HALF+B), 2*A] = 1
+        T[2*(A*POW_2_N_BITS_HALF+B), 2*B+1] = -1
+        T[2*(A*POW_2_N_BITS_HALF+B)+1, 2*B] = 1
+        T[2*(A*POW_2_N_BITS_HALF+B)+1, 2*A+1] = 1
+# ...
+def M_step(tensors, clustering_centers, soft_assignments):
+    assert len(clustering_centers) == CLUSTERING_CENTER_NUM
+    # m: new mean of each cluster
+    # N_tensors: number of tensors in each cluster
+    N_tensors = torch.sum(soft_assignments, dim=0).unsqueeze(-1).repeat(1, 2) + 1e-8
+    weighted_sums = torch.matmul(soft_assignments.T, tensors)
+    m = weighted_sums / N_tensors[:, :1]
+    N_tensors = N_tensors.flatten().unsqueeze(0)
+    mat = (T.T * N_tensors) @ T
+    A_mat = (torch.linalg.inv(mat) @ T.T) * N_tensors
+    B_mat = m.view(m.shape[0], M_GROUP // 2, 2).permute(0, 2, 1).flatten(0, 1)
+    theta = A_mat @ B_mat
+    clustering_centers = (T @ theta).view(CLUSTERING_CENTER_NUM, 2, M_GROUP // 2).permute(0, 2, 1).flatten(1)
+    return clustering_centers, theta
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: reading the M-step}]
+Row pair $2(64A+B),\,2(64A+B)+1$ of \code{T} produces the codeword $(x_A-y_B,\;x_B+y_A)$ from
+$\vtheta=(x_0,y_0,x_1,y_1,\dots,x_{63},y_{63})$, i.e.\ $z_A+i\,z_B$. \code{mat} is
+$\mT\T\mathbf{N}\mT$ and \code{A_mat} is $(\mT\T\mathbf{N}\mT)^{-1}\mT\T\mathbf{N}$, so \code{theta} is
+\eqref{eq:c13-structured-mstep}. \code{B_mat} rearranges the weighted means so that each of the 64 rotary
+pairs of the head becomes one column. All pairs share $\mT$ and the soft counts and differ only in their
+data, so one matrix product solves 64 least-squares problems. Before the loop, the data are reshaped
+with \texttt{view(N, 8, 2, 64).transpose(2, 3)}, which interleaves coordinates $j$ and $j+64$ of each head
+(the rotate-half pairs). The E-step (\code{E_step}) uses \code{torch.cdist}, the \emph{unsquared}
+distance, inside \texttt{softmax(-dist / temperature)}. As $\tau\to0$ this still selects the nearest
+codeword. \code{handle_single} runs the stages of \cref{alg:c13-commvq-em}.
+\end{implnote}
+
+The value encoder's quantizer and decoder are short:
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/UMass-Embodied-AGI\_\_CommVQ/commvq/compress\_evaluation.py} (\texttt{ValueCompressor})},label={lst:c13-commvq-value}]
+    def quantize(self, x):
+        B, S, E = x.shape
+        x = x.reshape(B, S, self.n_e, self.code_range)
+        x = torch.nn.functional.gumbel_softmax(x, tau=1.0, hard=True)
+        x[..., :2] += x[..., 2:3]
+        x = x[..., :2].flatten(2)
+        return x
+
+    def decode(self, x, prescale):
+        x = torch.matmul(x, self.embedding)
+        postscale = torch.norm(x, dim=-1, keepdim=True)
+        x = x / (postscale + self.eps)
+        x = x * (prescale + self.eps)
+        x = x * (self.learnable_scale + self.eps)
+        return x
+\end{lstlisting}
+
+Here \texttt{code\_range = 4}, \texttt{n\_e = feat\_dim * quant\_bits // 2} groups, and \code{embedding} is the
+codebook $\mathbf{E}$ with \texttt{n\_e * 2} rows. \code{pack} stores the bits eight to a \code{uint8}.
+The key path stores \code{uint16} codes of shape \texttt{[R, H\_kv, tokens]}, and \code{decode2} recovers the
+two 6-bit halves as \texttt{x // 64} and \texttt{x \% 64}. In the Triton path the score
+\eqref{eq:c13-commvq-score} is computed in two kernels. \code{calculate_QC_T_kernel} builds the table
+$\vu=M(z)\T\tilde{\vq}$ for every query head, pair, stage and codeword. The kernel below then gathers,
+sums over stages, rotates and reduces:
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/UMass-Embodied-AGI\_\_CommVQ/commvq/triton\_kernels.py}},label={lst:c13-commvq-kernel}]
+    for r_i in tl.static_range(0, R):
+        c_start = hx * R * N + r_i * N + token_offset
+        c = tl.load(key_code_ptr + c_start)  # FIXME: do I need mask?
+        c1x = c // 64
+        c2x = c % 64
+        c1_offset = codebook_start[None, :] + h_i * R * C * 2 + r_i * C * 2 + c1x[:, None] * 2
+        c2_offset = codebook_start[None, :] + h_i * R * C * 2 + r_i * C * 2 + c2x[:, None] * 2
+        c1x = tl.load(QC_T_ptr + c1_offset)
+        c1y = tl.load(QC_T_ptr + c1_offset + 1)
+        c2x = tl.load(QC_T_ptr + c2_offset)
+        c2y = tl.load(QC_T_ptr + c2_offset + 1)
+        acc_1X += c1x
+        acc_1Y += c1y
+        acc_2X += c2x
+        acc_2Y += c2y
+    sin = tl.load(sin_ptr + sin_start)
+    cos = tl.load(cos_ptr + cos_start)
+    acc = tl.sum(acc_1X * cos + acc_1Y * sin + acc_2Y * cos - acc_2X * sin, axis=1)
+    output_offset = (hx * H_RATIO + h_i) * N + token_offset
+    acc = acc * prescale
+    tl.store(output_ptr + output_offset, acc, mask=mask)
+\end{lstlisting}
+
+\begin{implnote}[title={In the code: the decoding attention}]
+In \code{LlamaFlashAttention2.forward} of \code{modeling_llama_triton.py}, the first call (prefill) runs
+FlashAttention on full-precision tensors and stores the codes of the first
+$\lfloor T/128\rfloor\cdot128$ tokens. The key norm is stored already divided by $\sqrt{d_k}$ (\texttt{pack(..., factor=math.sqrt(self.head\_dim))}),
+so the kernels need no separate scaling, and the value prescale is stored already divided by the postscale
+($\rho'_t$ above, via \code{cache_postscale}). At each later step the query is rotated, the two kernels
+above produce the scores of the quantized tokens, a dense product handles the recent full-precision
+window, and \code{attn_weights_mul_value_triton} computes \eqref{eq:c13-commvq-vread}: it unpacks the
+value bits inside the kernel, accumulates $\sum_ta_t\rho'_t\vb_t$ with \code{tl.dot}, and multiplies by
+the codebook (and $\vec{\lambda}$) once. That kernel asserts a 1024-bit value code (``Currently only
+1-bit quantization is supported to use Triton kernels''), matching the README's note that the
+memory-saving kernels support Llama-3.1-8B at 1 bit. The query-head axis is handled by repeating the
+8 key-value heads' codebooks 4 times (grouped-query attention with 32 query heads).
+One caution for readers who run this file: in the mirrored snapshot, the branch that compresses the
+recent window once it reaches 128 tokens still contains debugging statements (\texttt{print("???")} and
+\texttt{import pdb; pdb.set\_trace()}, under a \texttt{FIXME: [DEBUG ONLY]} comment), so long generations
+with the Triton model stop there. The evaluation model, \code{modeling_llama_evaluation.py}, has no such
+statements.
+\end{implnote}
+
+\subsection{Reference implementation}
+
+\Cref{lst:c13-commvq-ref} implements the two decoders, greedy residual encoding of a key, and the
+score computed from codes. For simplicity it normalizes each head's key separately and uses one head.
+
+\begin{lstlisting}[caption={Reference implementation (ours): additive VQ of a KV vector with a RoPE-commuting key codebook},label={lst:c13-commvq-ref}]
+import torch
+
+def encode_key(k, Z):
+    """k: [P, 2] pre-RoPE key as rotary pairs; Z: [R, P, C] complex codebooks.
+    Greedy residual VQ; stage codeword (A, B) is z_A + i z_B (12 bits if C = 64)."""
+    rho = k.norm()
+    x = torch.complex(k[:, 0], k[:, 1]) / rho
+    R, P, C = Z.shape
+    codes = []
+    for r in range(R):
+        cw = Z[r].T[:, None, :] + 1j * Z[r].T[None, :, :]   # [C, C, P]
+        A, B = divmod(int((x - cw).abs().pow(2).sum(-1).argmin()), C)
+        codes.append((A, B))
+        x = x - cw[A, B]                                     # residual
+    return codes, rho
+
+def decode_key(codes, Z, rho):                               # -> complex [P]
+    return rho * sum(Z[r, :, A] + 1j * Z[r, :, B] for r, (A, B) in enumerate(codes))
+
+def score_from_codes(q_rot, codes, Z, rho, phi):
+    """q_rot: complex [P] rotated query; phi: [P] angles t * omega_j of the key.
+    Equals Re(conj(q_rot) * e^{i phi} * decode_key(...)).sum() without decoding."""
+    U = torch.conj(q_rot)[None, :, None] * Z                 # table, [R, P, C]
+    WA = sum(U[r, :, A] for r, (A, B) in enumerate(codes))
+    WB = sum(U[r, :, B] for r, (A, B) in enumerate(codes))
+    return rho * torch.real(torch.exp(1j * phi) * (WA + 1j * WB)).sum()
+
+def decode_value(bits, E, rho, lam, eps=1e-6):               # bits: [n_bits] in {0,1}
+    x = bits @ E                                             # sum of selected codewords
+    return lam * rho * x / (x.norm() + eps)
+
+def read_values(a, bits, E, rho_post, lam):
+    """sum_t a_t * decode_value(bits_t) with rho_post = rho / ||bits @ E||, in one pass."""
+    return lam * (((a * rho_post) @ bits) @ E)
+\end{lstlisting}
+
+\paragraph{Numerical checks.} In NumPy we verified: (i) \cref{lem:c13-commute} (the solution space of
+$XR=RX$ is two-dimensional, of the form $aI+bJ$); (ii) $R(\theta)\,\mathrm{decode}(c)=\mathrm{decode}(R(\theta)c)$
+for \eqref{eq:c13-commvq-commute} (error $4\times10^{-16}$), and that the decoded codeword is
+$(x_A-y_B,\,x_B+y_A)$, the row pattern of \code{T}; (iii) scores from the table, in the kernel's real form
+and in the complex form \eqref{eq:c13-commvq-score}, match decode-rotate-dot with three stages (error
+$4\times10^{-15}$); (iv) the value read-out \eqref{eq:c13-commvq-vread}; (v) the 4-way-to-2-bit map;
+(vi) $\mT\T\mT$ is diagonal and the closed-form M-step minimizes the weighted distortion (no random
+perturbation of $\vtheta$ improved it).
+
+\begin{results}
+\textbf{Source:} \repofile{repos/UMass-Embodied-AGI__CommVQ/README.md}. The README gives no numbers.
+It states that CommVQ ``achieves strong performance across a wide range of benchmarks while
+significantly reducing memory overhead'', releases Llama-3.1-8B checkpoints (value and key codebooks)
+for 1-bit and 2-bit CommVQ, provides evaluation scripts for LongBench, InfiniteBench, needle-in-a-haystack
+and memory measurement, and notes of the Triton kernels for real memory savings: ``Currently
+supports LLaMA-3.1 8B with 1-bit quantization''. The survey describes the method as ``significantly
+reducing KV storage [\dots] with minimal performance degradation''~\citep{zhoubian2026memory}. See the paper
+for numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\paragraph{Strengths.} CommVQ reaches one or two bits per channel by spending its bits on vectors
+rather than numbers, and it keeps the decode cost low by matching the codebook's algebra to RoPE's. The
+LLM itself is not retrained: the encoder and codebooks are fitted to a frozen model, so the method
+applies to existing checkpoints.
+
+\paragraph{Limitations.} (i) Codebooks are fitted per model and per layer on calibration data, and a
+domain shift at inference is not corrected. (ii) Encoding costs a small MLP per value and a 4096-way
+nearest-neighbour search per key stage (on blocks of 128 tokens). (iii) The arithmetic of attention does
+not shrink, only the memory traffic, so the gain depends on how memory-bound decoding is. (iv) In the
+released code the fast kernels cover one model and one bit width.
+
+\paragraph{Relations.} CommVQ is orthogonal to eviction~\citep{c13-zhang2023h2o} and admission (HAM):
+those decide \emph{which} entries to keep, and CommVQ decides \emph{how} to store them, so the two could
+be combined. Low-rank latent caches~\citep{deepseek2024v2} also compress the cache, but along the
+feature dimension and by changing the architecture. The idea of making a compressed representation
+commute with the model's structure, so that computation can stay in the compressed domain, applies
+beyond RoPE.
+
+% ===========================================================================
+\section{Memory Caching: recurrent memory that grows}\label{sec:c13-mc}
+% ===========================================================================
+
+\subsection{Motivation}
+
+A recurrent memory has a fixed size, so it must overwrite or decay old content to make room for new
+content (\cref{ch:linear,ch:delta}). Attention never overwrites, but it pays for every token.
+Memory Caching~\citep{behrouz2026memorycaching} sits between the two. It runs an ordinary recurrent
+memory, but at the end of every segment of the sequence it saves a copy of the memory state
+(\cref{sec:c13-checkpoint}), and later tokens read from all saved copies as well as from the live
+state. The survey summarizes it as storing ``segment-level snapshots of recurrent hidden memory'' and
+aggregating them later, ``creating a middle ground between fixed-size recurrent states and fully
+token-level Transformer caches''~\citep{zhoubian2026memory}. The memory grows with the number of
+segments, not with the number of tokens.
+
+\begin{pitfall}[title={The code is unofficial}]
+There is no official code. The mirrored repository \repo{kmccleary3301__memory_caching} is a community
+implementation. Its README says plainly: ``This is not official author code.'' Its documentation
+separates a ``mechanism-faithful'' implementation, which it claims, from ``paper parity'', which it marks
+as ``Blocked'' (\repofile{repos/kmccleary3301__memory_caching/docs/reproduction_report.md}). The README's
+BibTeX entry for the paper also gives an author list (``Chandra, ...'') that does not match this book's
+bibliography, which follows the survey. Everything below describes the mechanism \emph{as implemented
+there}, using the paper's names for the aggregation rules. The original paper may differ in details.
+\end{pitfall}
+
+\begin{taxonomy}
+\textbf{Representation:} implicit (recurrent states and their snapshots). \textbf{Update dynamics:}
+online. \textbf{Persistence:} long-term (survey Table~I: ``Cached Recurrent State Snapshots'').
+\textbf{Update rule:} Table~II does not list Memory Caching. In our reading it combines a state-transition
+update (the backbone recurrence) with a retention rule: every segment's final state is kept and none
+is evicted~\citep{zhoubian2026memory}.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c13-mc-form}
+
+\paragraph{Ingredients.} A \emph{memory backend} has a state $\mM$, an update
+$\mM_t=U(\mM_{t-1};\vk_t,\vv_t)$ and a read-out $A(\mM,\vq)$. For linear attention,
+$U(\mM;\vk,\vv)=\mM+\vv\vk\T$ and $A(\mM,\vq)=\mM\vq$. The sequence is cut into segments
+$\mathcal{S}_1,\mathcal{S}_2,\dots$, either of constant length $C$ or of lengths given by the binary
+expansion of $T$, largest first ($23\to16,4,2,1$). Let $\sigma(t)$ be the segment containing $t$.
+
+\paragraph{Online state and snapshots.} Inside segment $i$ the layer updates an online state token by
+token. It starts either from the previous segment's final state (\code{checkpoint}, the default) or
+from the initial state (\code{restart}). It also accumulates a segment context, the running sum of the
+segment's keys:
+\begin{equation}\label{eq:c13-mc-online}
+  \mM_t = U(\mM_{t-1};\vk_t,\vv_t),\qquad \vec{c}^{\,\mathrm{on}}_t=\sum_{s\in\mathcal{S}_{\sigma(t)},\,s\le t}\vk_s .
+\end{equation}
+At the end of segment $i$ the layer caches the snapshot $\mM^{(i)}$ (the final online state) and the
+context $\vec{c}^{(i)}$ (the sum of all keys in the segment).
+
+\paragraph{Aggregation.} Token $t$ reads from the $n=\sigma(t)-1$ cached snapshots and the online
+state. A separate projection $\vu_t=\mW_U\vx_t$ (or $\vq_t$ itself) scores the segments by their
+contexts. The four rules implemented are:
+\begin{align}
+  \text{Residual (RM):}\quad &\vy_t = A(\mM_t,\vq_t)+\sum_{i=1}^{n}A(\mM^{(i)},\vq_t),\label{eq:c13-mc-rm}\\
+  \text{Gated residual (GRM):}\quad &\vy_t = \gamma^{\mathrm{on}}_tA(\mM_t,\vq_t)+\sum_{i=1}^{n}\gamma^{(i)}_tA(\mM^{(i)},\vq_t),\label{eq:c13-mc-grm}\\
+  &(\gamma^{(1)}_t,\dots,\gamma^{(n)}_t,\gamma^{\mathrm{on}}_t)=\softmax\bigl(\vu_t\T\vec{c}^{(1)},\dots,\vu_t\T\vec{c}^{(n)},\vu_t\T\vec{c}^{\,\mathrm{on}}_t\bigr),\nonumber\\
+  \text{Memory soup:}\quad &\vy_t = A\Bigl(\gamma^{\mathrm{on}}_t\mM_t+\textstyle\sum_{i}\gamma^{(i)}_t\mM^{(i)},\;\vq_t\Bigr),\label{eq:c13-mc-soup}\\
+  \text{Sparse selective (SSC):}\quad &\text{GRM over the online state and the top-}k\text{ snapshots by }\vu_t\T\vec{c}^{(i)}.\label{eq:c13-mc-ssc}
+\end{align}
+GRM is a softmax ``attention over segments'': the keys are segment summaries, the query is $\vu_t$, and
+the values are the snapshots' read-outs. Soup mixes the \emph{states} before reading. SSC bounds the
+read cost by visiting only $k$ snapshots (default $k=2$).
+
+\begin{proposition}\label{prop:c13-soup}
+If the read-out is linear in the state, $A(\mM,\vq)=\mM\vq$, then Memory Soup equals GRM.
+\end{proposition}
+\begin{proof}
+$A(\sum_i\gamma_i\mM^{(i)},\vq)=(\sum_i\gamma_i\mM^{(i)})\vq=\sum_i\gamma_i\mM^{(i)}\vq=\sum_i\gamma_iA(\mM^{(i)},\vq)$.
+\end{proof}
+For a deep memory, such as a two-layer MLP updated by gradient steps, $A$ is nonlinear in the
+parameters, and mixing parameters differs from mixing outputs. Only then is Soup a separate method.
+
+\begin{proposition}\label{prop:c13-rm-restart}
+For ungated linear attention with \code{restart} initialization, RM equals plain linear attention.
+\end{proposition}
+\begin{proof}
+With restart, $\mM^{(i)}=\sum_{s\in\mathcal{S}_i}\vv_s\vk_s\T$ and the online state is
+$\sum_{s\in\mathcal{S}_{\sigma(t)},s\le t}\vv_s\vk_s\T$. Their sum is $\sum_{s\le t}\vv_s\vk_s\T=\mS_t$, and the
+read-out is linear, so \eqref{eq:c13-mc-rm} gives $\mS_t\vq_t$.
+\end{proof}
+So caching pays off only when something breaks this additivity: decay or a delta rule (the snapshot
+keeps what the live state has since overwritten), a nonlinear memory, or input-dependent gating. With
+\code{checkpoint} initialization and RM, the same linear backend gives
+$\vy_t=\sum_{s\le t}(1+m_s)\,\vv_s\vk_s\T\vq_t$, where $m_s$ is the number of cached prefix snapshots
+that contain $s$. Older tokens are counted more often, which is one reason the gated rules exist.
+
+\paragraph{Backends.} Four memories are implemented: \code{linear} (above); \code{swla} with $c=2$,
+$\mM_t=\alpha\mM_{t-1}+\beta\vv_{t-1}\vk_{t-1}\T+\lambda\vv_t\vk_t\T$; \code{dla}, a per-head two-layer
+MLP (GELU) whose parameters take one gradient step per token on $-\inner{\mathrm{MLP}(\vk_t)}{\vv_t}$
+(the \code{dot} objective) or $\norm{\mathrm{MLP}(\vk_t)-\vv_t}^2$, optionally with momentum; and
+\code{titans}, a deep memory with a momentum buffer in the style of \cref{ch:ttt}. For a one-layer
+linear ``MLP'' the \code{dot} objective has gradient $-\vv_t\vk_t\T$, so one step of size $\eta$ is
+$\mM_t=\mM_{t-1}+\eta\vv_t\vk_t\T$, linear attention again. DLA is its deep generalization.
+
+\paragraph{Cost.} With constant segments of length $C$ the layer holds $\lceil t/C\rceil$ states,
+i.e.\ $\bigO((t/C)\,d_kd_v)$ numbers per head. RM, GRM and Soup read every snapshot, $\bigO((t/C)\,d_kd_v)$
+work per token and $\bigO(T^2d_kd_v/C)$ for a sequence: still quadratic, but with a $1/C$ factor and with no
+softmax over tokens. Logarithmic segments give $\bigO(\log T)$ states. SSC scores all contexts
+($\bigO((t/C)d_k)$, cheap) but reads only $k$ states.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[t]
+\caption{Memory Caching layer, per-token form (as in the unofficial implementation)}
+\label{alg:c13-mc}
+\begin{algorithmic}[1]
+\Require projections $\vq_t,\vk_t,\vv_t,\vu_t$; backend $(U,A)$; segments; aggregation rule
+\State cache $\gets[\,]$; $\mM\gets\mM_0$
+\For{each segment $\mathcal{S}_i$}
+  \If{restart}
+    \State $\mM\gets\mM_0$
+  \EndIf
+  \State $\vec{c}\gets\bm{0}$
+  \For{$t\in\mathcal{S}_i$}
+    \State $\mM\gets U(\mM;\vk_t,\vv_t)$; $\vec{c}\gets\vec{c}+\vk_t$
+    \State $\vy_t\gets$ aggregate $A(\cdot,\vq_t)$ over cache $\cup\{(\mM,\vec{c})\}$ by RM, GRM, Soup or SSC
+  \EndFor
+  \State append $(\operatorname{copy}(\mM),\operatorname{copy}(\vec{c}))$ to cache \Comment{snapshot}
+\EndFor
+\State \Return $\mW_O[\vy_1;\dots;\vy_T]$
+\end{algorithmic}
+\end{algorithm}
+
+The same loop serves decoding: the layer's state is the online memory, the online context and the list
+of snapshots. A training implementation for real models would use the chunkwise algorithms of
+\cref{ch:linear} inside each segment. The unofficial code loops over tokens in Python, which is meant for
+clarity, not speed.
+
+\subsection{Implementation walkthrough}\label{sec:c13-mc-impl}
+
+\begin{implnote}[title={In the code: map of \texttt{repos/kmccleary3301\_\_memory\_caching}}]
+\begin{itemize}
+  \item \repofile{repos/kmccleary3301__memory_caching/src/memory_caching/layer.py}:
+        \code{MemoryCachingLayer} with projections \code{q_proj}, \code{k_proj}, \code{v_proj},
+        \code{u_proj}, \code{o_proj} ($d\to d$, split into heads), \code{_forward_impl} (the loop of
+        \cref{alg:c13-mc}), and \code{_residual_aggregate}, \code{_grm_or_soup_aggregate},
+        \code{_ssc_aggregate}.
+  \item \code{config.py}: \code{MCConfig} defaults \code{backend="linear"}, \code{aggregation="grm"},
+        \code{segmentation="constant"}, \code{segment_size=256}, \code{state_init_mode="checkpoint"},
+        \code{ssc_top_k=2}, \code{use_q_as_u=False}, \code{softmax_temperature=1.0},
+        \code{detach_cached_states=False}.
+  \item \code{contracts.py}: \texttt{SegmentCache(mem\_state, seg\_context, seg\_len)} and the
+        \code{MemoryBackend} protocol (\code{init_state}, \code{update}, \code{apply}); a
+        \code{MixableMemoryBackend} adds \code{mix_states} for Soup.
+  \item \code{segmentation.py} (\code{constant_segments}, \code{logarithmic_segments}),
+        \code{backends/} (\code{linear.py}, \code{swla.py}, \code{dla.py}, \code{titans.py}),
+        \code{baselines/loglinear_pp.py} (\code{LogLinearPP}, which fixes \code{aggregation="grm"}
+        and \code{segmentation="logarithmic"}; compare \cref{ch:structured}), and
+        \code{tests/test_paper_equations.py} (analytic checks of RM, GRM, Soup and SSC).
+\end{itemize}
+Shapes: per-token tensors are \texttt{[B, H, d\_h]}; the linear state is \texttt{[B, H, d\_h, d\_h]}.
+Snapshots are taken with \code{tree_clone} (or \code{tree_detach_clone} when
+\code{detach_cached_states=True}), so by default gradients flow from later segments back into earlier
+snapshots, i.e.\ backpropagation through time across segments.
+\end{implnote}
+
+\begin{lstlisting}[caption={Excerpt from \texttt{repos/kmccleary3301\_\_memory\_caching/src/memory\_caching/layer.py}},label={lst:c13-mc-grm}]
+    def _grm_or_soup_aggregate(
+        # ...
+    ) -> Tensor:
+        contexts = [c.seg_context for c in cached] + [online_context]
+        scores = self._context_scores(u_t, contexts)
+        weights = torch.softmax(scores, dim=-1)
+
+        if self.config.aggregation == "soup" and self._backend_supports_state_mixing:
+            states = [c.mem_state for c in cached] + [online_state]
+            mixed_state = self.backend.mix_states(states, weights)
+            return self.backend.apply(mixed_state, q_t)
+        if self.config.aggregation == "soup" and not self.config.allow_output_mixture_fallback:
+            raise ValueError(
+                "aggregation='soup' requires a backend that supports state mixing; "
+                "set allow_output_mixture_fallback=True to enable output-space fallback."
+            )
+
+        responses = [self.backend.apply(c.mem_state, q_t) for c in cached]
+        responses.append(self.backend.apply(online_state, q_t))
+        stacked_responses = torch.stack(responses, dim=2)  # [B,H,S,Dh]
+        return torch.einsum("bhs,bhsd->bhd", weights, stacked_responses)
+\end{lstlisting}
+
+The elided keyword arguments are \code{q_t}, \code{u_t}, \code{online_state}, \code{cached} (a list of
+\code{SegmentCache}) and \code{online_context}. \code{_context_scores} stacks the contexts to
+\texttt{[B, H, S, d\_h]}, contracts them with \code{u_t} by an \code{einsum}, and divides by the temperature.
+In \code{_forward_impl} the online context is reset to zero at each segment start and incremented by
+\code{k_t} after each update, and at the segment end a \code{SegmentCache} with the state, the context and
+the segment length is appended. SSC
+masks all but the top-$k$ cached scores with $-\infty$, appends the online score, takes one softmax, and
+skips the read-out of unselected snapshots.
+
+\begin{pitfall}[title={Sign conventions in the \texttt{titans} backend}]
+\code{backends/titans.py} offers two conventions. The default, \code{update_convention="paper"}, computes
+$\mathbf{s}_t=\beta\mathbf{s}_{t-1}-\eta\nabla\ell$ and $\mM_t=\alpha\mM_{t-1}-\mathbf{s}_t$. With zero momentum this is
+$\mM_t=\alpha\mM_{t-1}+\eta\nabla\ell$, a step that \emph{increases} the inner loss. The repository's own test
+(\repofile{repos/kmccleary3301__memory_caching/tests/test_titans_update_convention.py}) hand-derives exactly
+this: a target of $1$, a prediction of $0$, and a bias that moves to a negative value. The alternative
+\code{"gradient_descent"} descends. Titans as defined in \cref{ch:ttt} descends the inner loss.
+\code{docs/TITANS_NOTES.md} says the \code{paper} mode mirrors ``the written recurrence form''. Check the
+sign before you use this backend. The \code{dla} backend always descends.
+\end{pitfall}
+
+\subsection{Reference implementation}
+
+\begin{lstlisting}[caption={Reference implementation (ours): segment-snapshot memory caching with gated aggregation (linear backend, GRM)},label={lst:c13-mc-ref}]
+import torch
+
+def memory_caching(q, k, v, u, seg=256, init="checkpoint", temp=1.0):
+    """q, k, u: [T, d_k]; v: [T, d_v]. Linear memory M <- M + v k^T,
+    snapshots at segment ends, gated residual (softmax) aggregation."""
+    T, d_k = k.shape
+    snaps, ctxs, out = [], [], []              # cached states and contexts
+    M = k.new_zeros(v.shape[1], d_k)
+    for start in range(0, T, seg):
+        if init == "restart":
+            M = k.new_zeros(v.shape[1], d_k)
+        c = k.new_zeros(d_k)                    # running segment summary
+        for t in range(start, min(start + seg, T)):
+            M = M + torch.outer(v[t], k[t])     # online write
+            c = c + k[t]
+            scores = torch.stack([u[t] @ ci for ci in ctxs + [c]]) / temp
+            gamma = torch.softmax(scores, dim=0)              # [n_seg + 1]
+            reads = torch.stack([Mi @ q[t] for Mi in snaps + [M]])
+            out.append(gamma @ reads)                         # GRM read-out
+        snaps.append(M.clone()); ctxs.append(c.clone())       # snapshot
+    return torch.stack(out)
+\end{lstlisting}
+
+We checked in NumPy, with a re-implementation that follows \code{layer.py} (read, not imported):
+(i) Soup equals GRM for the linear backend (\cref{prop:c13-soup}, difference $4\times10^{-15}$); (ii) RM with
+\code{restart} equals plain linear attention (\cref{prop:c13-rm-restart}); (iii) SSC with $k$ at least the
+number of segments equals GRM; (iv) \code{checkpoint} snapshots equal the prefix states; (v) the number of
+snapshots is $\lceil T/C\rceil$; (vi) the logarithmic segmentation of $23$ is $(16,4,2,1)$ and of $1000$ is
+$(512,256,128,64,32,8)$.
+
+\begin{results}
+\textbf{Source:} \repofile{repos/kmccleary3301__memory_caching/README.md} and
+\repofile{repos/kmccleary3301__memory_caching/docs/}. The unofficial repository reports no paper-scale
+results. Its status table lists ``Full table-level paper parity: Blocked by missing baselines''.
+\code{docs/TRAINING_PARITY_TABLE.md} records that its own runs used sequence length 128 for 4 steps,
+against target profiles of 4096 to 16384 tokens and 1000 to 10000 steps. The survey states qualitatively
+that Memory Caching creates ``a middle ground between fixed-size recurrent states and fully token-level
+Transformer caches''~\citep{zhoubian2026memory}. See the paper for numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\paragraph{Strengths.} Memory Caching gives any recurrent memory a knob, the segment length, that
+interpolates between an RNN ($C=T$) and something close to attention ($C=1$, \cref{exr:c13-mc}). It is
+backend-agnostic, and its gated rules are themselves a small attention over segments, so retrieval
+across segments is content-based.
+
+\paragraph{Limitations.} Snapshots are large: one $d_k\times d_v$ state per head per segment, against
+$d_k+d_v$ numbers per token for a KV cache. Caching beats a KV cache in memory only if $C>d_kd_v/(d_k+d_v)$,
+i.e.\ $C>32$ for $d_k=d_v=64$. Reads cost a state product per snapshot. The segment context is a plain sum
+of keys, a coarse summary when segments are long.
+
+\paragraph{Relations.} With logarithmic segments and GRM, Memory Caching resembles log-linear
+attention (\cref{ch:structured}), which keeps $\bigO(\log T)$ states per query. The repository makes the
+link explicit through its \code{LogLinearPP} baseline. Compared with HAM, which keeps \emph{tokens}
+selected by surprise, Memory Caching keeps \emph{states} selected by position. CommVQ could compress the
+snapshots as well.
+
+% ===========================================================================
+\section{Bottlenecked Transformers: consolidating the KV cache}\label{sec:c13-bottleneck}
+% ===========================================================================
+
+\subsection{Motivation}
+
+Every method so far keeps cache entries as written, or drops or compresses them. In a decoder-only
+Transformer, the entry for position $s$ is a causal function of $x_{1:s}$, computed once and never
+revisited. It cannot discard details that later prove irrelevant, and it cannot absorb what later
+tokens reveal about it. Bottlenecked Transformers~\citep{oomerjee2026bottlenecked} add a small
+auxiliary Transformer, the \emph{Cache Processor}, that periodically rewrites KV entries \emph{in place}
+at reasoning-step boundaries. The motivation comes from neuroscience. \emph{Consolidation} stabilizes
+newly formed memory traces~\citep{c13-mcgaugh2000}, and \emph{reconsolidation} makes a recalled
+memory labile again so that it can be updated~\citep{c13-nader2000}. It also comes from information
+theory: the \emph{information bottleneck} principle~\citep{c13-tishby2000ib} holds that a good
+representation $Z$ of an input $X$ for predicting $Y$ solves
+\begin{equation}\label{eq:c13-ib}
+  \min_{p(z\mid x)}\; I(X;Z)-\beta\,I(Z;Y),
+\end{equation}
+i.e.\ it keeps as little about the input as possible while staying predictive of the target. Here
+$X$ is the context read so far, $Z$ the KV cache, and $Y$ the tokens still to be generated. A cache that is
+written once and never revised cannot move towards this trade-off; a processor that rewrites it can. The
+survey describes the method as ``periodic processing of cached representations, using an auxiliary
+bottleneck module to consolidate or rewrite parts of the working memory at structured generation
+boundaries''~\citep{zhoubian2026memory}.
+
+\begin{taxonomy}
+The survey's Table~I does not list Bottlenecked Transformers. Table~II places them under
+``admission, eviction, and consolidation'' (with ``irreversible loss and retrieval bias'' as main risks).
+In \S V-B the survey adds that, ``from the taxonomy perspective, this remains closer to short-term
+implicit working memory than to long-term explicit storage'', because the memory being changed is
+the model's own cache~\citep{zhoubian2026memory}. On the three axes: \textbf{representation} implicit,
+\textbf{update dynamics} online (rewrites during generation), \textbf{persistence} short-term.
+\end{taxonomy}
+
+\subsection{Formulation}\label{sec:c13-bt-form}
+
+No code is public. From public descriptions: the backbone LLM is frozen; the Cache Processor consists of
+small Transformer blocks, one aligned to each backbone layer; it is invoked when a reasoning step ends,
+detected by a newline token; it performs non-causal, in-place rewrites of the entries of the most recent
+step (consolidation) and of a small set of earlier entries selected by top-$k$ attention mass
+(reconsolidation); and it preserves the length and dimension of the cache. \emph{One way to formalize
+this is the following; the paper's exact parameterization may differ.}
+
+Let $\mK^{(\ell)},\mV^{(\ell)}$ be layer $\ell$'s cache and $b_1<b_2<\cdots$ the step boundaries. At
+boundary $b_j$ define the recent window and the recalled set
+\begin{equation}\label{eq:c13-bt-sets}
+  \mathcal{W}_j=\{b_{j-1}+1,\dots,b_j\},\qquad
+  \mathcal{P}^{(\ell)}_j=\operatorname{TopK}_{s\le b_{j-1}}\Bigl(\sum_{t\in\mathcal{W}_j}\sum_{h}a^{(\ell,h)}_{t,s}\Bigr),
+\end{equation}
+where $a^{(\ell,h)}_{t,s}$ is the attention weight of query $t$ on key $s$ in head $h$. These weights
+were already computed while the step was generated, so they can be accumulated during decoding. The
+processor of layer $\ell$ reads the selected entries as a set of tokens, $\vx_s=[\vk^{(\ell)}_s;\vv^{(\ell)}_s]$
+for $s\in\mathcal{W}_j\cup\mathcal{P}^{(\ell)}_j$, applies non-causal self-attention and an MLP among
+them, and writes back a residual update:
+\begin{equation}\label{eq:c13-bt-rewrite}
+  \bigl[\vk^{(\ell)}_s;\vv^{(\ell)}_s\bigr]\;\leftarrow\;\bigl[\vk^{(\ell)}_s;\vv^{(\ell)}_s\bigr]
+  + \mathrm{Proc}^{(\ell)}\bigl(\{\vx_{s'}\}_{s'\in\mathcal{W}_j\cup\mathcal{P}^{(\ell)}_j}\bigr)_s,
+  \qquad s\in\mathcal{W}_j\cup\mathcal{P}^{(\ell)}_j .
+\end{equation}
+With a zero-initialized output projection, the rewrite starts as the identity and the model starts as
+the backbone. The same trick appears in AMOR. All later tokens attend to the rewritten entries. Because
+the backbone is frozen, the processor must produce entries that the backbone's own queries can still
+read. This is a strong constraint and keeps the rewrites ``in distribution''. The training objective and
+how positions are handled for keys that already carry RoPE are details for which we refer to the paper.
+
+\begin{algorithm}[t]
+\caption{Generation with periodic KV consolidation (our formalization)}\label{alg:c13-bt}
+\begin{algorithmic}[1]
+\Require frozen backbone; processors $\mathrm{Proc}^{(1..L)}$; budget $k$
+\State prefill the prompt; $b\gets$ prompt length
+\Repeat
+  \State generate the next token $x_t$ with the backbone; accumulate attention mass on positions $\le b$
+  \If{$x_t$ is a newline}
+    \For{$\ell=1,\dots,L$} \Comment{parallel over layers}
+      \State $\mathcal{W}\gets\{b+1,\dots,t\}$; $\mathcal{P}\gets$ top-$k$ earlier positions by mass
+      \State rewrite $(\mK^{(\ell)},\mV^{(\ell)})$ on $\mathcal{W}\cup\mathcal{P}$ by \eqref{eq:c13-bt-rewrite}
+    \EndFor
+    \State $b\gets t$; reset the accumulated mass
+  \EndIf
+\Until{end of sequence}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost.} The cache keeps its size, so the memory cost is unchanged. Per boundary and layer, the
+processor attends among $m+k$ entries ($m=\abs{\mathcal{W}_j}$), costing $\bigO((m+k)^2d)$. Amortized over
+the $m$ tokens of the step, this is $\bigO((m+k)^2d/m)$ per token, small next to attention over a long
+cache when steps are short and $k$ is small. The processor's parameters are an additional, small, fixed cost.
+
+\begin{results}
+\textbf{Source:} no public code was found (\repofile{README.md}, section~4). The survey makes the
+qualitative point that ``attention memory can be managed not only by dropping, quantizing, or paging
+entries, but also by periodically transforming them into a more compact or stable representation
+before subsequent reasoning steps''~\citep{zhoubian2026memory}. The authors report, on mathematical
+reasoning benchmarks with several backbone LLMs, consistent gains over vanilla Transformers and over
+baselines augmented with pause tokens~\citep{c13-goyal2024pause}. See the paper for numbers.
+\end{results}
+
+\subsection{Discussion}
+
+\paragraph{Strengths.} Consolidation adds latent computation without adding tokens. A chain of thought
+spends compute by writing text, pause tokens~\citep{c13-goyal2024pause} by writing placeholder tokens,
+and the Cache Processor by revising the memory itself. The rewrite is bounded in scope (the last step
+plus $k$ recalled entries), so the overhead is predictable. The backbone stays frozen.
+
+\paragraph{Limitations.} (i) In-place rewriting breaks a property that serving systems rely on: the KV
+entries of a prefix are no longer a function of the prefix alone. Prefix caching and block sharing in
+paged KV memory~\citep{kwon2023paged} (\cref{ch:foundations}) need copy-on-write for rewritten blocks.
+(ii) Boundaries are defined by newlines, a heuristic tied to step-by-step reasoning formats. (iii) As
+with every consolidation scheme, a rewrite can destroy detail that would have been needed later; the
+survey's ``irreversible loss'' risk applies.
+
+\paragraph{Relations.} Like CommVQ, the processor changes the \emph{content} of cache entries rather
+than their number. CommVQ does so to save bits, with a fixed, offline-trained map; the Cache Processor
+does so to improve prediction, with a learned map that depends on context. Like HAM and AMOR it uses
+attention statistics or other signals to decide \emph{which} entries to touch.
+
+% ===========================================================================
+\section{Comparison and discussion}\label{sec:c13-compare}
+% ===========================================================================
+
+\Cref{tab:c13-compare} lines up the five systems on the questions of this chapter: which signal
+drives the decision, what is admitted, compressed or rewritten, how memory grows with the sequence length
+$T$, and what the mechanism costs.
+
+\begin{table}[t]
+\centering\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+System & Signal & Admitted / compressed / rewritten & Memory growth & Overhead \\
+\midrule
+AMOR & normalized output entropy vs.\ EMA threshold (or fitted router) & nothing is dropped; attention \emph{runs} only for uncertain tokens & $\bigO(1)$ backbone $+$ $\bigO(KTd)$ for $K$ attention blocks & LM-head product per block and token (router: $\approx$\,1/250 of it) \\
+HAM (our formalization) & RNN prediction error vs.\ threshold (or learned router) & tokens the RNN predicts poorly are admitted to the KV cache & $\bigO(d_kd_v)+\bigO(rT(d_k+d_v))$, $r$ = admission rate & one extra state-vector product per token \\
+CommVQ & none (all tokens) & every key and value compressed to codes ($\approx$1--2 bits/channel) & $\bigO(T)$ with a $\approx$8--16$\times$ smaller constant & encoder MLP and codeword search at write; code-domain attention at read \\
+Memory Caching & segment boundaries; router $\vu_t\T\vec{c}^{(i)}$ over segments & recurrent state snapshots at segment ends & $\bigO((T/C)d_kd_v)$, or $\bigO(\log T)$ states & one state read per snapshot (SSC: $k$) \\
+Bottlenecked Transformers & newline boundaries; top-$k$ attention mass & recent-step and recalled entries rewritten in place & $\bigO(T)$, unchanged & processor over $m+k$ entries per boundary \\
+\bottomrule
+\end{tabularx}
+\caption{The five systems of this chapter. ``Our formalization'' marks rows whose mechanism details
+come from \cref{sec:c13-ham-form} rather than released code.}
+\label{tab:c13-compare}
+\end{table}
+
+\paragraph{Where to intervene.} The five systems act at different points in the life of a memory
+entry. AMOR acts at \emph{read} time (does this token query the high-resolution memory?). HAM acts at
+\emph{write} time (does this token get a verbatim entry?). CommVQ changes the \emph{representation} (how
+many bits an entry takes). Memory Caching changes the \emph{granularity} (whole states instead of
+tokens). Bottlenecked Transformers \emph{revise} entries after the fact. These choices are largely
+independent. A HAM-style layer could quantize its admitted entries with a CommVQ codebook, snapshot its
+recurrent state at segment ends, and consolidate the admitted entries at step boundaries.
+
+\paragraph{Signals.} Three kinds of signal appear. \emph{Model uncertainty} (AMOR's output entropy)
+says how unsure the prediction is. \emph{Memory error} (HAM's innovation) says what the compact memory
+fails to hold, and is the more direct measure of what a second memory should store. \emph{Usage} (the
+attention mass of Bottlenecked Transformers, and of heavy-hitter eviction~\citep{c13-zhang2023h2o}) says
+what has been useful so far. All three are computed from quantities the model produces anyway, but each
+has a known failure mode: irreducible uncertainty, surprising noise, and delayed relevance respectively.
+
+\paragraph{Compute versus memory.} The systems save different resources. AMOR saves attention compute
+but, in its released decoder, not KV memory. HAM and Memory Caching save memory by storing less.
+CommVQ saves memory and memory bandwidth but not arithmetic. Bottlenecked Transformers spend extra
+compute for quality at fixed memory. When reading claims about ``efficient memory'', always ask which
+resource is meant.
+
+\paragraph{Open problems.} Calibrating thresholds across layers, heads and input distributions;
+recovering from wrong admission decisions (a token not admitted is gone); keeping ragged,
+data-dependent caches efficient on hardware built for dense tensors; and avoiding a mismatch between
+training (dense masked computation, as in AMOR and the parallel form of HAM) and inference (sparse
+computation). \Cref{ch:synthesis} returns to these questions across the whole book.
+
+\begin{summarybox}
+\begin{itemize}
+  \item Fixed-ratio hybrids decide once where attention goes. \textbf{Adaptive routing} decides per token
+        which memory a token uses, driven by a signal: output entropy (AMOR) or the recurrent memory's
+        prediction error (HAM). Threshold policies control the rate, and an EMA of quantiles keeps it stable.
+  \item \textbf{AMOR} appends entropy-gated attention blocks to a recurrent language model. The gate is
+        detached and parameter-free, dense-masked training equals sparse inference, the released decoder
+        still stores every key and value, and a fitted router replaces the costly LM-head entropy.
+  \item \textbf{HAM} lets an RNN see every token and admits only poorly predicted tokens to a KV cache.
+        The cache grows with novelty, deduplicates what the RNN already knows, and is controlled by one
+        threshold.
+  \item \textbf{Managing working memory} uses several independent levers: fewer heads, fewer tokens,
+        fewer bits, states instead of tokens, paging, and rewriting.
+  \item \textbf{CommVQ} compresses keys and values to 1--2 bits per channel with vector quantization: a
+        learned encoder with a binary additive codebook for values, and a residual codebook of complex
+        $2\times2$ blocks for keys. These blocks are exactly the matrices that commute with RoPE, so scores
+        and value sums are computed from the codes. The key codebook is trained by EM with a structured
+        least-squares M-step.
+  \item \textbf{Memory Caching} snapshots a recurrent memory at segment ends and aggregates snapshots
+        with residual, gated, soup or sparse-selective rules. For linear memories Soup equals GRM, and
+        residual-with-restart collapses to linear attention. The only code is unofficial.
+  \item \textbf{Bottlenecked Transformers} rewrite recent and recalled KV entries in place at reasoning-step
+        boundaries with a small processor on a frozen backbone, motivated by memory consolidation and
+        the information bottleneck.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}[Entropy and fire rates]\label{exr:c13-entropy}
+(a) Derive $\mathrm{H}(\softmax(\vz))=\operatorname{lse}(\vz)-\sum_ip_iz_i$ and show that adding a constant to
+all logits leaves it unchanged. (b) Compute $\bar{\mathrm{H}}$ for $\vec{p}=(0.5,0.25,0.25,0)$ over
+$\abs{\mathcal{V}}=4$. (c) If the normalized entropies are $\mathcal{N}(\mu,\sigma^2)$, show that AMOR's
+adaptive threshold $\tau=\mu+\kappa\sigma$ fires on a fraction $1-\Phi(\kappa)$ of positions, and find the
+$\kappa$ that gives a 10\% fire rate. (d) Explain why a skewed entropy distribution breaks this
+calculation, and propose an EMA estimator of the $(1-r)$-quantile that targets a fire rate $r$ directly.
+\end{exercise}
+
+\begin{exercise}[Why AMOR caches every key]\label{exr:c13-amor}
+(a) Prove \cref{prop:c13-amor-sparse} for multi-head attention with RoPE. (b) Suppose the decoder stored
+keys and values only at firing positions. Show by a two-token example that a firing query's output then
+differs from the dense-masked training computation. (c) With fire rate $f$, $K$ blocks, width $d$ and
+vocabulary $\abs{\mathcal{V}}$, write the per-token decoding cost of the native gate and of attention at
+context length $t$, and find the $t$ above which the attention saving exceeds the gate's cost.
+\end{exercise}
+
+\begin{exercise}[Surprise-gated admission with decay]\label{exr:c13-ham}
+Consider the delta-rule memory \eqref{eq:c13-ham-rnn} with $\beta_t=1$, constant decay $\alpha<1$ and
+orthonormal keys. (a) Show that an item written at time $t$ is recalled at time $t+n$ as $\alpha^n\vv$ if
+no other write uses its key, so its normalized error is $(1-\alpha^n)^2$. (b) With threshold $\tau$, after how
+many steps is a repeated item admitted again? (c) Implement \cref{lst:c13-ham-ref} in NumPy, reproduce
+\cref{ex:c13-ham-dedup}, and plot cache size against $\tau$ for a stream with 60\% repeats.
+(d) Construct a sequence where a token is not admitted but is needed later, and discuss a fix based on
+delayed admission (keeping a short buffer of candidates).
+\end{exercise}
+
+\begin{exercise}[Codebooks that commute with RoPE]\label{exr:c13-commute}
+(a) Let $\bm{R}_t$ be block diagonal with blocks $R(t\omega_j)$, $j=1,\dots,P$, and distinct
+frequencies $\omega_j\in(0,\pi)$. Show that a $2P\times2P$ matrix commutes with $\bm{R}_t$ for all integers $t$ if and
+only if it is block diagonal with blocks $a_jI+b_jJ$. (Hint: for the blocks $X_{jk}$, consider
+$R(t\omega_j)X_{jk}=X_{jk}R(t\omega_k)$; use \cref{lem:c13-commute} for $j=k$.) (b) Derive
+\eqref{eq:c13-commvq-score} from \eqref{eq:c13-commvq-key}, and check it numerically against
+decode-rotate-dot. (c) Count the bits per channel of CommVQ keys with $R$ stages and of values with
+$b$ bits, including the two 16-bit scales, for $D=1024$ and $H_{kv}=8$.
+\end{exercise}
+
+\begin{exercise}[Structured EM]\label{exr:c13-em}
+(a) Derive \eqref{eq:c13-structured-mstep} and show it reduces to weighted means when $\mT=\mI$. (b) For the
+CommVQ matrix $\mT$ with $C$ complex parameters, show that $\mT\T\mT=2C\,\mI$, and explain why
+$\mT\T\mathbf{N}\mT$ is not diagonal for general soft counts $\mathbf{N}$. (c) Implement annealed EM with the
+structured M-step for $C=8$ on random unit vectors in $\R^4$ (two rotary pairs) and compare its distortion
+with unconstrained $k$-means using the same number of codewords. How much does the RoPE constraint cost?
+\end{exercise}
+
+\begin{exercise}[Memory Caching in closed form]\label{exr:c13-mc}
+For the linear backend: (a) prove \cref{prop:c13-soup,prop:c13-rm-restart}. (b) Take segment length
+$C=1$, \code{restart} initialization and GRM. Show that
+$\vy_t=\sum_{s\le t}\gamma_{t,s}(\vk_s\T\vq_t)\,\vv_s$ with $\gamma_{t,\cdot}=\softmax_s(\vu_t\T\vk_s)$. Compare
+this with softmax attention: what plays the role of the attention logits, and what extra factor scales each
+value? (c) Show that snapshots use less memory than a KV cache for the same tokens if and only if
+$C>d_kd_v/(d_k+d_v)$. (d) Run \cref{lst:c13-mc-ref} with \code{checkpoint} and \code{restart} on a
+recall task of your choice and explain the difference.
+\end{exercise}
