@@ -12,6 +12,28 @@ repository for each paper and a local mirror of that code.
 | [`papers/`](papers) | The survey PDF |
 | [`repos/`](repos) | 40 code snapshots (no git history), one directory per upstream repo |
 | [`repos/MANIFEST.md`](repos/MANIFEST.md) | Upstream URL, pinned commit, license and notes for each snapshot |
+| [`textbook/`](textbook) | LaTeX sources of the textbook *Memory in Large Language Models* |
+| [`.github/workflows/textbook.yml`](.github/workflows/textbook.yml) | GitHub Actions workflow that compiles the textbook to PDF |
+
+## Textbook
+
+[`textbook/`](textbook) is a ~490-page book that teaches every system below from scratch. It
+starts from the standard decoder-only Transformer (tokenization, attention, RoPE, MoE,
+training, KV cache, FlashAttention), then covers the survey's taxonomy and the
+linear-attention / state-space toolkit, then the 2025–2026 memory systems in ten chapters,
+and ends with a synthesis chapter and a guide to the mirrored code.
+For each system it gives the derivations, pseudocode, a walkthrough of the mirrored code in
+[`repos/`](repos), and a from-scratch reference implementation checked numerically. It quotes
+results only from files in this repository. The book was drafted with AI assistance (Claude
+Code); check details against the papers before relying on them.
+
+- **Get the PDF:** open the latest run of the
+  [Build textbook](https://github.com/utkrshkmr/mem-sys/actions/workflows/textbook.yml)
+  workflow and download the `memory-in-llms-textbook` artifact. Pushing a tag named
+  `textbook-v*` (e.g. `textbook-v0.1`) also attaches the PDF to a GitHub release.
+- **Build locally:** with TeX Live installed, `cd textbook && latexmk main.tex` writes
+  `build/main.pdf`. `tools/check-chapter.sh chapters/<file>.tex` compiles one chapter.
+- **Contribute:** follow [`textbook/STYLE.md`](textbook/STYLE.md).
 
 ## The survey's taxonomy
 
