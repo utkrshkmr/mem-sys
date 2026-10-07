@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "metric_prefix": "layer0.cms.cms_mid",
+  "log_path": "logs/mechanism_audit_smoke.json",
+  "flush_partial": false,
+  "total_tokens": 8,
+  "update_period": 4,
+  "expected": {
+    "updates_applied": 2.0,
+    "chunk_tokens": 8.0,
+    "tokens_flushed": 0.0,
+    "pending_tokens": 0.0,
+    "remainder_tokens": 0.0
+  },
+  "observed": {
+    "updates_applied": 2.0,
+    "chunk_tokens": 8.0,
+    "tokens_flushed": 0.0,
+    "pending_tokens": 0.0
+  },
+  "checks": {
+    "updates_applied": true,
+    "chunk_tokens": true,
+    "tokens_flushed": true,
+    "pending_tokens": true
+  }
+}

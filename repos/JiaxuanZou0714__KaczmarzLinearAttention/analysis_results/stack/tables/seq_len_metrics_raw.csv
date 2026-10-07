@@ -1,0 +1,13 @@
+Model,Model Raw,Seq Len,Accuracy,Seed,Path
+Mamba2,Mamba2_Stack,256,99.98168349266052,42,./out/stack/Mamba2_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+Mamba2,Mamba2_Stack,512,99.93689060211182,42,./out/stack/Mamba2_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+Mamba2,Mamba2_Stack,1024,99.54324960708618,42,./out/stack/Mamba2_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+Mamba2,Mamba2_Stack,2048,93.82480382919312,42,./out/stack/Mamba2_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+GDN,GatedDeltaNet_Stack,256,99.92825388908386,42,./out/stack/GatedDeltaNet_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+GDN,GatedDeltaNet_Stack,512,99.73104000091553,42,./out/stack/GatedDeltaNet_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+GDN,GatedDeltaNet_Stack,1024,98.93745183944702,42,./out/stack/GatedDeltaNet_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+GDN,GatedDeltaNet_Stack,2048,95.6378698348999,42,./out/stack/GatedDeltaNet_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Stack,256,99.96947050094604,42,./out/stack/RelaxedKaczmarzQNorm_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Stack,512,99.84598755836487,42,./out/stack/RelaxedKaczmarzQNorm_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Stack,1024,99.24885630607605,42,./out/stack/RelaxedKaczmarzQNorm_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Stack,2048,96.94026708602905,42,./out/stack/RelaxedKaczmarzQNorm_Stack_seq1024_v128_s64_val26_seed42_lr1em3_20000steps/results.json

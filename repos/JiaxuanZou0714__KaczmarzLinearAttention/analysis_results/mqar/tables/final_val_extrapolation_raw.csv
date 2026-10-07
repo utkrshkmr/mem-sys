@@ -1,0 +1,13 @@
+Model,Model Raw,Val Acc,Factor,Train Seq Len,Eval Seq Len,Key Len,Seed,Path
+KLA,RelaxedKaczmarzQNorm_MQAR,98.34835529327393,1,256,256,1,42,./out/mqar/RelaxedKaczmarzQNorm_MQAR_seq256_key1_seed42_10k/results.json
+KLA,RelaxedKaczmarzQNorm_MQAR,98.1629729270935,2,256,512,1,42,./out/mqar/RelaxedKaczmarzQNorm_MQAR_seq256_key1_seed42_10k/results.json
+KLA,RelaxedKaczmarzQNorm_MQAR,95.64257860183716,4,256,1024,1,42,./out/mqar/RelaxedKaczmarzQNorm_MQAR_seq256_key1_seed42_10k/results.json
+KLA,RelaxedKaczmarzQNorm_MQAR,73.84058237075806,8,256,2048,1,42,./out/mqar/RelaxedKaczmarzQNorm_MQAR_seq256_key1_seed42_10k/results.json
+GDN,GatedDeltaNet_MQAR,98.7362802028656,1,256,256,1,42,./out/mqar/GatedDeltaNet_MQAR_seq256_key1_seed42_10k/results.json
+GDN,GatedDeltaNet_MQAR,98.36187362670898,2,256,512,1,42,./out/mqar/GatedDeltaNet_MQAR_seq256_key1_seed42_10k/results.json
+GDN,GatedDeltaNet_MQAR,94.31184530258179,4,256,1024,1,42,./out/mqar/GatedDeltaNet_MQAR_seq256_key1_seed42_10k/results.json
+GDN,GatedDeltaNet_MQAR,66.80529117584229,8,256,2048,1,42,./out/mqar/GatedDeltaNet_MQAR_seq256_key1_seed42_10k/results.json
+Mamba2,Mamba2_MQAR,99.07677173614502,1,256,256,1,42,./out/mqar/Mamba2_MQAR_seq256_key1_seed42_10k/results.json
+Mamba2,Mamba2_MQAR,99.02327060699463,2,256,512,1,42,./out/mqar/Mamba2_MQAR_seq256_key1_seed42_10k/results.json
+Mamba2,Mamba2_MQAR,96.53502106666565,4,256,1024,1,42,./out/mqar/Mamba2_MQAR_seq256_key1_seed42_10k/results.json
+Mamba2,Mamba2_MQAR,64.28638696670532,8,256,2048,1,42,./out/mqar/Mamba2_MQAR_seq256_key1_seed42_10k/results.json

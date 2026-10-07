@@ -1,0 +1,35 @@
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data and custom data links/folders
+data/
+mydata/
+mydata
+
+# Logs, outputs, and model checkpoints
+save_dir/
+out/
+logs/
+outputs/
+triton/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Weights & Biases locally cached data
+wandb/
+
+# IDEs and Environment
+.vscode/
+.idea/
+.env
+venv/
+env/
+.DS_Store

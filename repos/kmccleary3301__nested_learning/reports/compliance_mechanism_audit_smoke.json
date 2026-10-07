@@ -1,0 +1,73 @@
+{
+  "config": "configs/pilot.yaml",
+  "overall_ok": true,
+  "checks": [
+    {
+      "name": "strict_streaming_contract_observed",
+      "ok": true,
+      "detail": "train.strict_streaming_contract=False"
+    },
+    {
+      "name": "algorithm_mode_supported",
+      "ok": true,
+      "detail": "train.algorithm_mode='two_pass_stopgrad_updates'; allowed=['boundary_state_grad_through_write', 'two_pass_stopgrad_updates']"
+    },
+    {
+      "name": "variant_recorded",
+      "ok": true,
+      "detail": "model.block_variant='hope_hybrid'"
+    },
+    {
+      "name": "lm_head_embed_tied",
+      "ok": true,
+      "detail": "lm_head.weight aliases embed.weight"
+    },
+    {
+      "name": "boundary_requires_online_updates",
+      "ok": true,
+      "detail": "online_updates=True, online_boundary_targets=False"
+    },
+    {
+      "name": "carry_attention_requires_boundary",
+      "ok": true,
+      "detail": "online_carry_attention_cache requires online_boundary_targets (carry=False, boundary=False)"
+    },
+    {
+      "name": "fast_state_batch_semantics",
+      "ok": true,
+      "detail": "use_fast_state=False, data.batch_size=6"
+    },
+    {
+      "name": "cadence_report_ok",
+      "ok": true,
+      "detail": "cadence_report=reports/cadence_mechanism_audit_smoke.json"
+    }
+  ],
+  "cadence_report": {
+    "ok": true,
+    "metric_prefix": "layer0.cms.cms_mid",
+    "log_path": "logs/mechanism_audit_smoke.json",
+    "flush_partial": false,
+    "total_tokens": 8,
+    "update_period": 4,
+    "expected": {
+      "updates_applied": 2.0,
+      "chunk_tokens": 8.0,
+      "tokens_flushed": 0.0,
+      "pending_tokens": 0.0,
+      "remainder_tokens": 0.0
+    },
+    "observed": {
+      "updates_applied": 2.0,
+      "chunk_tokens": 8.0,
+      "tokens_flushed": 0.0,
+      "pending_tokens": 0.0
+    },
+    "checks": {
+      "updates_applied": true,
+      "chunk_tokens": true,
+      "tokens_flushed": true,
+      "pending_tokens": true
+    }
+  }
+}

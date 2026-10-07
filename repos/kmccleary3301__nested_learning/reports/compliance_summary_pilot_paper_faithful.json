@@ -1,0 +1,42 @@
+{
+  "config": "configs/pilot_paper_faithful.yaml",
+  "overall_ok": true,
+  "checks": [
+    {
+      "name": "strict_streaming_contract_observed",
+      "ok": true,
+      "detail": "train.strict_streaming_contract=True"
+    },
+    {
+      "name": "algorithm_mode_supported",
+      "ok": true,
+      "detail": "train.algorithm_mode='two_pass_stopgrad_updates'; allowed=['boundary_state_grad_through_write', 'two_pass_stopgrad_updates']"
+    },
+    {
+      "name": "strict_variant_is_paper_defined",
+      "ok": true,
+      "detail": "model.block_variant='hope_attention'; allowed=['hope_attention', 'hope_selfmod']"
+    },
+    {
+      "name": "lm_head_embed_tied",
+      "ok": true,
+      "detail": "lm_head.weight aliases embed.weight"
+    },
+    {
+      "name": "boundary_requires_online_updates",
+      "ok": true,
+      "detail": "online_updates=True, online_boundary_targets=True"
+    },
+    {
+      "name": "carry_attention_requires_boundary",
+      "ok": true,
+      "detail": "online_carry_attention_cache requires online_boundary_targets (carry=True, boundary=True)"
+    },
+    {
+      "name": "fast_state_batch_semantics",
+      "ok": true,
+      "detail": "use_fast_state=True, data.batch_size=1"
+    }
+  ],
+  "cadence_report": null
+}

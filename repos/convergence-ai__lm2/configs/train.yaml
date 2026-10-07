@@ -1,0 +1,10 @@
+defaults:
+  - model: llama3.2-1b
+  - train: default
+  - pretrain: default
+  - _self_
+
+input_bin: "None"
+input_val_bin: "None"
+dtype: "bfloat16"
+seed: 42

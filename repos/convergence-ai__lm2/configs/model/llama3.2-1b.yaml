@@ -1,0 +1,13 @@
+model_type: "llama"     # Model type specified in ScriptArguments
+vocab_size: 128256      # llama-3 vocabulary size
+n_layer: 12             # Number of layers
+n_head: 12              # Number of attention heads
+num_mem_heads: 8
+n_embd: 144             # Embedding size
+block_size: 144         # Block size, which corresponds to context length
+memory_slots: 2048      # Number of memory slots used in the model
+max_length: 1024        # Maximum length of input sequences
+use_memory: false       # Whether to use memory mechanism in the model
+sequence_length: 10
+beta_coeff: 100
+model_name: "meta-llama/Llama-3.2-1B"

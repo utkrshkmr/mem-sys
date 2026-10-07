@@ -1,0 +1,16 @@
+name: my_env_name
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda
+  - transformers==4.45.1
+  - omegaconf
+  - hydra-core

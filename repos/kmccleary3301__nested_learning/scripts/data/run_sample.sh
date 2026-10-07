@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/data/run_sample.sh [TOKENIZER_MODEL_PATH]
+
+Builds a small filtered corpus sample, trains a tokenizer if missing, and shards it.
+
+Args:
+  TOKENIZER_MODEL_PATH  Optional tokenizer model path.
+                        Default: artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
+TOKENIZER_MODEL=${1:-artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model}
+TOKENIZER_DIR="$(dirname -- "${TOKENIZER_MODEL}")"
+
+if [[ ! -f "data/filtered/refinedweb_en_sample.txt" ]]; then
+  echo "[Data] Creating filtered RefinedWeb sample"
+  uv run python scripts/data/filter_corpus.py \
+    --dataset HuggingFaceFW/fineweb \
+    "--subset=sample-10BT" \
+    --split train \
+    --text-column text \
+    --target-lang en \
+    --lang-threshold 0.85 \
+    --min-chars 200 \
+    --max-chars 8000 \
+    --limit 2000 \
+    --output-path data/filtered/refinedweb_en_sample.txt \
+    --force-exit
+fi
+
+if [[ ! -f "data/filtered/wikipedia_en_sample.txt" ]]; then
+  echo "[Data] Creating filtered Wikipedia sample"
+  uv run python scripts/data/filter_corpus.py \
+    --dataset wikimedia/wikipedia \
+    "--subset=20231101.en" \
+    --split train \
+    --text-column text \
+    --target-lang en \
+    --lang-threshold 0.85 \
+    --min-chars 200 \
+    --max-chars 8000 \
+    --limit 1000 \
+    --output-path data/filtered/wikipedia_en_sample.txt \
+    --force-exit
+fi
+
+if [[ ! -f "data/filtered/c4_en_sample.txt" ]]; then
+  echo "[Data] Creating filtered C4 sample"
+  uv run python scripts/data/filter_corpus.py \
+    --dataset allenai/c4 --subset en --split train \
+    --text-column text --target-lang en --lang-threshold 0.85 \
+    --min-chars 200 --max-chars 8000 --limit 1000 \
+    --output-path data/filtered/c4_en_sample.txt --force-exit
+fi
+
+if [[ ! -f "data/filtered/redpajama_en_sample.txt" ]]; then
+  echo "[Data] Creating filtered SlimPajama sample"
+  uv run python scripts/data/filter_corpus.py \
+    "--dataset=cerebras/SlimPajama-627B" \
+    --split train \
+    --text-column text \
+    --target-lang en \
+    --lang-threshold 0.85 \
+    --min-chars 200 \
+    --max-chars 8000 \
+    --limit 1000 \
+    --output-path data/filtered/redpajama_en_sample.txt \
+    --force-exit
+fi
+
+if [[ ! -f "data/filtered/code_en_sample.txt" ]]; then
+  echo "[Data] Creating filtered code sample"
+  uv run python scripts/data/filter_corpus.py \
+    --dataset codeparrot/codeparrot-clean-train --split train \
+    --text-column content --target-lang en --lang-threshold 0.5 \
+    --min-chars 200 --max-chars 12000 --limit 1000 \
+    --output-path data/filtered/code_en_sample.txt --force-exit
+fi
+
+if [[ ! -f "${TOKENIZER_MODEL}" ]]; then
+  echo "[Data] Training tokenizer (sample) -> ${TOKENIZER_DIR}"
+  uv run python scripts/data/train_tokenizer.py \
+    --manifest configs/data/refinedweb_mixture_filtered.yaml \
+    --vocab-size 32000 \
+    --no-hard-vocab-limit \
+    --output-dir "${TOKENIZER_DIR}" \
+    --log-file data/mixtures/refinedweb_mix_tokenizer_sample.json
+fi
+
+echo "[Data] Sharding filtered samples"
+uv run python scripts/data/process_mixture.py \
+  configs/data/refinedweb_mixture_filtered.yaml \
+  --tokenizer-path ${TOKENIZER_MODEL} \
+  --log-file data/mixtures/refinedweb_mix_filtered_shards.json
+
+echo "[Data] Sample pipeline complete"

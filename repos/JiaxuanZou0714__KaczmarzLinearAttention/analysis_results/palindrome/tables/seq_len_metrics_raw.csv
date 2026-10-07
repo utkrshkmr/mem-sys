@@ -1,0 +1,13 @@
+Model,Model Raw,Seq Len,Accuracy,Seed,Path
+Mamba2,Mamba2_Palindrome,256,3.2001961022615433,42,./out/palindrome/Mamba2_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+Mamba2,Mamba2_Palindrome,512,17.92123317718506,42,./out/palindrome/Mamba2_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+Mamba2,Mamba2_Palindrome,1024,88.22346329689026,42,./out/palindrome/Mamba2_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+Mamba2,Mamba2_Palindrome,2048,0.8589643053710461,42,./out/palindrome/Mamba2_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+GDN,GatedDeltaNet_Palindrome,256,99.94333386421204,42,./out/palindrome/GatedDeltaNet_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+GDN,GatedDeltaNet_Palindrome,512,99.80929493904114,42,./out/palindrome/GatedDeltaNet_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+GDN,GatedDeltaNet_Palindrome,1024,98.23651313781738,42,./out/palindrome/GatedDeltaNet_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+GDN,GatedDeltaNet_Palindrome,2048,80.73710203170776,42,./out/palindrome/GatedDeltaNet_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Palindrome,256,99.83705878257751,42,./out/palindrome/RelaxedKaczmarzQNorm_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Palindrome,512,99.49862957000732,42,./out/palindrome/RelaxedKaczmarzQNorm_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Palindrome,1024,97.22483158111572,42,./out/palindrome/RelaxedKaczmarzQNorm_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json
+KLA,RelaxedKaczmarzQNorm_Palindrome,2048,75.956791639328,42,./out/palindrome/RelaxedKaczmarzQNorm_Palindrome_seq1024_v128_h2_seed42_20000steps/results.json

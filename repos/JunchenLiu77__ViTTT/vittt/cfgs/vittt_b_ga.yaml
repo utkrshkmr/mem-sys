@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+MODEL:
+  TYPE: vittt_base
+  NAME: vittt_base_ga
+  DROP_PATH_RATE: 0.4
+  TTT_LOSS_TYPE: ga_dot_product
+

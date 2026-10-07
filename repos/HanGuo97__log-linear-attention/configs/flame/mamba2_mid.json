@@ -1,0 +1,11 @@
+{
+    "hidden_size": 1536,
+    "initializer_range": 0.006,
+    "model_type": "mamba2mlp",
+    "num_heads": 48,
+    "num_hidden_layers": 21,
+    "tie_word_embeddings": false,
+    "use_cache": true,
+    "vocab_size": 32000,
+    "residual_in_fp32": false
+}

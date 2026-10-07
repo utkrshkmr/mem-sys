@@ -1,0 +1,63 @@
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# VS Code
+.vscode/
+
+# MacOS
+.DS_Store
+
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+**/data_example/re10k_*
+weight/
+output/
+
+# wandb
+wandb/
+
+# uv
+uv.lock
+
+lact_nvs/srun_sub.sh
+lact_nvs/job_script.sh
+lact_nvs/logs/

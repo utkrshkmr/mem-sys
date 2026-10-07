@@ -1,0 +1,12 @@
+max_iters: 100000        # Maximum number of iterations
+ckpt_dir: "check_points/ckpts"  # Directory for checkpoints
+max_ckpts_to_keep: 5    # Maximum number of checkpoints to retain
+log_freq: 100           # Logging frequency during training
+local_rank: 0           # Rank for distributed training
+save_freq: 100
+dtype: "bfloat16"
+learning_rate: 0.0006
+lr_decay_frac: 0.0
+warmup_iters: 700
+batch_size: 32
+total_batch_size: 524288

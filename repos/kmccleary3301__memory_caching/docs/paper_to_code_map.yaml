@@ -1,0 +1,133 @@
+paper: "Memory Caching: RNNs with Growing Memory (arXiv:2602.24281v1)"
+generated_by: "scripts/reports/generate_paper_to_code.py"
+sections:
+  - name: "MC wrapper and segmentation"
+    items:
+      - mechanism: "Constant/logarithmic segmentation"
+        paper_anchor: "Segmentation discussion + binary decomposition example"
+        code:
+          - "src/memory_caching/segmentation.py"
+          - "src/memory_caching/layer.py"
+        symbols:
+          - "memory_caching.segmentation::logarithmic_segments"
+          - "memory_caching.layer::MemoryCachingLayer"
+        status: "implemented"
+      - mechanism: "Checkpoint vs restart segment initialization"
+        paper_anchor: "Checkpoint vs independent compressor discussion"
+        code:
+          - "src/memory_caching/layer.py"
+          - "src/memory_caching/config.py"
+        symbols:
+          - "memory_caching.layer::MemoryCachingLayer"
+          - "memory_caching.config::MCConfig"
+        status: "implemented"
+  - name: "Aggregation strategies"
+    items:
+      - mechanism: "Residual Memory (RM)"
+        paper_anchor: "RM equation"
+        code:
+          - "src/memory_caching/layer.py"
+          - "tests/test_layer.py"
+          - "tests/test_paper_equations.py"
+        symbols:
+          - "memory_caching.layer::MemoryCachingLayer"
+        status: "implemented"
+      - mechanism: "Gated Residual Memory (GRM)"
+        paper_anchor: "GRM equation and gamma weighting"
+        code:
+          - "src/memory_caching/layer.py"
+          - "tests/test_layer.py"
+          - "tests/test_paper_equations.py"
+        symbols:
+          - "memory_caching.layer::MemoryCachingLayer"
+        status: "implemented"
+      - mechanism: "Memory Soup"
+        paper_anchor: "Soup definition; true state-space mixing on mixable backends, explicit output-mixture fallback otherwise"
+        code:
+          - "src/memory_caching/layer.py"
+          - "tests/test_layer.py"
+          - "tests/test_paper_equations.py"
+        symbols:
+          - "memory_caching.layer::MemoryCachingLayer"
+        status: "implemented_with_caveat"
+      - mechanism: "Sparse Selective Caching (SSC)"
+        paper_anchor: "SSC top-k selective routing"
+        code:
+          - "src/memory_caching/layer.py"
+          - "tests/test_layer.py"
+          - "tests/test_paper_equations.py"
+        symbols:
+          - "memory_caching.layer::MemoryCachingLayer"
+        status: "implemented"
+  - name: "Backends"
+    items:
+      - mechanism: "Linear memory backend"
+        paper_anchor: "Unnormalized matrix-memory reference backend for the wrapper; not a full normalized linear-attention baseline and not a paper-parity claim"
+        code:
+          - "src/memory_caching/backends/linear.py"
+          - "tests/test_linear_backend.py"
+        symbols:
+          - "memory_caching.backends.linear::LinearMemoryBackend"
+        status: "implemented"
+      - mechanism: "DLA backend"
+        paper_anchor: "DLA-style deep-memory equations with constant scalar coefficients; implementation-faithful but not paper-metric validated"
+        code:
+          - "src/memory_caching/backends/dla.py"
+          - "tests/test_dla_backend.py"
+        symbols:
+          - "memory_caching.backends.dla::DLABackend"
+        status: "implemented_with_caveat"
+      - mechanism: "Titans backend"
+        paper_anchor: "Titans-style deep-memory equations with explicit sign convention and constant scalar coefficients; implementation-faithful but not paper-metric validated"
+        code:
+          - "src/memory_caching/backends/titans.py"
+          - "tests/test_titans_backend.py"
+          - "tests/test_titans_update_convention.py"
+        symbols:
+          - "memory_caching.backends.titans::TitansBackend"
+        status: "implemented_with_caveat"
+      - mechanism: "SWLA c=2 backend"
+        paper_anchor: "SWLA c=2 recurrence with previous-outer-product carry and constant scalar coefficients; implementation-faithful but not paper-metric validated"
+        code:
+          - "src/memory_caching/backends/swla.py"
+          - "tests/test_swla_backend.py"
+          - "tests/test_layer.py"
+        symbols:
+          - "memory_caching.backends.swla::SWLABackend"
+        status: "implemented_with_caveat"
+      - mechanism: "Paper-equation analytic invariants"
+        paper_anchor: "RM/GRM/Soup/SSC formula-level checks"
+        code:
+          - "tests/test_paper_equations.py"
+          - "docs/IMPLEMENTATION_STATUS.md"
+        symbol_coverage_reason: "Test-and-doc mapping item; no single runtime module::symbol anchor."
+        status: "implemented"
+  - name: "Claims and release discipline"
+    items:
+      - mechanism: "Claim boundary and blocked-claim policy"
+        paper_anchor: "Public claim discipline (project policy)"
+        code:
+          - "docs/CLAIM_BOUNDARY.md"
+          - "docs/CLAIM_TO_EVIDENCE_MATRIX.md"
+          - "scripts/checks/claim_evidence_lint.py"
+        symbol_coverage_reason: "Policy/docs mapping item; symbol linkage is not applicable."
+        status: "implemented"
+  - name: "LogLinearPP baseline"
+    items:
+      - mechanism: "LogLinearPP baseline preset"
+        paper_anchor: "Memory Caching paper comparison baseline; distinct from original LogLinearAttention"
+        code:
+          - "src/memory_caching/baselines/loglinear_pp.py"
+          - "tests/test_loglinear_pp.py"
+          - "docs/LOG_LINEAR_PP_BASELINE.md"
+        symbols:
+          - "memory_caching.baselines.loglinear_pp::LogLinearPP"
+        status: "implemented_with_caveat"
+      - mechanism: "LogLinearPP training config family"
+        paper_anchor: "Pilot/mid/target configuration lane for the baseline"
+        code:
+          - "configs/train/loglinear_pp_pilot.yaml"
+          - "configs/train/loglinear_pp_mid.yaml"
+          - "configs/train/loglinear_pp_target.yaml"
+        symbol_coverage_reason: "Config-only mapping item; runtime symbol linkage is not applicable."
+        status: "implemented"

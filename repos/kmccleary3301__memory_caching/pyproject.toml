@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-caching"
+version = "0.1.0"
+description = "Robust PyTorch modules and research tooling for Memory Caching (arXiv:2602.24281)"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "kmccleary3301" }
+]
+keywords = ["pytorch", "memory caching", "long context", "recurrent memory", "attention"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+urls = { Repository = "https://github.com/kmccleary3301/memory_caching", Issues = "https://github.com/kmccleary3301/memory_caching/issues" }
+dependencies = [
+  "torch>=2.3",
+  "typer>=0.12",
+  "numpy>=1.26"
+]
+
+[project.optional-dependencies]
+research = [
+  "pyyaml>=6.0"
+]
+dev = [
+  "build>=1.2",
+  "pyyaml>=6.0",
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "twine>=5.1"
+]
+
+[project.scripts]
+mc = "memory_caching.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+memory_caching = ["py.typed"]

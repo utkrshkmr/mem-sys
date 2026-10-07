@@ -1,0 +1,28 @@
+# Benchmark Command Matrix
+
+- NIAH:
+  - `uv run mc bench niah --adapter all --tasks s_niah_1,s_niah_2,s_niah_3 --context-lengths 4096,8192,16384 --samples-per-length 16 --position-mode uniform --seed 0`
+- MQAR:
+  - `uv run mc bench mqar --adapter all --samples 64 --pair-grid 8,16,32 --query-grid 1,4,8 --seed 0`
+- LongBench scaffold:
+  - `uv run mc bench longbench --adapter all --tasks single_doc_qa,multi_doc_qa,summarization,few_shot,code --samples-per-task 4 --seed 0`
+- LongBench dataset-file mode:
+  - `uv run mc bench longbench --adapter all --tasks single_doc_qa,code --samples-per-task 2 --seed 0 --dataset-file examples/longbench_subset.jsonl`
+- Retrieval scaffold:
+  - `uv run mc bench retrieval --adapter all --datasets swde,squad,fda --truncation-lengths 512,1024,2048,16384 --samples-per-dataset 4 --seed 0`
+- Retrieval dataset-file mode:
+  - `uv run mc bench retrieval --adapter all --datasets swde,squad --truncation-lengths 64 --samples-per-dataset 2 --seed 0 --dataset-file examples/retrieval_subset.jsonl`
+- Sweep orchestration (timeout/retry/resume):
+  - `uv run python scripts/bench/run_benchmark_sweep.py --root outputs/benchmarks/sweeps/default --retries 1 --timeout-sec 1800`
+- Phase3 parity dashboard generation:
+  - `uv run python scripts/reports/parity_dashboard.py --trend-json outputs/reports/phase3_benchmark_trend.json --targets-yaml configs/bench/smoke_targets.yaml --out-md outputs/reports/phase3_parity_dashboard.md --out-json outputs/reports/phase3_parity_dashboard.json`
+- Phase3 statistical summary generation:
+  - `uv run python scripts/reports/stat_summary.py --root outputs/benchmarks/phase3_smoke --out-json outputs/reports/phase3_stat_summary.json --out-md outputs/reports/phase3_stat_summary.md`
+- Paper-to-code mapping sync check:
+  - `uv run python scripts/checks/paper_to_code_sync.py`
+- Layer debug trace (per-token cached count + router weights):
+  - `uv run mc debug-layer --backend linear --aggregation grm --seq-len 8 --d-model 8 --num-heads 2 --out-json outputs/debug/debug_layer.json`
+- Paper-scale execution automation (strict full-corpus mode):
+  - `LONG_BENCH_DATASET_FILE=/abs/path/longbench_full.jsonl RETRIEVAL_DATASET_FILE=/abs/path/retrieval_full.jsonl ./scripts/checks/paper_scale_execution.sh`
+- Paper-scale automation in subset dry-run mode:
+  - `ALLOW_SUBSET=1 LONG_BENCH_DATASET_FILE=examples/longbench_subset.jsonl RETRIEVAL_DATASET_FILE=examples/retrieval_subset.jsonl LONG_BENCH_TASKS=single_doc_qa,code RETRIEVAL_DATASETS=swde,squad LONG_BENCH_SAMPLES_PER_TASK=2 RETRIEVAL_SAMPLES_PER_DATASET=2 ./scripts/checks/paper_scale_execution.sh`

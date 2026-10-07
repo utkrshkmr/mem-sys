@@ -1,0 +1,55 @@
+# Training outputs
+out/
+outputs/
+logs/
+experiments/
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+
+# Data cache
+data/cache/
+data/database/*.jsonl
+data/database/*.json
+!data/database/.gitkeep
+
+# Large data files (should use DVC instead)
+sft_data/*.json
+sft_data/*.jsonl
+!sft_data/.gitkeep
+
+# Tokenizer files (large binary files)
+models/*/tokenizer.json
+models/*/merges.txt
+models/*/vocab.json
+models/*/tokenizer_config.json
+models/*tokenizer*/
+
+# Logs
+*.log
+
+# SwanLab
+swanlog/
+swanlab/
+
+# Hydra
+.hydra/
+
+# Temporary
+*.tmp
+*.temp
+.cache/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# data process
+train_data_with_extract.json
+llmlingua2/
