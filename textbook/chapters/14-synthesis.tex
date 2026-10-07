@@ -1,3 +1,258 @@
 \chapter{Synthesis: Choosing and Combining Memory Mechanisms}\label{ch:synthesis}
 
-(Chapter in preparation.)
+The previous chapters studied more than forty memory mechanisms one at a time. This chapter
+steps back. It first compares their costs side by side, then shows that most of their write
+rules are instances of a single idea, online regression, and finally turns the comparison into
+practical guidance and a list of open problems.
+
+\section{Four questions that define a memory}\label{sec:c14-four}
+
+Every mechanism in this book can be described by answering four questions, which refine the
+survey's three axes \citep{zhoubian2026memory} (\cref{ch:taxonomy}):
+\begin{enumerate}
+  \item \textbf{What is stored?} Token-level key--value pairs (attention), a compressed
+    matrix state (linear attention, delta rules, SSMs), the parameters of a small network
+    (test-time training), or entries of an addressable table (slots, hashed lookups).
+  \item \textbf{How is it written?} By appending (KV cache), by a fixed or gated linear
+    transition (state-transition updates), by a gradient step on an inner objective
+    (optimization-based writing), by a gate that decides whether to write at all
+    (signal-gated writing), or offline during training (objective-induced or structural).
+  \item \textbf{How is it read?} By softmax over all entries, by selecting a few blocks
+    first, by a matrix--vector product with a state, by running an inner network, or by an
+    $\bigO(1)$ table lookup.
+  \item \textbf{When and how fast does it change?} Per token, per chunk, per document, or only
+    during training; and whether several timescales coexist.
+\end{enumerate}
+
+\Cref{tab:c14-costs} compares representative mechanisms on the quantities that matter at
+inference time: how much memory is held for one head of one layer after $t$ tokens, and how
+much work one decoding step costs. The entries are asymptotic and ignore constant factors and
+kernel efficiency, which often decide practical speed.
+
+\begin{table}[t]
+\centering\small
+\caption{Inference-time cost of memory mechanisms, per head and layer, after $t$ tokens.
+$d_k, d_v$: head dimensions; $W$: window; $B, k$: block size and number of selected blocks;
+$m$: number of memory states; $n_h$: delta steps per token; $S$: segment length; $N$: table
+size.}
+\label{tab:c14-costs}
+\begin{tabularx}{\textwidth}{@{}lXXl@{}}
+\toprule
+Mechanism & Memory held & Work per decoding step & Chapter \\
+\midrule
+Softmax attention (KV cache) & $\bigO(t(d_k+d_v))$ & $\bigO(t(d_k+d_v))$ & \ref{ch:foundations} \\
+Sliding-window attention & $\bigO(W(d_k+d_v))$ & $\bigO(W(d_k+d_v))$ & \ref{ch:sparse} \\
+Block-sparse (MoBA, NSA) & $\bigO(t(d_k+d_v))$ & $\bigO(\tfrac{t}{B}d_k + kB(d_k+d_v))$ & \ref{ch:sparse} \\
+Window + linear (RATTENTION) & $\bigO(W(d_k+d_v) + d_kd_v)$ & same & \ref{ch:sparse} \\
+Linear / delta-rule state & $\bigO(d_kd_v)$ & $\bigO(d_kd_v)$ & \ref{ch:linear}, \ref{ch:delta} \\
+DeltaProduct & $\bigO(d_kd_v)$ & $\bigO(n_h d_kd_v)$ & \ref{ch:expressive} \\
+Log-linear attention & $\bigO(d_kd_v\log t)$ & $\bigO(d_kd_v\log t)$ & \ref{ch:structured} \\
+Mixture-of-Memories & $\bigO(m\,d_kd_v)$ & $\bigO(k\,d_kd_v)$ & \ref{ch:structured} \\
+Test-time-trained network & parameters of the inner model & forward and backward of the inner model & \ref{ch:ttt} \\
+Memory slots (LM2) & $\bigO(N d)$ & $\bigO(N d)$ & \ref{ch:lookup} \\
+Hashed lookup (Engram) & $\bigO(N d)$, can live off-GPU & $\bigO(d)$ per lookup & \ref{ch:lookup} \\
+Memory caching & $\bigO(\tfrac{t}{S}d_kd_v)$ & up to $\bigO(\tfrac{t}{S}d_kd_v)$ & \ref{ch:routing} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three patterns stand out. First, only attention-style memories keep every token at full
+fidelity, and they pay for it with memory that grows linearly in $t$. Second, the recurrent
+families hold a fixed budget, $\bigO(d_kd_v)$ per head, and differ only in \emph{how} they
+spend it: which old associations to erase, how much to write, and how expressive the
+transition is. Third, the newer designs interpolate between the two extremes, with memory that
+grows logarithmically (log-linear attention), in steps (memory caching), only for selected
+tokens (HAM, \cref{ch:routing}), or with a fixed window plus a compressed summary
+(RATTENTION, hybrids).
+
+\section{One idea behind the write rules: online regression}\label{sec:c14-regression}
+
+Many write rules in this book can be derived from one template. Treat the memory as a map
+$f_{\mS}$ from keys to values and, at each step, update it to better fit the newest
+association $(\vk_t,\vv_t)$ while not drifting too far from the current memory:
+\begin{equation}\label{eq:c14-template}
+  \mS_t = \argmin_{\mS}\;
+  \underbrace{\ell\big(f_{\mS}(\vk_t), \vv_t\big)}_{\text{fit the new pair}}
+  + \underbrace{\tfrac{1}{2\eta_t}\norm{\mS - \alpha_t\mS_{t-1}}_F^2}_{\text{stay close to the decayed memory}} .
+\end{equation}
+Solving \eqref{eq:c14-template} exactly or approximately, with different losses $\ell$, memory
+maps $f$ and solvers, recovers most of the mechanisms studied. This view has been developed in
+detail in the literature on test-time regression and associative-memory frameworks
+\citep{c14-wang2025testtimeregression,c14-behrouz2025miras}; the version below is a compact
+summary in this book's notation.
+
+\begin{itemize}
+  \item \textbf{Linear attention} (\cref{ch:linear}): $f_{\mS}(\vk)=\mS\vk$, $\alpha_t=1$, and
+    the linear loss $\ell = -\vv_t\T\mS\vk_t$. One gradient step gives
+    $\mS_t = \mS_{t-1} + \eta_t\vv_t\vk_t\T$, the Hebbian outer-product write.
+  \item \textbf{Delta rule} (\cref{ch:linear}): the squared loss
+    $\ell=\tfrac12\norm{\mS\vk_t-\vv_t}^2$ with one gradient step taken at $\mS_{t-1}$ gives
+    $\mS_t = \mS_{t-1} - \beta_t(\mS_{t-1}\vk_t-\vv_t)\vk_t\T$.
+  \item \textbf{Gated delta rule, KDA, Gated DeltaNet-2} (\cref{ch:delta}): add decay
+    $\alpha_t<1$ (scalar for Gated DeltaNet, per channel for KDA), or separate the erase and
+    write strengths (Gated DeltaNet-2).
+  \item \textbf{Kaczmarz step} (\cref{ch:delta}): the delta rule with
+    $\beta_t = 1/\norm{\vk_t}^2$, which makes the updated memory fit the new pair exactly:
+    a projection onto the set $\{\mS : \mS\vk_t=\vv_t\}$.
+  \item \textbf{DeltaProduct} (\cref{ch:expressive}): several gradient steps per token on
+    several key--value pairs, so the transition becomes a product of Householder-like
+    matrices.
+  \item \textbf{Recursive least squares, Kalman filtering, Gated KalmaNet}
+    (\cref{ch:probabilistic}): solve the regression over the whole (decayed) past exactly or
+    with an iterative solver, which accounts for the correlation between keys instead of
+    taking a single gradient step.
+  \item \textbf{Test-time training} (\cref{ch:ttt}): $f$ is a neural network (Titans, TTT
+    layers), and the update is one or more steps of a first-order optimizer, possibly with
+    momentum. TTT-E2E and In-Place TTT replace the key--value loss with a next-token
+    prediction loss on the model's own weights.
+\end{itemize}
+
+\begin{keyidea}
+A memory design is a choice of \emph{what to fit} (the loss and the memory map), \emph{how
+hard to fit it} (the step size, the number of steps, or an exact solve), and \emph{what to
+forget} (the decay or regularizer). Reading a new architecture through this lens tells you
+immediately which earlier design it generalizes.
+\end{keyidea}
+
+The template does not cover everything. Sparse attention (\cref{ch:sparse}) and the KV cache
+never compress; their design questions are about access and retention. Lookup memories
+(\cref{ch:lookup}) are written offline and read by address rather than by similarity.
+Routing mechanisms (\cref{ch:routing}) and hybrids (\cref{ch:hybrid}) combine several memories
+and decide which one to use; the template describes each component, not the combination.
+
+\section{Choosing a memory mechanism}\label{sec:c14-choosing}
+
+No single mechanism dominates; the survey makes the same point \citep{zhoubian2026memory}.
+The right choice depends on what the workload needs. The guidance below summarizes the
+trade-offs discussed in the chapters; it is a starting point for experiments, not a
+substitute for them.
+
+\begin{description}
+  \item[Exact recall of arbitrary earlier tokens.] Keep some softmax attention. Purely
+    recurrent models compress, and compression loses detail. Hybrids
+    (\cref{ch:hybrid}) keep a minority of full-attention layers for this reason, and the
+    hybrid-ratio analysis \citep{wang2025hybridanalysis} studies how much attention is
+    enough.
+  \item[Long streams under a fixed memory budget.] Use a gated delta-rule layer
+    (Gated DeltaNet, KDA, Gated DeltaNet-2), usually in a hybrid. Decay lets the model forget;
+    the delta rule lets it overwrite instead of piling up interference.
+  \item[State tracking (counting, permutations, code execution).] Allow transitions with
+    negative eigenvalues or products of reflections: DeltaProduct, RWKV-7, Comba
+    (\cref{ch:expressive}).
+  \item[More capacity without more compute per token.] Spread memory across several states
+    (Mixture-of-Memories), resolutions (log-linear attention) or table entries (Engram), so
+    each token touches only a small part.
+  \item[Factual knowledge that should scale independently of compute.] Lookup memory
+    (Engram, ExplicitLM, MemoryLLM) or mixture-of-experts (\cref{ch:lookup}).
+  \item[Adapting to a long document or a new domain at inference time.] Test-time training
+    (TTT-E2E, In-Place TTT, Titans; \cref{ch:ttt}), with care for stability.
+  \item[Serving long contexts on limited hardware.] Compress or page the KV cache (CommVQ,
+    PagedAttention), or convert an existing Transformer into a hybrid (Priming,
+    \cref{ch:hybrid}) rather than training from scratch.
+  \item[Learning continually without forgetting.] Multi-timescale updates and constrained
+    update geometry (Nested Learning, OLieRA, Muon-OGD; \cref{ch:multiscale}).
+\end{description}
+
+\section{Implementation patterns across codebases}\label{sec:c14-patterns}
+
+Reading the mirrored repositories side by side (\cref{app:code}) reveals a handful of
+patterns that recur regardless of the mechanism.
+
+\begin{itemize}
+  \item \textbf{Two code paths per layer.} A chunkwise-parallel kernel for training and
+    prefill, and a token-by-token recurrent kernel for decoding. Both must compute the same
+    function; testing them against a slow \texttt{naive} reference is standard practice in
+    \fla{} (\cref{ch:linear}).
+  \item \textbf{Shared libraries.} Many official repositories either build on \fla{} or
+    contributed their kernels to it (Gated DeltaNet, KDA, DeltaProduct, Comba, MoM, Gated
+    DeltaNet-2). Learning one library's conventions transfers across most of Part~II.
+  \item \textbf{Variable-length batching.} Packing sequences of different lengths without
+    padding (cumulative sequence offsets) is supported throughout, because memory states must
+    reset at document boundaries.
+  \item \textbf{Inference integration.} Recurrent and hybrid layers need state caches in
+    serving engines alongside KV caches; several projects ship plugins or model definitions
+    for existing serving stacks.
+  \item \textbf{Conversion instead of pretraining.} Priming, LightTransfer and In-Place TTT
+    all start from a pretrained Transformer and add or swap a memory mechanism, which makes
+    experimentation affordable.
+  \item \textbf{Prototypes versus production code.} Some releases are small research
+    prototypes or unofficial reimplementations. Their behaviour can differ from the papers,
+    so read them as explanations rather than as reference results.
+\end{itemize}
+
+\section{Open problems}\label{sec:c14-open}
+
+The survey closes with six open challenges \citep{zhoubian2026memory}. Having worked through
+the mechanisms, we can state them more concretely.
+
+\begin{enumerate}
+  \item \textbf{A unified theory of memory.} The online-regression view of
+    \cref{sec:c14-regression} unifies the write rules, but not sparse access, lookup tables or
+    routing. A theory that predicts recall, interference and capacity from the design would
+    make comparisons principled rather than empirical.
+  \item \textbf{Lifelong parametric memory.} Test-time training writes into parameters, but
+    how to keep what was learned across sessions without drift or forgetting is open. The
+    stability tools of \cref{ch:multiscale} are first steps.
+  \item \textbf{Robust and interpretable update rules.} Each family of update rules has
+    characteristic failure modes: objective mismatch for optimization-based writing,
+    saturation for state transitions, miscalibrated signals for gated writing, and
+    irreversible loss for eviction. Diagnosing these failures in a trained model is still
+    hard.
+  \item \textbf{Adaptive allocation.} Most hybrids fix where attention goes at design time.
+    AMOR and HAM (\cref{ch:routing}) decide per token; how to train and serve such routing
+    efficiently at scale is an open question.
+  \item \textbf{Hardware--algorithm co-design.} Chunkwise kernels, offloaded lookup tables
+    and compressed caches show that memory designs succeed when they map well to the
+    accelerator's memory hierarchy (\cref{ch:foundations}).
+  \item \textbf{Principled evaluation.} Benchmarks still mostly measure accuracy at a given
+    context length. Separating capacity, fidelity, persistence, robustness to interference
+    and efficiency (\cref{ch:taxonomy}) would show what each mechanism actually remembers.
+\end{enumerate}
+
+A practical problem sits underneath all six: reproducibility. Of the 42 systems from
+2025--2026 in this book, several have no public code and several are available only through
+unofficial implementations (\cref{app:code}). Open, complete releases, including training
+configurations and evaluation scripts, would make every one of these problems easier to
+study.
+
+\begin{summarybox}
+\begin{itemize}
+  \item A memory is defined by what it stores, how it is written, how it is read, and on what
+    timescale it changes.
+  \item Attention keeps everything and grows linearly; recurrent memories keep a fixed
+    budget; recent designs interpolate between the two.
+  \item Most write rules are online regression steps that differ in the loss, the solver and
+    the forgetting term.
+  \item The choice of mechanism should follow the workload: exact recall, streaming, state
+    tracking, knowledge capacity, adaptation, serving cost or continual learning.
+\end{itemize}
+\end{summarybox}
+
+\section*{Exercises}
+
+\begin{exercise}
+Starting from \eqref{eq:c14-template} with $f_{\mS}(\vk)=\mS\vk$ and the squared loss, solve
+the minimization exactly (not by one gradient step) and show that the solution is a delta-rule
+update with a step size that depends on $\eta_t$ and $\norm{\vk_t}^2$. What happens as
+$\eta_t\to\infty$?
+\end{exercise}
+
+\begin{exercise}
+Fill in a version of \cref{tab:c14-costs} for a hybrid model with $L$ layers in which a
+fraction $\rho$ of the layers use full attention and the rest use a gated delta-rule layer.
+Express the total memory held after $t$ tokens as a function of $\rho$, and find the context
+length at which the attention layers dominate it.
+\end{exercise}
+
+\begin{exercise}
+Choose one mechanism from Part~II and one from Part~III. Write both in the four-question form
+of \cref{sec:c14-four}, then propose a hybrid that combines them and explain which component
+should handle which kind of information.
+\end{exercise}
+
+\begin{exercise}
+Design a synthetic benchmark that separates \emph{capacity} (how many associations can be
+stored) from \emph{fidelity} (how accurately one association is recalled) and
+\emph{persistence} (how long it survives). Which mechanisms in this book would you expect to
+fail each test, and why?
+\end{exercise}
