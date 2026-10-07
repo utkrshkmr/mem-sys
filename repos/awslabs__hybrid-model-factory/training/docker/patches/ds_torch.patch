@@ -1,0 +1,24 @@
+diff --git a/deepspeed/comm/torch.py b/deepspeed/comm/torch.py
+index 8e821f2..350a461 100644
+--- a/deepspeed/comm/torch.py
++++ b/deepspeed/comm/torch.py
+@@ -269,7 +269,7 @@ class TorchBackend(Backend):
+                                                                                  async_op=async_op)
+         elif has_coalescing_manager():
+             reqs = []
+-            with get_coalescing_manager(group, input_tensors[0].device, reqs, async_op):
++            with get_coalescing_manager(group, input_tensors[0].device, reqs, async_op) as cm:
+                 for output, input in zip(output_tensors, input_tensors):
+                     handle = torch.distributed.distributed_c10d.all_gather_into_tensor(output,
+                                                                                        input,
+@@ -277,9 +277,7 @@ class TorchBackend(Backend):
+                                                                                        async_op=True)
+                     reqs.append(handle)
+             if async_op:
+-                return reqs[-1]
+-            else:
+-                reqs[-1].wait()
++                cm.wait()
+
+     @disable_compiler_collective
+     def all_gather_object(self, object_list, obj, group=None):

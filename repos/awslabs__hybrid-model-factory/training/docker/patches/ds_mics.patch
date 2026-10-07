@@ -1,0 +1,48 @@
+diff --git a/deepspeed/runtime/zero/mics.py b/deepspeed/runtime/zero/mics.py
+index f1b6b95..6fef3db 100644
+--- a/deepspeed/runtime/zero/mics.py
++++ b/deepspeed/runtime/zero/mics.py
+@@ -41,6 +41,7 @@ class MiCS_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
+         """
+         """
+         # let the current stream to op
++        '''
+         try:
+             # print("HANDLE", self.allgather_handle)
+             instrument_w_nvtx(self.allgather_handle.wait)()
+@@ -49,6 +50,7 @@ class MiCS_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
+                 "WARNING: Runtime Error while waiting the collective all-gather, possibly due to the _IllegalWork",
+                 ranks=[0])
+             log_dist(f"Error message: {e}", ranks=[0])
++        '''
+ 
+         if self.complete:
+             return
+@@ -240,7 +242,7 @@ class MiCS_Init(Init):
+         all_gather_handle = dist.all_gather_coalesced(output_tensors,
+                                                       input_tensors,
+                                                       group=mics_comm_groups.param_shard_group,
+-                                                      async_op=True)
++                                                      async_op=False)
+ 
+         for idx, param in enumerate(params):
+             param.data = output_tensors[idx].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+@@ -308,7 +310,7 @@ class MiCS_Init(Init):
+         all_gather_handle = dist.all_gather_coalesced(intra_outputs,
+                                                       intra_inputs,
+                                                       group=intra_node_comm_group,
+-                                                      async_op=True)
++                                                      async_op=False)
+         for i, param in enumerate(params):
+             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+ 
+@@ -439,7 +441,8 @@ class MiCS_Optimizer(DeepSpeedZeroOptimizer_Stage3):
+                         load_optimizer_states=True,
+                         load_from_fp32_weights=False,
+                         checkpoint_folder=None,
+-                        load_serial=None):
++                        load_serial=None,
++                        param_shapes=None):
+         r""" Loading the ZeRO-3/MiCS partitioned checkpoints
+         Because the self.dp_process_group is replaced with the communicator for
+         partition group we can call the load_state_dict logic from ZeRO-3.

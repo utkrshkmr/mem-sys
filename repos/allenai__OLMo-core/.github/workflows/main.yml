@@ -1,0 +1,403 @@
+name: Main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+env:
+  # Change this to invalidate existing cache.
+  CACHE_PREFIX: v1
+  PYTHONPATH: ./src/
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  BEAKER_TOKEN: ${{ secrets.BEAKER_TOKEN }}
+  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+jobs:
+  checks:
+    name: ${{ matrix.task.name }}
+    runs-on: [ubuntu-latest]
+    timeout-minutes: 15
+    env:
+      # HF models downloaded by the HF roundtrip tests are cached here across runs
+      # (see the "Cache HuggingFace models" step) to avoid re-downloading every run.
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11"]
+        task:
+          - name: Lint
+            run: make lint-check
+
+          - name: Test
+            run: |
+              pytest -v --color=yes --durations=6 \
+                --ignore-glob='src/test/distributed/checkpoint*' \
+                --ignore-glob='src/test/train/checkpoint*' \
+                --ignore-glob='src/test/nn/transformer*' \
+                --ignore-glob='src/test/nn/attention*' \
+                --ignore-glob='src/test/examples/*' \
+                --ignore-glob='src/test/scripts/*' \
+                src/test/
+
+          - name: Test checkpoint
+            run: |
+              pytest -v --color=yes --durations=3 \
+                src/test/distributed/checkpoint* \
+                src/test/train/checkpoint*
+
+          - name: Test transformer
+            run: |
+              pytest -v --color=yes --durations=3 \
+                src/test/nn/transformer/
+
+          - name: Test attention
+            run: |
+              # Note: Exclude tensor parallel tests because they are resource-intensive and we test
+              # them on GPU anway.
+              pytest -v --color=yes --durations=3 \
+                -k 'not tensor_parallel' \
+                src/test/nn/attention*
+
+          - name: Test examples
+            run: |
+              pytest -v --color=yes --durations=3 \
+                src/test/examples/
+
+          - name: Test scripts
+            run: |
+              pytest -v --color=yes --durations=3 \
+                src/test/scripts/
+
+          - name: Integration tests
+            run: |
+              pytest -v --color=yes --durations=3 -m "not gpu" \
+                src/integration_tests/
+
+          - name: Type check
+            run: make type-check
+
+          - name: Build
+            run: make build
+
+          - name: Style
+            run: make style-check
+
+          - name: Docs
+            run: |
+              cd docs && make html SPHINXOPTS="-W --keep-going"
+
+        include:
+          - python: "3.10"
+            task:
+              name: Lint (min Python)
+              run: make lint-check
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: ${{ matrix.python }}
+          cache-prefix: ${{ env.CACHE_PREFIX }}
+
+      - name: Setup Google credentials
+        run: |
+          mkdir -p $HOME/.google
+          printenv GOOGLE_CREDENTIALS > $HOME/.google/credentials.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/.google/credentials.json" >> $GITHUB_ENV
+
+      - name: Restore mypy cache
+        if: matrix.task.name == 'Type check'
+        uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml') }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml') }}-${{ github.ref }}
+            mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: Cache HuggingFace models
+        # The "Test" task runs the HF roundtrip tests, which download Qwen3-0.6B and
+        # Gemma-3-270m. Persist HF_HOME so they're only downloaded once. Bump the key
+        # suffix when the set of models pulled by these tests changes.
+        if: matrix.task.name == 'Test'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-${{ env.CACHE_PREFIX }}-${{ runner.os }}-qwen3-0.6b-gemma3-270m
+
+      - name: ${{ matrix.task.name }}
+        run: |
+          ${{ matrix.task.run }}
+
+      - name: Upload package distribution files
+        if: matrix.task.name == 'Build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist
+
+  gpu_checks:
+    name: ${{ matrix.task.name }}
+    runs-on: ubuntu-latest
+    # Queueing and image pulls consume GitHub time before Beaker starts its runtime cap.
+    # Keep the per-task runtime caps below while allowing time to acquire shared GPUs.
+    timeout-minutes: 90
+    env:
+      GANTRY_GITHUB_TESTING: "true" # force better logging for CI
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: Add GPU test coverage for PyTorch 2.12 with CUDA 13.0 once a compatible
+        # Beaker image is available.
+        task:
+          - name: Test (GPU)
+            image: &gpu_test_image akshitab/olmo-core-tch2130cu129-sm80-2026-09-11
+            gpus: 2
+            # This catch-all slice runs ~27m of mostly distributed tests (even with nn/ddp excluded),
+            # so give it a larger beaker run cap and a GH step timeout above it (pull + log flush).
+            task_timeout: 35m
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            # nn/ddp (fused MoE-v2 block/model tests) runs in the "Test MoE kernels" job; it also
+            # needs the symm_mem_vdev2d NVSHMEM kernels the sm80 image lacks, so ignore it here.
+            # (It slipped in once the image gained TE, blowing this job's time budget.)
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                --ignore-glob='src/test/distributed/checkpoint*' \
+                --ignore-glob='src/test/nn/transformer*' \
+                --ignore-glob='src/test/nn/attention*' \
+                --ignore-glob='src/test/nn/moe*' \
+                --ignore-glob='src/test/nn/ddp*' \
+                --ignore-glob='src/test/optim*' \
+                src/test/
+
+          - name: Test checkpoint (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                src/test/distributed/checkpoint*
+
+          - name: Test transformer (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            task_timeout: 30m
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                src/test/nn/transformer*
+
+          - name: Test attention (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            task_timeout: 30m
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/titan
+            # Experimental KDA needs the CUDA 13 CuTe compiler; exercised below.
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                -k 'not experimental_kernels' src/test/nn/attention*
+
+          - name: Test experimental KDA (GPU)
+            image: akshitab/olmo-core-tch2130cu130-fa4-rma-2026-09-11
+            torch_backend: cu130
+            gpus: 1
+            clusters: --cluster ai2/holmes
+            task_timeout: 25m
+            # CUDA 12 CuTe fails to lower KDA's MMA backward, despite reporting
+            # support. Use CUDA 13 on Blackwell and reject a silently skipped suite.
+            run: |
+              bash -ec '
+                python -m pip install ".[kernel-fun]" "nvidia-cutlass-dsl[cu13]==4.5.3"
+                pytest -v --color=yes --durations=3 -m gpu \
+                  -k experimental_kernels src/test/nn/attention/kda_test.py \
+                  --junitxml=/tmp/experimental-kda.xml
+                python -c "import xml.etree.ElementTree as E; r = E.parse(\"/tmp/experimental-kda.xml\"); assert r.findall(\".//testcase\"); assert not r.findall(\".//skipped\"), \"Experimental KDA tests must execute on Blackwell\""
+              '
+
+          - name: Test MoE (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            # The v2 MoE GPU tests (src/test/nn/moe/v2) need the symm_mem_vdev2d NVSHMEM kernels,
+            # which only the RMA image has, so they run in the "Test MoE kernels" job below; exclude
+            # them here. (The fused block/model tests moved to src/test/nn/ddp, which this job's
+            # src/test/nn/moe glob doesn't reach, so only src/test/nn/moe/v2 needs excluding.)
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                --ignore-glob='src/test/nn/moe/v2*' \
+                src/test/nn/moe*
+
+          - name: Test optim (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            run: |
+              pytest -v --color=yes --durations=3 -m gpu \
+                src/test/optim*
+
+          - name: Integration tests (GPU)
+            image: *gpu_test_image
+            gpus: 2
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn --cluster ai2/titan
+            run: |
+              pytest -v --color=yes -m gpu \
+                src/integration_tests/
+
+          # The rowwise-EP MoE-v2 tests need the symm_mem_vdev2d NVSHMEM extension, which only the
+          # RMA image bundles (the universal sm80 image above has no NVSHMEM). The MoE kernels also
+          # JIT-build .cu extensions, so the image ships the CUDA toolkit (nvcc). This job therefore
+          # runs on the RMA image and covers the MoE kernels plus the fused MoE-v2 GPU tests
+          # (src/test/nn/ddp for the block/model, src/test/nn/moe/v2 for the EP primitives).
+          - name: Test MoE kernels (GPU)
+            image: akshitab/olmo-core-tch2130cu129-rma-2026-09-11
+            gpus: 2
+            # Builds the symm_mem ext then runs kernels + nn/ddp + MoE-v2 EP tests; needs more than
+            # 15m (reached 80% at the cap), so give it a larger beaker run cap + GH step timeout.
+            task_timeout: 30m
+            # Runs on h100/b200 (not a100, which lacks the sm_90+ kernels). NOTE: the v1 grouped_gemm
+            # CUTLASS kernels have no Blackwell/sm_100 build, so any grouped_gemm test that isn't
+            # gated to skip off sm_90 will fail on b200 with "Grouped GEMM execution not possible
+            # with HW"; the symm_mem_vdev2d kernels build and run on sm_100 as of the block-size fix.
+            clusters: --cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/titan
+            # Build the NVSHMEM symm_mem_vdev2d ext (compiled out-of-tree; needs an image with
+            # NVSHMEM + CUDA toolkit) before pytest, so the rowwise-EP tests that import the built
+            # module at collection time can run. One `bash -c` so both run inside the gantry container.
+            run: |
+              bash -c 'export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"; python -m olmo_core.kernels.build_symm_mem_vdev2d_ext --inplace && python -c "from olmo_core.kernels import _symm_mem_vdev2d_ext_gpu" && pytest -v --color=yes --durations=3 -m gpu src/test/kernels/ src/test/nn/ddp/ src/test/nn/moe/v2/ src/test/nn/moe/moe_test.py src/test/nn/moe/routed_experts_v2_test.py src/test/train/train_module/transformer/ddp_train_module_test.py'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }} # check out PR head commit instead of merge commit
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          # Pin an explicit uv version so setup-uv resolves from its bundled manifest instead of
+          # querying the GitHub "latest release" API. The GPU matrix launches many jobs at once and
+          # the concurrent unauthenticated lookups were intermittently rate-limited, failing the jobs
+          # in the setup step with "Github API request failed while getting latest release".
+          version: "0.11.29"
+
+      - name: Install Gantry
+        run:
+          # uv tool install git+https://github.com/allenai/beaker-gantry
+          uv tool install 'beaker-gantry>=3.4.5,<4.0'
+
+      - name: Determine Beaker workspace
+        if: env.BEAKER_TOKEN != ''
+        run: |
+          echo "BEAKER_WORKSPACE=$(make get-beaker-workspace)" >> $GITHUB_ENV
+
+      - name: Determine current commit SHA (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "COMMIT_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
+          echo "BRANCH_NAME=${{ github.head_ref }}" >> $GITHUB_ENV
+
+      - name: Determine current commit SHA (push)
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "COMMIT_SHA=$GITHUB_SHA" >> $GITHUB_ENV
+          echo "BRANCH_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+
+      - name: GPU Tests
+        if: env.BEAKER_TOKEN != ''
+        run: |
+          exec gantry run \
+            --show-logs \
+            --yes \
+            --workspace ai2/OLMo-core \
+            --description 'Olmo-core ${{ matrix.task.name }}' \
+            --ref ${{ env.COMMIT_SHA }} \
+            --branch ${{ env.BRANCH_NAME }} \
+            --beaker-image ${{ matrix.task.image }} \
+            --pre-setup 'python -m pip uninstall -y torchaudio' \
+            --budget ai2/oe-other \
+            --priority normal \
+            --min-runtime 0 \
+            --gpus ${{ matrix.task.gpus }} \
+            --task-timeout ${{ matrix.task.task_timeout || '15m' }} \
+            --host-networking \
+            ${{ matrix.task.clusters || '--cluster ai2/jupiter --cluster ai2/ceres --cluster ai2/saturn' }} \
+            --system-python \
+            --uv-extra all \
+            --uv-torch-backend ${{ matrix.task.torch_backend || 'cu129' }} \
+            --dataset-secret 'GOOGLE_CREDENTIALS:/.google/credentials.json' \
+            --env 'GOOGLE_APPLICATION_CREDENTIALS=/.google/credentials.json' \
+            --env 'TOKENIZERS_PARALLELISM=false' \
+            --env 'CUBLAS_WORKSPACE_CONFIG=:16:8' \
+            --env-secret 'AWS_ACCESS_KEY_ID=olmocore_AWS_ACCESS_KEY_ID' \
+            --env-secret 'AWS_SECRET_ACCESS_KEY=olmocore_AWS_SECRET_ACCESS_KEY' \
+            -- ${{ matrix.task.run }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [checks]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: "3.11"
+          cache-prefix: ${{ env.CACHE_PREFIX }}
+
+      - name: Prepare environment
+        run: |
+          echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Download package distribution files
+        uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: dist
+
+      - name: Generate release notes
+        run: |
+          python src/scripts/release/release_notes.py > ${{ github.workspace }}-RELEASE_NOTES.md
+
+      - name: Publish package to PyPI
+        run: |
+          twine upload --verbose -u __token__ -p '${{ secrets.PYPI_TOKEN }}' dist/*
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          body_path: ${{ github.workspace }}-RELEASE_NOTES.md
+          prerelease: ${{ contains(env.TAG, 'rc') }}
+          files: |
+            dist/*
+
+      - name: Add PR comments on release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./src/scripts/release/add_pr_comments_on_release.sh
+
+      - name: Send Slack notifications about release
+        continue-on-error: true
+        run: |
+          python ./src/scripts/release/slack_notification.py '${{ secrets.SLACK_WEBHOOK_URL}}'
