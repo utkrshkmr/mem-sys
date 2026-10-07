@@ -1,3 +1,163 @@
 \chapter{Guide to the Mirrored Code}\label{app:code}
 
-(Appendix in preparation.)
+Every implementation discussed in this book is mirrored in the \texttt{repos/} directory of
+the \texttt{mem-sys} repository (\url{https://github.com/utkrshkmr/mem-sys}). This appendix
+explains how the mirrors were made, which repository belongs to which chapter, and how to read
+them efficiently.
+
+\section{How the mirrors were made}
+
+Each directory \repo{<owner>__<repo>} is a snapshot of the upstream repository's default
+branch at a pinned commit, exported with \texttt{git archive}. The snapshots therefore contain
+exactly the files tracked upstream, without git history. Three kinds of content are left out:
+\begin{itemize}
+  \item \textbf{Git submodules} (marked ``has-submodules'' in the manifest). The native sparse
+    attention, log-linear attention, FlashKDA and Mamba mirrors reference submodules; symbolic
+    links into those submodules are kept but dangle.
+  \item \textbf{Git LFS objects.} None of the mirrored repositories uses LFS.
+  \item \textbf{Dataset files over 20\,MB} (two training files in ExplicitLM and the
+    \texttt{enwik8} archive in \texttt{titans-pytorch}).
+\end{itemize}
+Two mirrors contain only the folder relevant to this book: RATTENTION
+(\repo{apple__axlearn/axlearn/common/rattention}, from Apple's AXLearn library) and RWKV-7
+(\repo{BlinkDL__RWKV-LM/RWKV-v7}). The file \repofile{repos/MANIFEST.md} records the upstream
+URL, commit hash, branch, commit date, license file and size of every mirror. Always consult
+the upstream repository for the latest code, and check each repository's license before
+reusing code: several repositories ship without a license file.
+
+\section{Official, probable and unofficial code}
+
+The book uses the same labels as the repository README:
+\begin{description}
+  \item[Official] The repository is published by the authors and its README cites the paper,
+    or it is clearly the authors' release.
+  \item[Probably official] The repository belongs to an author, but its README does not cite
+    the paper (ExplicitLM, AMOR, Muon-OGD). The code may correspond to a different version of
+    the method than the one in the paper.
+  \item[Unconfirmed] Kaczmarz Linear Attention: the candidate repository belongs to the first
+    author but does not mention the paper.
+  \item[Unofficial] No official code exists; the mirror is the most widely used third-party
+    implementation (NSA, Titans, Nested Learning/HOPE, Memory Caching). Its behaviour can
+    differ from the paper.
+\end{description}
+
+\section{Repositories by chapter}
+
+\begin{longtable}{@{}p{0.27\textwidth}p{0.42\textwidth}p{0.23\textwidth}@{}}
+\toprule
+\textbf{System} & \textbf{Mirror} & \textbf{Status} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{System} & \textbf{Mirror} & \textbf{Status} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:foundations}: the standard LLM}} \\
+Transformer, RoPE, MoE, training & \repo{allenai__OLMo-core} & reference codebase \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:linear}: linear attention and SSMs}} \\
+Linear attention, GLA, delta rule & \repo{fla-org__flash-linear-attention} & library \\
+Mamba-2 / SSD & \repo{state-spaces__mamba} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:sparse}: sparse and selective attention}} \\
+MoBA & \repo{MoonshotAI__MoBA} & official \\
+NSA & \repo{fla-org__native-sparse-attention} & unofficial \\
+RATTENTION & \repo{apple__axlearn/axlearn/common/rattention} & official (folder) \\
+HyperMLP & \repo{LJC-FVNR__HyperMLP} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:delta}: the delta-rule family}} \\
+Gated DeltaNet & \repo{NVlabs__GatedDeltaNet} & official \\
+Kimi Linear / KDA & \repo{MoonshotAI__Kimi-Linear}, \repo{MoonshotAI__FlashKDA} & official \\
+Gated DeltaNet-2 & \repo{NVlabs__GatedDeltaNet-2} & official \\
+Kaczmarz Linear Attention & \repo{JiaxuanZou0714__KaczmarzLinearAttention} & unconfirmed \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:expressive}: expressive state transitions}} \\
+DeltaProduct & \repo{automl__DeltaProduct} & official \\
+Comba & \repo{AwesomeSeq__Comba-triton} & official \\
+RWKV-7 & \repo{BlinkDL__RWKV-LM/RWKV-v7} & official (folder) \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:structured}: structured recurrent memory}} \\
+Log-Linear Attention & \repo{HanGuo97__log-linear-attention} & official \\
+Mixture-of-Memories & \repo{OpenSparseLLMs__MoM} & official \\
+Mamba-3 & \repo{state-spaces__mamba} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:probabilistic}: probabilistic and objective-shaped memory}} \\
+Kalman Linear Attention & \repo{vaisakh-shaj__kalman-linear-attention} & official \\
+Gated KalmaNet & \repo{awslabs__hybrid-model-factory} & official (toolkit) \\
+Next-Latent Prediction & \repo{JaydenTeoh__NextLat} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:ttt}: test-time training}} \\
+Titans & \repo{lucidrains__titans-pytorch} & unofficial \\
+TTT-E2E & \repo{test-time-training__e2e} & official \\
+In-Place TTT & \repo{ByteDance-Seed__In-Place-TTT} & official \\
+GDWM & --- & no public code \\
+TTT as linear attention & \repo{nv-tlabs__tttla}, \repo{JunchenLiu77__LaCT}, \repo{JunchenLiu77__ViTTT} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:lookup}: memory slots and lookup memory}} \\
+LM2 & \repo{convergence-ai__lm2} & official \\
+Engram & \repo{deepseek-ai__Engram} (includes the paper PDF) & official \\
+ExplicitLM & \repo{SCUT-HCC__ExplicitLM} & probably official \\
+MemoryLLM (FFN memory) & --- & no public code \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:multiscale}: multi-timescale memory}} \\
+Nested Learning / HOPE & \repo{kmccleary3301__nested_learning} & unofficial \\
+OLieRA & --- & no public code \\
+Muon-OGD & \repo{jeremylu916__OSD} & probably official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:hybrid}: hybrid architectures}} \\
+Hybrid quadratic-linear & \repo{kazuki-irie__hybrid-memory} & official \\
+Hymba & \repo{NVlabs__hymba} & official \\
+Falcon-H1 & \repo{tiiuae__Falcon-H1} & official \\
+Hybrid linear attention analysis & --- & weights only \\
+OLMo Hybrid & \repo{allenai__OLMo-core} & official \\
+Expansion Span & --- & no public code \\
+Hydra & \repo{sidcraftscode__hydra} & official (prototype) \\
+Priming & \repo{awslabs__hybrid-model-factory} & official \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:routing}: adaptive routing and memory management}} \\
+AMOR & \repo{HaoranZhengRaul__AMOR} & probably official \\
+HAM & --- & no public code \\
+CommVQ & \repo{UMass-Embodied-AGI__CommVQ} & official \\
+Memory Caching & \repo{kmccleary3301__memory_caching} & unofficial \\
+Bottlenecked Transformers & --- & no public code \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{\Cref{ch:taxonomy}: related surveys (paper lists)}} \\
+Du et al.\ (2025) & \repo{Elvin-Yiming-Du__Survey_Memory_in_AI} & official \\
+Luo et al.\ (2026) & \repo{FeishuLuo__Evolving-LLM-Agent-Memory-Survey} & official \\
+\end{longtable}
+
+\section{Reading the linear-attention code}
+
+Most recurrent layers in Part~II share the structure of the \fla{} library
+(\repo{fla-org__flash-linear-attention}), and several official repositories either depend on
+it or contributed their kernels to it. Learning its layout once pays off across
+\cref{ch:linear,ch:delta,ch:expressive,ch:structured}:
+\begin{itemize}
+  \item \repofile{fla/ops/<op>/} holds the operator. A \texttt{naive.py} file, when present,
+    is a slow but readable PyTorch reference that matches the equations in this book; read it
+    first. \texttt{fused\_recurrent.py} implements the token-by-token form used for decoding,
+    and \texttt{chunk.py} the chunkwise-parallel form used for training and prefill.
+  \item \repofile{fla/layers/} wraps an operator into a full token-mixing layer: projections,
+    short convolutions, gates, normalization and output projection.
+  \item \repofile{fla/models/} assembles layers into Hugging Face-compatible language models
+    with configuration classes.
+\end{itemize}
+A good way to study a new layer is to (1)~write down its recurrence, (2)~find the matching
+\texttt{naive} reference, (3)~read the layer to see how the inputs to the recurrence (keys,
+values, gates) are produced, and only then (4)~read the chunked kernel.
+
+\section{Building this book}
+
+The \LaTeX{} sources live in \texttt{textbook/}. With a \TeX{} Live installation, run
+\begin{lstlisting}[language=bash,numbers=none]
+cd textbook
+latexmk main.tex            # writes build/main.pdf
+tools/check-chapter.sh chapters/05-delta-rule-family.tex   # compile one chapter
+\end{lstlisting}
+The GitHub Actions workflow \repofile{.github/workflows/textbook.yml} compiles the book on
+every change to \texttt{textbook/} and uploads the PDF as a workflow artifact named
+\texttt{memory-in-llms-textbook}. Pushing a tag whose name starts with \texttt{textbook-v}
+also attaches the PDF to a GitHub release. Contributors should follow
+\repofile{textbook/STYLE.md}.

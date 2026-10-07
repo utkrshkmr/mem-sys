@@ -1,3 +1,99 @@
 \chapter{Preface}
 
-(Preface in preparation.)
+Memory used to be a side effect of how language models compute: the key--value cache of a
+Transformer, or the hidden state of a recurrent network. Between 2025 and 2026 it became a
+design dimension in its own right. Models now write to memory modules at test time (Titans,
+TTT-E2E, In-Place TTT), look facts up in hashed tables (Engram), edit matrix-valued states
+with delta rules (Gated DeltaNet, Kimi Delta Attention, Gated DeltaNet-2), filter their memory
+like a Kalman filter (Kalman Linear Attention, Gated KalmaNet), and decide per token which
+memory to consult (AMOR, HAM). The survey \emph{Memory for Large Language Models}
+\citep{zhoubian2026memory} organizes this landscape along three axes: how memory is
+represented, when it is updated, and how long it persists.
+
+This book turns that survey into a course. It starts from the standard decoder-only
+Transformer and builds, step by step, the mathematics, algorithms and code needed to
+understand every 2025--2026 memory system the survey covers. For each system it explains the
+idea, derives the equations, gives pseudocode, walks through the authors' implementation, and
+provides a short reference implementation written from scratch.
+
+\section*{Who this book is for}
+
+Readers who know linear algebra, basic probability, Python and the fundamentals of deep
+learning (multilayer networks, backpropagation, stochastic gradient descent), and who want to
+read and modify the code of modern memory architectures. No prior knowledge of state-space
+models, linear attention or test-time training is assumed.
+
+\section*{How the book is organized}
+
+\begin{description}
+  \item[Part I, Foundations.] \Cref{ch:foundations} sets up the standard LLM: tokenization,
+    attention, positional encodings, mixture-of-experts layers, training, the key--value cache
+    and the GPU memory hierarchy. \Cref{ch:taxonomy} presents the survey's taxonomy of memory
+    and how memory is evaluated. \Cref{ch:linear} develops linear attention, the delta rule,
+    state-space models and chunkwise computation, the toolkit for Part~II.
+  \item[Part II, Implicit memory.] Memory that lives in the forward computation: sparse and
+    selective attention (\cref{ch:sparse}), the delta-rule family (\cref{ch:delta}), more
+    expressive state transitions (\cref{ch:expressive}), structured recurrent memory
+    (\cref{ch:structured}) and probabilistic or objective-shaped memory
+    (\cref{ch:probabilistic}).
+  \item[Part III, Explicit memory.] Memory with its own write rule: test-time training
+    (\cref{ch:ttt}), memory slots and lookup tables (\cref{ch:lookup}), and multi-timescale
+    memory with stable parametric updates (\cref{ch:multiscale}).
+  \item[Part IV, Hybrids and memory systems.] Architectures that combine memories
+    (\cref{ch:hybrid}), route between them adaptively, and manage the working memory
+    (\cref{ch:routing}).
+  \item[Part V, Synthesis.] A cross-cutting comparison and the open problems
+    (\cref{ch:synthesis}). \Cref{app:code} is a guide to the mirrored code.
+\end{description}
+Readers new to the area should read Part~I in order. After that, Parts~II--IV can be read in
+any order; each chapter points back to the background it relies on.
+
+\section*{Conventions}
+
+Notation is shared across chapters: sequences have length $T$, recurrent memories are
+matrices $\mS_t \in \R^{d_v \times d_k}$ written by outer products $\vv_t\vk_t\T$ and read by
+$\vo_t = \mS_t\vq_t$, and gates are written $\alpha_t$ (decay) and $\beta_t$ (write strength).
+Coloured boxes mark recurring material:
+\begin{keyidea}[title={Key idea}]
+The central insight of a section.
+\end{keyidea}
+\begin{taxonomy}
+Where a system sits on the survey's three axes and which update rule it uses.
+\end{taxonomy}
+\begin{implnote}
+How the mirrored implementation realizes the equations: files, functions, tensor shapes.
+\end{implnote}
+\begin{results}
+Quantitative results, quoted only from files in the \texttt{mem-sys} repository, with the
+source file named.
+\end{results}
+\begin{pitfall}
+A common misunderstanding or implementation trap.
+\end{pitfall}
+Code listings captioned ``Reference implementation (ours)'' were written for this book to
+expose the core mechanism. They favour clarity over speed and are not the authors' code.
+Listings captioned ``Excerpt from \ldots'' are quoted from the mirrored repositories.
+
+\section*{About the code and the results}
+
+All implementations discussed are mirrored, at pinned commits, in the \texttt{repos/}
+directory of \url{https://github.com/utkrshkmr/mem-sys}; \cref{app:code} lists them. Some
+systems have no public code, and some have only unofficial implementations; the text says so
+each time. To avoid misquoting, quantitative results are reproduced only when they appear in
+a file in the repository (a README, a results table, or a paper PDF included in a mirror).
+Otherwise the book describes the authors' claims qualitatively and refers to the paper.
+
+\section*{How this book was written}
+
+This book was drafted with AI assistance (Claude Code) from the survey, the mirrored source
+code and the repositories' documentation. Every chapter was compiled and its from-scratch
+reference implementations were checked numerically where feasible, but the text has not been
+reviewed by the authors of the papers it describes. Treat it as a guide to the primary
+sources, and check details against the papers and code before relying on them. Corrections
+are welcome as issues or pull requests on the repository.
+
+\section*{Acknowledgements}
+
+This book would not exist without the survey by Sining Zhoubian, Dan Zhang, Evgeny Kharlamov
+and Jie Tang, and without the many authors who released their code openly. All credit for the
+methods belongs to them; any errors in their exposition are ours.
